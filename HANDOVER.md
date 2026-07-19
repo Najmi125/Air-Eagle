@@ -45,6 +45,22 @@ Client: Air Eagle (B737 cargo — ad-hoc + scheduled, confirmed 2026-07-19)
   (Go/Rust backend, TimescaleDB+Redis, GraphQL) as scaled for a
   large carrier, not Air Eagle's actual crew pool size — noted here
   so a future session doesn't reintroduce them without re-deciding.
+- Phase 3: schema. Three numbered migrations (001_crew_table.sql,
+  002_flights_table.sql, 003_roster_table.sql), applied and verified
+  against real Postgres — actual resulting columns/constraints
+  inspected via psql \d, not assumed from the SQL source. 11 new
+  tests (37/37 total), including one that matters more than the
+  others: inserted a genuine 2-sector duty into the real, constrained
+  roster table, read it back, and ran it through the already-tested
+  Phase 2 duty_summary logic — confirming the schema and the dedup
+  logic actually fit together, not just that each is independently
+  correct. Also tested: FK rejection of orphan crew_id/flight_id,
+  CHECK rejection of bad status values and backwards time ranges,
+  UNIQUE constraint correctly blocking duplicate (crew, flight, role)
+  while correctly allowing two different crew in the same role on
+  one flight. crew.base confirmed to have no hardcoded default (a
+  bug fixed twice in the old repo) — now an actual regression test,
+  not just a one-off fix.
 
 ## Why this repo exists (context for future sessions)
 The previous repo (K2 / "K2_for_Claude_Clean") accumulated real
@@ -81,35 +97,47 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Phase 2 complete (this snapshot). Phase 3 (schema: crew/flights/
-roster tables) is next, pending confirmation.
+Phase 3 complete (this snapshot). Phase 4 (Crew Data page) is next,
+pending confirmation.
 
 ## Files changed
-Phase 2: core/legality/pcaa_ano012_core.py (new),
-core/duty_summary.py (new), scripts/check_reachability.py (refined
-— tests/ no longer counts toward reachability), HANDOVER.md.
+Phase 3: migrations/001_crew_table.sql (new),
+migrations/002_flights_table.sql (new),
+migrations/003_roster_table.sql (new), tests/test_schema.py (new),
+HANDOVER.md.
 
 ## DB changes (migrations applied)
-- 000_migration_tracking.sql (schema_migrations tracking table only)
-- No business schema yet (crew/flights/roster tables are Phase 3)
+- 000_migration_tracking.sql (schema_migrations tracking table)
+- 001_crew_table.sql (crew — matches the 19-column operator template
+  plus operator_staff_id; no hardcoded base default)
+- 002_flights_table.sql (flights — flight_no nullable for ad-hoc ops,
+  CHECK-constrained status, CHECK on arr > dep)
+- 003_roster_table.sql (roster — one row per crew per flight sector,
+  duty_id NOT NULL, FKs to crew/flights, UNIQUE on
+  crew_id+flight_id+role_assigned, CHECK on debrief > report)
 
 ## Tests passed
-26/26 — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12). Against real Postgres 16
-(local test instance; production Air Eagle DB not yet provisioned).
+37/37 — tests/test_migrations.py (4), tests/test_duty_summary.py
+(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (11).
+Against real Postgres 16 (local test instance; production Air Eagle
+DB not yet provisioned). Actual table structure additionally
+verified by hand via psql \d against all three tables — matched the
+migration source exactly.
 
 ## Open stubs / known blockers
 - `core/legality/pcaa_ano012_core.py` and `core/duty_summary.py` are
   correctly flagged by `scripts/check_reachability.py` — fully
-  ported and tested (26/26 passing), but not yet called from any
-  service or page. Expected: services/ (Phase 3+) is what will
-  actually call these. Not a bug, matches db.py's existing note
-  below for the same reason.
+  ported and tested (37/37 passing overall), but not yet called from
+  any service or page. Expected: services/ (Phase 6) is what will
+  actually call these.
 - `db/db.py` is currently flagged by `scripts/check_reachability.py`
   — correctly. Nothing imports it yet because `app.py` doesn't exist
-  yet (Phase 1 deliberately stopped before pages/app.py). This is
-  expected, not a bug; it'll clear once Phase 4/5 wires up the first
-  page. Noting it here is the whole point of the checker existing.
+  yet. Expected to clear in Phase 4/5.
+- The `crew` table schema (001_crew_table.sql) is built against the
+  19-column template, not yet against real operator data. When
+  Monday's data comes back: check it actually matches this shape
+  before writing a new migration to add anything — don't assume the
+  template survived contact with a real spreadsheet unchanged.
 - Waiting on: real crew data from operator (was expected Monday
   2026-07-20, via AirEagle_Crew_Data_Simple.xlsx)
 - Waiting on: Air Eagle's actual route network — blocks duty
@@ -125,17 +153,14 @@ core/duty_summary.py (new), scripts/check_reachability.py (refined
   Eagle's confirmed operation_type="cargo_charter" default.
 - "Engr" role definition unconfirmed (flight-deck FE vs
   line-maintenance AME) — flagged on the crew data template,
-  answer expected with Monday's data
+  answer expected with Monday's data. Also affects whether
+  001_crew_table.sql needs AME/LM-specific columns added later.
 
 ## Next safest step
-Phase 3: schema. crew/flights/roster tables as numbered migrations
-(002_, 003_, ...), building on 000_migration_tracking.sql. Crew
-table should match the 19-column simple template already sent to
-the operator (ID, Name, Role, DOB, Nationality, Base, Ph No, Email,
-License No, License Exp, Medical Exp, Type Rating Exp, LPC/OPC Exp,
-Line Check Exp, SEP Exp, CRM Exp, DG Exp, Contract Exp, Remarks) —
-confirm against whatever comes back Monday before finalizing column
-types.
+Phase 4: Crew Data page (pages/2_Crew_Data.py + a real
+crew_service.py, per the Ownership Table — not page-level SQL).
+This is also the natural point to load Monday's real operator data
+once it arrives, since the page will be what actually writes it in.
 
 ## Do not change without discussion
 - migrations/000_migration_tracking.sql — once applied anywhere,
@@ -151,3 +176,7 @@ types.
   test in the same change. This file is the actual legality
   authority; silent edits here are exactly the failure mode the
   whole rebuild was meant to prevent.
+- migrations/001_crew_table.sql, 002_flights_table.sql,
+  003_roster_table.sql — once applied anywhere, immutable like
+  000_. Need a new column, e.g. for Engr/LM quals once confirmed?
+  New numbered migration (004_...). Never edit these three in place.
