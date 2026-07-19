@@ -63,9 +63,32 @@ def all_source_files():
     return files
 
 
+def app_reachable_source_files():
+    """
+    Files whose imports actually count as "this is wired into the app":
+    app.py, pages/, and cross-references within core/services/db
+    themselves. Deliberately EXCLUDES tests/ and scripts/ — a file
+    that's only ever imported by its own test is not connected to the
+    running app, and counting test imports as reachability would mask
+    exactly the gap this checker exists to catch.
+    """
+    included_top = {"pages"}
+    files = []
+    for f in all_source_files():
+        rel = f.relative_to(ROOT)
+        top = rel.parts[0] if len(rel.parts) > 1 else None
+        if str(rel) == "app.py":
+            files.append(f)
+        elif top in included_top:
+            files.append(f)
+        elif top in WATCHED_DIRS:
+            files.append(f)
+    return files
+
+
 def find_all_imports():
     imported_modules = set()
-    for f in all_source_files():
+    for f in app_reachable_source_files():
         try:
             text = f.read_text()
         except Exception:
