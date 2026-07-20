@@ -86,6 +86,33 @@ Client: Air Eagle (B737 cargo — ad-hoc + scheduled, confirmed 2026-07-19)
   2025-12-31) that a plain compile check would have missed entirely.
   crew.base still correctly has no default (regression test from
   Phase 3 still passing).
+- Phase 5: Duty builder v2 + Flight Log. core/duty_builder.py
+  replaces the old repo's XYZ-hardcoded DUTY_TEMPLATES entirely —
+  takes whatever flight legs are given, computes report/debrief/FDP
+  from them, no route lookup table. Split into two deliberately
+  separate functions after tracing through the exact historical bug
+  scenario (Section 8) carefully: build_duty() for planning a NEW
+  duty (report_time derived from departure - buffer), and
+  recompute_fdp_after_delay() for an EXISTING duty whose crew already
+  reported (report_time stays fixed, only debrief_time/fdp_hours
+  change). Conflating these two would have reintroduced a version of
+  the exact bug this file exists to prevent — a delayed departure
+  would have incorrectly shifted report_time along with it. One test
+  replicates Section 8's exact numbers (report 05:00, delayed
+  debrief 18:00 -> 13.0h) and explicitly demonstrates the wrong
+  block-time-only answer (2.25h) it must not produce.
+  services/flight_service.py: add/update/cancel_flight, get_flight,
+  get_all_flights. cancel_flight() never deletes — sets
+  status='CANCELLED' — per the explicit "permanent log of all
+  flights" requirement; get_all_flights() shows cancelled flights by
+  default rather than hiding them, verified directly by a test.
+  app.py updated with nav; pages/3_Flight_Log.py added, thin wrapper
+  matching pages/2_Crew_Data.py's pattern.
+  28 new tests (89/89 total): 10 for duty_builder (pure logic), 13
+  for flight_service, 5 AppTest page-level tests for Flight Log
+  including the permanent-log requirement verified through the
+  actual UI (add a flight, cancel it, confirm it's still visible
+  with status=CANCELLED, not removed from the table).
 
 ## Why this repo exists (context for future sessions)
 The previous repo (K2 / "K2_for_Claude_Clean") accumulated real
@@ -112,8 +139,8 @@ assessment is in the FTLguard project chat history, 2026-07-19.
 ## What did NOT carry over (deliberate)
 - utils/ftl_validator.py's dead CAA_RULES flat-limits dict — left
   behind entirely, not ported "just in case"
-- duty_builder.py's hardcoded XYZ-specific DUTY_TEMPLATES — will be
-  rebuilt schedule-agnostic/config-driven from the start
+- duty_builder.py's hardcoded XYZ-specific DUTY_TEMPLATES — rebuilt
+  schedule-agnostic from scratch in Phase 5, see Recently Completed.
 - crew_position.py / replacement_options.py (location tracking) —
   deliberately not included. All Air Eagle crew are KHI-based;
   nothing currently indicates away-from-base overnight layovers.
@@ -122,16 +149,15 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Phase 4 complete (this snapshot). Phase 5 (Duty builder v2 + Flight
-Log) is next, pending confirmation.
+Phase 5 complete (this snapshot). Phase 6 (Assignment + legality
+gate) is next, pending confirmation.
 
 ## Files changed
-Phase 4: migrations/004_audit_log.sql (new),
-services/audit_service.py (new), services/crew_service.py (new),
-app.py (new), pages/2_Crew_Data.py (new),
-tests/test_audit_service.py (new), tests/test_crew_service.py (new),
-tests/test_crew_data_page.py (new), tests/conftest.py (added shared
-migrated_db fixture, moved from test_schema.py), HANDOVER.md.
+Phase 5: core/duty_builder.py (new), services/flight_service.py
+(new), app.py (updated — nav to Flight Log), pages/3_Flight_Log.py
+(new), tests/test_duty_builder.py (new),
+tests/test_flight_service.py (new), tests/test_flight_log_page.py
+(new), HANDOVER.md.
 
 ## DB changes (migrations applied)
 - 000_migration_tracking.sql (schema_migrations tracking table)
@@ -144,22 +170,27 @@ migrated_db fixture, moved from test_schema.py), HANDOVER.md.
   crew_id+flight_id+role_assigned, CHECK on debrief > report)
 - 004_audit_log.sql (audit_log — single unified table, all action
   types, per Section 16's required field list)
+- No new migrations in Phase 5 — duty_builder.py is pure logic, no
+  schema of its own; flight_service.py uses the flights table
+  already built in Phase 3.
 
 ## Tests passed
-61/61 — tests/test_migrations.py (4), tests/test_duty_summary.py
+89/89 — tests/test_migrations.py (4), tests/test_duty_summary.py
 (10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (11),
 tests/test_audit_service.py (3), tests/test_crew_service.py (17),
-tests/test_crew_data_page.py (4). Against real Postgres 16 (local
-test instance; production Air Eagle DB not yet provisioned).
+tests/test_crew_data_page.py (4), tests/test_duty_builder.py (10),
+tests/test_flight_service.py (13), tests/test_flight_log_page.py (5).
+Against real Postgres 16 (local test instance; production Air Eagle
+DB not yet provisioned).
 
 ## Open stubs / known blockers
-- `core/legality/pcaa_ano012_core.py` and `core/duty_summary.py` are
-  still correctly flagged by `scripts/check_reachability.py` — fully
-  ported and tested, but Crew Data doesn't need legality checks.
-  Expected to clear in Phase 6 (assignment + legality gate).
-- `db/db.py` no longer flagged — cleared naturally once app.py and
-  pages/2_Crew_Data.py started using it via crew_service.py. This is
-  the reachability checker doing exactly what it's for.
+- `core/legality/pcaa_ano012_core.py`, `core/duty_summary.py`, and
+  now `core/duty_builder.py` are all correctly flagged by
+  `scripts/check_reachability.py` — fully built and tested, but
+  Flight Log doesn't call them (adding a flight isn't the same as
+  building a duty or assigning crew to it). Expected to clear in
+  Phase 6 (assignment + legality gate), which is what will actually
+  tie a flight to a crew member through a duty.
 - The `crew` table schema (001_crew_table.sql) is built against the
   19-column template, not yet against real operator data. When
   Monday's data comes back: check it actually matches this shape
@@ -179,6 +210,13 @@ test instance; production Air Eagle DB not yet provisioned).
   meantime, per phase plan). Roster generator will use Google
   OR-Tools CP-SAT for the assignment optimization (decided
   2026-07-19) — add `ortools` to requirements.txt when Phase 7 starts.
+- Air Eagle's domestic-only vs domestic+international route mix was
+  never confirmed either — core/duty_builder.py's build_duty()
+  requires an explicit domestic=True/False rather than guessing,
+  specifically because this was never answered. Whoever calls
+  build_duty() in Phase 6 needs this decided, or needs it as a
+  per-flight input from Flight Log (arguably better — a mixed
+  ad-hoc+scheduled cargo operator may fly both).
 - RESOLVED 2026-07-19: D21 (charter rest) confirmed as the
   applicable rule for Air Eagle's cargo ops. D20 (home/away base)
   code path still exists in the ported engine for a future
@@ -189,19 +227,30 @@ test instance; production Air Eagle DB not yet provisioned).
   answer expected with Monday's data. Also affects whether
   001_crew_table.sql needs AME/LM-specific columns added later.
 - Auth (require_login/require_permission) is NOT wired anywhere yet
-  — Crew Data page has zero access control right now. Was flagged
-  as a Section 18 requirement in the old repo too and never done
-  there either. Needs a real decision on when to build this — not
-  urgent while only synthetic test data exists, genuinely urgent
-  before any real operator data goes in permanently.
+  — neither page has any access control right now. Needs a real
+  decision on when to build this — not urgent while only synthetic
+  test data exists, genuinely urgent before any real operator data
+  goes in permanently.
+- Supabase: DATABASE_URL is saved locally (2026-07-19) but
+  dependencies (`pip install -r requirements.txt`) hadn't been
+  installed in that venv as of the last update, so migrations were
+  not yet confirmed applied against the real Supabase DB. Also
+  flagged and then explicitly deferred by the user ("tackle Supabase
+  later") — the GitHub-integration collision risk (Supabase's native
+  migration deploy expects a supabase/migrations/ folder we don't
+  use) was explained but not yet confirmed resolved one way or the
+  other. Check status before assuming this is settled.
 
 ## Next safest step
-Phase 5: Duty builder v2 (schedule-agnostic — group whatever flights
-get entered into duties, not hardcoded route templates) + Flight Log
-page. Flight Log needs flight_service.py first (Ownership Table:
-add_flight/update_flight/cancel_flight), following the same pattern
-as crew_service.py — thin page, real service, tests against real
-Postgres including AppTest for the page itself.
+Phase 6: Assignment + legality gate. services/assignment_service.py
+— ties a crew member to a flight through a duty, calling
+core/duty_builder.py to compute the duty window and
+core/legality/pcaa_ano012_core.py to validate it before writing to
+the roster table. This is also where the confirmed live bug from the
+old repo (validate_single_assignment called without its route
+params) needs to be built correctly from the start, not retrofitted
+— there's no old buggy call site here to fix, just don't recreate
+the missing-params version of it.
 
 ## Do not change without discussion
 - migrations/000_migration_tracking.sql — once applied anywhere,
@@ -228,3 +277,9 @@ Postgres including AppTest for the page itself.
   building an unsafe dynamic UPDATE from arbitrary keys). Don't
   loosen either without adding a test for whatever case motivated
   the change.
+- core/duty_builder.py — build_duty() and recompute_fdp_after_delay()
+  are deliberately separate functions, not one function reused for
+  both cases. Do not merge them "for simplicity" — that merge is
+  exactly how the historical block-time bug would come back. If a
+  future change seems to need them merged, that's a signal to
+  re-read the comments in this file first, not a green light.
