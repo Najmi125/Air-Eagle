@@ -16,8 +16,13 @@ tests are skipped (not silently passed) — you'll see exactly which
 ones didn't run and why.
 """
 import os
+import sys
+from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine, text
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @pytest.fixture(scope="function")
@@ -38,3 +43,14 @@ def db_engine():
     yield engine
 
     engine.dispose()
+
+
+@pytest.fixture
+def migrated_db(db_engine):
+    """db_engine already gives a wiped-clean schema. Apply all
+    migrations on top of it — for any test that needs the real
+    crew/flights/roster/audit_log tables, not just an empty DB.
+    Used by test_schema.py, test_crew_service.py, and onward."""
+    from scripts import run_migrations as rm
+    rm.run(engine=db_engine)
+    return db_engine

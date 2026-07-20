@@ -61,6 +61,31 @@ Client: Air Eagle (B737 cargo — ad-hoc + scheduled, confirmed 2026-07-19)
   one flight. crew.base confirmed to have no hardcoded default (a
   bug fixed twice in the old repo) — now an actual regression test,
   not just a one-off fix.
+- Phase 4: Crew Data page — the first real service-layer writes and
+  the first real page in this repo. Built in this order:
+  migrations/004_audit_log.sql (single unified audit table per
+  Section 16 — deliberately not built in Phase 3, since there were
+  no writes yet to audit; building it ahead of need would have been
+  the exact speculative-schema mistake Section 3's FUTURE
+  classification warns against), services/audit_service.py,
+  services/crew_service.py (add/update/deactivate_crew, get_crew,
+  get_all_crew — crew_id always system-generated, never taken from
+  caller input, matching what the crew data template already
+  promised the operator), then app.py and pages/2_Crew_Data.py as
+  thin wrappers calling only these services, no direct SQL.
+  24 new tests (61/61 total): audit_service (append-only, minimal
+  calls leave other fields NULL), crew_service (required-field
+  validation, sequential per-role ID generation, caller-supplied
+  crew_id correctly ignored, soft-delete not hard-delete, audit
+  record written on every operation with before/after state), and —
+  this is the one worth calling out — genuine page-level tests using
+  Streamlit's own AppTest framework: the add-crew form actually
+  gets filled in and submitted against real Postgres, not just
+  syntax-checked. AppTest caught a real, already-relevant
+  deprecation (`use_container_width`, deprecation window closed
+  2025-12-31) that a plain compile check would have missed entirely.
+  crew.base still correctly has no default (regression test from
+  Phase 3 still passing).
 
 ## Why this repo exists (context for future sessions)
 The previous repo (K2 / "K2_for_Claude_Clean") accumulated real
@@ -97,14 +122,16 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Phase 3 complete (this snapshot). Phase 4 (Crew Data page) is next,
-pending confirmation.
+Phase 4 complete (this snapshot). Phase 5 (Duty builder v2 + Flight
+Log) is next, pending confirmation.
 
 ## Files changed
-Phase 3: migrations/001_crew_table.sql (new),
-migrations/002_flights_table.sql (new),
-migrations/003_roster_table.sql (new), tests/test_schema.py (new),
-HANDOVER.md.
+Phase 4: migrations/004_audit_log.sql (new),
+services/audit_service.py (new), services/crew_service.py (new),
+app.py (new), pages/2_Crew_Data.py (new),
+tests/test_audit_service.py (new), tests/test_crew_service.py (new),
+tests/test_crew_data_page.py (new), tests/conftest.py (added shared
+migrated_db fixture, moved from test_schema.py), HANDOVER.md.
 
 ## DB changes (migrations applied)
 - 000_migration_tracking.sql (schema_migrations tracking table)
@@ -115,31 +142,37 @@ HANDOVER.md.
 - 003_roster_table.sql (roster — one row per crew per flight sector,
   duty_id NOT NULL, FKs to crew/flights, UNIQUE on
   crew_id+flight_id+role_assigned, CHECK on debrief > report)
+- 004_audit_log.sql (audit_log — single unified table, all action
+  types, per Section 16's required field list)
 
 ## Tests passed
-37/37 — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (11).
-Against real Postgres 16 (local test instance; production Air Eagle
-DB not yet provisioned). Actual table structure additionally
-verified by hand via psql \d against all three tables — matched the
-migration source exactly.
+61/61 — tests/test_migrations.py (4), tests/test_duty_summary.py
+(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (11),
+tests/test_audit_service.py (3), tests/test_crew_service.py (17),
+tests/test_crew_data_page.py (4). Against real Postgres 16 (local
+test instance; production Air Eagle DB not yet provisioned).
 
 ## Open stubs / known blockers
 - `core/legality/pcaa_ano012_core.py` and `core/duty_summary.py` are
-  correctly flagged by `scripts/check_reachability.py` — fully
-  ported and tested (37/37 passing overall), but not yet called from
-  any service or page. Expected: services/ (Phase 6) is what will
-  actually call these.
-- `db/db.py` is currently flagged by `scripts/check_reachability.py`
-  — correctly. Nothing imports it yet because `app.py` doesn't exist
-  yet. Expected to clear in Phase 4/5.
+  still correctly flagged by `scripts/check_reachability.py` — fully
+  ported and tested, but Crew Data doesn't need legality checks.
+  Expected to clear in Phase 6 (assignment + legality gate).
+- `db/db.py` no longer flagged — cleared naturally once app.py and
+  pages/2_Crew_Data.py started using it via crew_service.py. This is
+  the reachability checker doing exactly what it's for.
 - The `crew` table schema (001_crew_table.sql) is built against the
   19-column template, not yet against real operator data. When
   Monday's data comes back: check it actually matches this shape
   before writing a new migration to add anything — don't assume the
   template survived contact with a real spreadsheet unchanged.
+- `crew.role` is deliberately NOT validated against a fixed list at
+  either the schema or service layer (the template explicitly allows
+  "Other"). pages/2_Crew_Data.py's dropdown offers CPT/FO/LM/ENGR/
+  Other with a free-text field for Other. If this proves too loose
+  once real data arrives, tighten at the service layer, not schema.
 - Waiting on: real crew data from operator (was expected Monday
-  2026-07-20, via AirEagle_Crew_Data_Simple.xlsx)
+  2026-07-20, via AirEagle_Crew_Data_Simple.xlsx) — pages/2_Crew_Data.py
+  is now ready to receive it.
 - Waiting on: Air Eagle's actual route network — blocks duty
   template design and the 28-day roster generator's real content
   (the generator ENGINE can still be built schedule-agnostic in the
@@ -155,12 +188,20 @@ migration source exactly.
   line-maintenance AME) — flagged on the crew data template,
   answer expected with Monday's data. Also affects whether
   001_crew_table.sql needs AME/LM-specific columns added later.
+- Auth (require_login/require_permission) is NOT wired anywhere yet
+  — Crew Data page has zero access control right now. Was flagged
+  as a Section 18 requirement in the old repo too and never done
+  there either. Needs a real decision on when to build this — not
+  urgent while only synthetic test data exists, genuinely urgent
+  before any real operator data goes in permanently.
 
 ## Next safest step
-Phase 4: Crew Data page (pages/2_Crew_Data.py + a real
-crew_service.py, per the Ownership Table — not page-level SQL).
-This is also the natural point to load Monday's real operator data
-once it arrives, since the page will be what actually writes it in.
+Phase 5: Duty builder v2 (schedule-agnostic — group whatever flights
+get entered into duties, not hardcoded route templates) + Flight Log
+page. Flight Log needs flight_service.py first (Ownership Table:
+add_flight/update_flight/cancel_flight), following the same pattern
+as crew_service.py — thin page, real service, tests against real
+Postgres including AppTest for the page itself.
 
 ## Do not change without discussion
 - migrations/000_migration_tracking.sql — once applied anywhere,
@@ -180,3 +221,10 @@ once it arrives, since the page will be what actually writes it in.
   003_roster_table.sql — once applied anywhere, immutable like
   000_. Need a new column, e.g. for Engr/LM quals once confirmed?
   New numbered migration (004_...). Never edit these three in place.
+- migrations/004_audit_log.sql — same rule, immutable once applied.
+- services/crew_service.py — crew_id generation logic
+  (_generate_crew_id) and the UPDATABLE_FIELDS allowlist are both
+  load-bearing for data integrity (the allowlist is what prevents
+  building an unsafe dynamic UPDATE from arbitrary keys). Don't
+  loosen either without adding a test for whatever case motivated
+  the change.
