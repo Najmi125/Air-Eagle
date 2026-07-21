@@ -39,6 +39,7 @@ with st.form("add_flight_form", clear_on_submit=True):
         origin = st.text_input("Origin *")
         destination = st.text_input("Destination *")
         aircraft = st.text_input("Aircraft")
+        domestic = st.radio("Domestic or international? *", ["Domestic", "International"], horizontal=True)
 
     with col2:
         dep_date = st.date_input("Departure date *", value=dt.date.today())
@@ -60,6 +61,7 @@ with st.form("add_flight_form", clear_on_submit=True):
                 "aircraft": aircraft or None,
                 "dep_time_planned": dt.datetime.combine(dep_date, dep_time),
                 "arr_time_planned": dt.datetime.combine(arr_date, arr_time),
+                "domestic": domestic == "Domestic",
                 "cargo_dg": cargo_dg,
                 "remarks": remarks or None,
             })

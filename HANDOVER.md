@@ -113,6 +113,79 @@ Client: Air Eagle (B737 cargo — ad-hoc + scheduled, confirmed 2026-07-19)
   including the permanent-log requirement verified through the
   actual UI (add a flight, cancel it, confirm it's still visible
   with status=CANCELLED, not removed from the table).
+- Phase 6: Assignment + legality gate. The biggest phase yet, and the
+  one where the actual workflow architecture got clarified properly
+  (see "Architecture: Roster vs Control Room" below — read that
+  before touching either page). Two new migrations first:
+  005_roster_partial_unique_index.sql (Phase 3's UNIQUE constraint on
+  roster would have permanently blocked ever re-assigning the same
+  crew/flight/role after an unassignment — replaced with a partial
+  unique index that only applies to non-cancelled rows) and
+  006_flights_domestic_column.sql (domestic is a property of the
+  route, decided once at flight creation — NOT NULL, no default,
+  moved off being asked per-assignment).
+  services/assignment_service.py: the core write path for roster,
+  shared by both Roster and Control Room. Two real bugs found and
+  fixed during testing, not just written and assumed correct:
+    1. flight_service.py's and crew_service.py's required-field
+       checks used truthiness (`if not value`), which incorrectly
+       treats a legitimate `domestic=False` as "missing" (`not False`
+       is `True`). Fixed to distinguish None/empty from a real False.
+       Both directions now have permanent regression tests.
+    2. The downstream-impact check's before/after duty comparison
+       never actually included the future duty being assessed in
+       either list — it would have silently returned "no conflicts"
+       on every single call, which is worse than not having the
+       feature at all, since it would have looked like it worked.
+       Rewritten to independently load full context (lookback window
+       through each future duty's own start time) per future duty
+       checked. Caught immediately because the downstream-conflict
+       tests were written to assert a SPECIFIC conflict using real
+       D21 rest-math numbers, not just "does this not crash."
+  assign_crew_to_duty() (Roster — assign to a flight that already
+  exists) and assign_crew_to_new_flights() (Control Room — atomic
+  flight-creation + assignment, gated by legality BEFORE either is
+  written) share one validation core (_validate_new_duty) rather than
+  duplicating the legality orchestration — SSOT, not two copies that
+  could drift. find_legal_candidates_for_duty() searches active crew
+  by role and returns who would actually be legal, not just who has
+  the right role.
+  pages/4_Roster.py and pages/1_Control_Room.py both built as thin
+  wrappers over assignment_service.py.
+  33 new tests (122/122 total): 20 for assignment_service (including
+  the atomic no-orphan-flight guarantee, verified directly — an
+  illegal ad-hoc assignment leaves flight count unchanged), 4 AppTest
+  tests each for Control Room and Roster pages.
+
+## Architecture: Roster vs Control Room (clarified 2026-07-20)
+
+Two distinct entry points for crew assignment, both writing through
+the same services/assignment_service.py — read this before touching
+either page, it's not obvious from the code alone:
+
+| | Roster page (pages/4_Roster.py) | Control Room (pages/1_Control_Room.py) |
+|---|---|---|
+| For | Scheduled flights | Ad-hoc / unscheduled / charter |
+| Flight source | Already exists (Flight Log / future auto-generator) | Created in the same action |
+| Function called | assign_crew_to_duty() | assign_crew_to_new_flights() |
+| On ILLEGAL | Assignment rejected, flight untouched (it already existed) | BOTH flight and assignment rejected — no orphan flight saved |
+
+Both funnel through `_validate_new_duty()` — one validation core, not
+two copies. The only real difference is atomicity: Control Room's
+save is gated as one unit because the flight doesn't exist
+independently of the crew decision the way a Flight-Log-created
+flight does.
+
+**The downstream "swap alert" catch** (also from this clarification):
+assigning a crew member to ANY new duty — ad-hoc or scheduled — can
+make an ALREADY-scheduled future duty of theirs illegal, even though
+the new assignment is perfectly legal on its own (it just consumes
+enough rest/cumulative hours). Both assignment functions call
+`_check_downstream_impact()` after a successful save. Scope was
+explicitly decided as "alert + suggest legal candidates, human
+confirms" — not full auto-reassignment. That's Phase 7/reoptimization
+territory if it ever gets built; don't quietly expand this function's
+scope to auto-apply a swap without that being a deliberate decision.
 
 ## Why this repo exists (context for future sessions)
 The previous repo (K2 / "K2_for_Claude_Clean") accumulated real
@@ -149,15 +222,24 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Phase 5 complete (this snapshot). Phase 6 (Assignment + legality
-gate) is next, pending confirmation.
+Phase 6 complete (this snapshot). Phase 7 (28-day roster generator,
+OR-Tools) is next, pending confirmation — and pending the route
+network, which was still not received as of this snapshot.
 
 ## Files changed
-Phase 5: core/duty_builder.py (new), services/flight_service.py
-(new), app.py (updated — nav to Flight Log), pages/3_Flight_Log.py
-(new), tests/test_duty_builder.py (new),
-tests/test_flight_service.py (new), tests/test_flight_log_page.py
-(new), HANDOVER.md.
+Phase 6: migrations/005_roster_partial_unique_index.sql (new),
+migrations/006_flights_domestic_column.sql (new),
+services/assignment_service.py (new),
+services/flight_service.py (bugfix: required-field truthiness),
+services/crew_service.py (bugfix: same pattern, defensive fix),
+pages/3_Flight_Log.py (domestic field added to form),
+pages/4_Roster.py (new), pages/1_Control_Room.py (new),
+tests/test_schema.py (3 new tests for the partial unique index +
+domestic column), tests/test_flight_service.py (regression tests for
+the truthiness bug, domestic field added to existing helper),
+tests/test_flight_log_page.py (domestic field added to seed calls),
+tests/test_assignment_service.py (new), tests/test_control_room_page.py
+(new), tests/test_roster_page.py (new), HANDOVER.md.
 
 ## DB changes (migrations applied)
 - 000_migration_tracking.sql (schema_migrations tracking table)
@@ -166,57 +248,61 @@ tests/test_flight_service.py (new), tests/test_flight_log_page.py
 - 002_flights_table.sql (flights — flight_no nullable for ad-hoc ops,
   CHECK-constrained status, CHECK on arr > dep)
 - 003_roster_table.sql (roster — one row per crew per flight sector,
-  duty_id NOT NULL, FKs to crew/flights, UNIQUE on
-  crew_id+flight_id+role_assigned, CHECK on debrief > report)
+  duty_id NOT NULL, FKs to crew/flights, CHECK on debrief > report)
 - 004_audit_log.sql (audit_log — single unified table, all action
   types, per Section 16's required field list)
-- No new migrations in Phase 5 — duty_builder.py is pure logic, no
-  schema of its own; flight_service.py uses the flights table
-  already built in Phase 3.
+- 005_roster_partial_unique_index.sql (replaces roster's UNIQUE
+  constraint with a partial index — non-cancelled rows only — so
+  unassign-then-reassign of the same crew/flight/role works)
+- 006_flights_domestic_column.sql (flights.domestic, NOT NULL, no
+  default — required at flight-creation time, never guessed)
 
 ## Tests passed
-89/89 — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (11),
+122/122 — tests/test_migrations.py (4), tests/test_duty_summary.py
+(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (14),
 tests/test_audit_service.py (3), tests/test_crew_service.py (17),
 tests/test_crew_data_page.py (4), tests/test_duty_builder.py (10),
-tests/test_flight_service.py (13), tests/test_flight_log_page.py (5).
-Against real Postgres 16 (local test instance; production Air Eagle
-DB not yet provisioned).
+tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
+tests/test_assignment_service.py (20), tests/test_control_room_page.py
+(4), tests/test_roster_page.py (4). Against real Postgres 16 (local
+test instance; production Air Eagle DB not yet provisioned).
 
 ## Open stubs / known blockers
-- `core/legality/pcaa_ano012_core.py`, `core/duty_summary.py`, and
-  now `core/duty_builder.py` are all correctly flagged by
-  `scripts/check_reachability.py` — fully built and tested, but
-  Flight Log doesn't call them (adding a flight isn't the same as
-  building a duty or assigning crew to it). Expected to clear in
-  Phase 6 (assignment + legality gate), which is what will actually
-  tie a flight to a crew member through a duty.
+- `core/duty_summary.py` is the only file still flagged by
+  `scripts/check_reachability.py`. Correctly so — it's for cumulative-
+  hours reporting/dashboards, not the assignment flow (which uses
+  pcaa_ano012_core.py's validator directly on Duty objects, a
+  different code path). No page uses it yet. Not urgent; would matter
+  for a future crew-profile or compliance-dashboard page.
 - The `crew` table schema (001_crew_table.sql) is built against the
-  19-column template, not yet against real operator data. When
-  Monday's data comes back: check it actually matches this shape
-  before writing a new migration to add anything — don't assume the
-  template survived contact with a real spreadsheet unchanged.
+  19-column template, not yet against real operator data. When the
+  route network + crew data comes back: check it actually matches
+  this shape before writing a new migration to add anything — don't
+  assume the template survived contact with a real spreadsheet
+  unchanged.
 - `crew.role` is deliberately NOT validated against a fixed list at
   either the schema or service layer (the template explicitly allows
-  "Other"). pages/2_Crew_Data.py's dropdown offers CPT/FO/LM/ENGR/
-  Other with a free-text field for Other. If this proves too loose
-  once real data arrives, tighten at the service layer, not schema.
-- Waiting on: real crew data from operator (was expected Monday
-  2026-07-20, via AirEagle_Crew_Data_Simple.xlsx) — pages/2_Crew_Data.py
-  is now ready to receive it.
-- Waiting on: Air Eagle's actual route network — blocks duty
-  template design and the 28-day roster generator's real content
-  (the generator ENGINE can still be built schedule-agnostic in the
-  meantime, per phase plan). Roster generator will use Google
-  OR-Tools CP-SAT for the assignment optimization (decided
-  2026-07-19) — add `ortools` to requirements.txt when Phase 7 starts.
-- Air Eagle's domestic-only vs domestic+international route mix was
-  never confirmed either — core/duty_builder.py's build_duty()
-  requires an explicit domestic=True/False rather than guessing,
-  specifically because this was never answered. Whoever calls
-  build_duty() in Phase 6 needs this decided, or needs it as a
-  per-flight input from Flight Log (arguably better — a mixed
-  ad-hoc+scheduled cargo operator may fly both).
+  "Other"). If this proves too loose once real data arrives, tighten
+  at the service layer, not schema.
+- RESOLVED 2026-07-20: Air Eagle's domestic vs international route
+  mix — rather than needing an answer up front, this is now decided
+  per-flight via flights.domestic (006_flights_domestic_column.sql),
+  required at creation time on both Flight Log and Control Room's
+  forms. Handles a mixed ad-hoc+scheduled operator flying both
+  without needing a single global answer.
+- Waiting on: real crew data from operator, and Air Eagle's route
+  network — both confirmed still not received as of 2026-07-20
+  ("not today, as was expected"). Neither blocks further building —
+  see the phase-sequencing discussion in project chat history for
+  why. Phase 7's roster generator is the first phase that actually
+  needs the route network for its real content (the OR-Tools engine
+  itself can still be built schedule-agnostic without it).
+- The "reoptimize roster accordingly" scope was explicitly decided as
+  alert + suggest legal candidates, human confirms — NOT full
+  auto-reassignment. See the Architecture note above. Don't expand
+  `_check_downstream_impact()` / `find_legal_candidates_for_duty()`
+  to auto-apply a swap without that being a deliberate, separate
+  decision — that's real Phase 7/reoptimization-engine territory.
 - RESOLVED 2026-07-19: D21 (charter rest) confirmed as the
   applicable rule for Air Eagle's cargo ops. D20 (home/away base)
   code path still exists in the ported engine for a future
@@ -224,33 +310,38 @@ DB not yet provisioned).
   Eagle's confirmed operation_type="cargo_charter" default.
 - "Engr" role definition unconfirmed (flight-deck FE vs
   line-maintenance AME) — flagged on the crew data template,
-  answer expected with Monday's data. Also affects whether
-  001_crew_table.sql needs AME/LM-specific columns added later.
+  still pending with the rest of the operator data.
 - Auth (require_login/require_permission) is NOT wired anywhere yet
-  — neither page has any access control right now. Needs a real
-  decision on when to build this — not urgent while only synthetic
-  test data exists, genuinely urgent before any real operator data
-  goes in permanently.
+  — none of the four pages have any access control right now. Needs
+  a real decision on when to build this — not urgent while only
+  synthetic test data exists, genuinely urgent before any real
+  operator data goes in permanently. This gap has now persisted
+  across 6 phases; worth deciding deliberately rather than by default
+  much longer.
 - Supabase: DATABASE_URL is saved locally (2026-07-19) but
   dependencies (`pip install -r requirements.txt`) hadn't been
   installed in that venv as of the last update, so migrations were
-  not yet confirmed applied against the real Supabase DB. Also
-  flagged and then explicitly deferred by the user ("tackle Supabase
-  later") — the GitHub-integration collision risk (Supabase's native
-  migration deploy expects a supabase/migrations/ folder we don't
-  use) was explained but not yet confirmed resolved one way or the
-  other. Check status before assuming this is settled.
+  not yet confirmed applied against the real Supabase DB. Explicitly
+  deferred by the user ("tackle Supabase later"). The GitHub-
+  integration collision risk (Supabase's native migration deploy
+  expects a supabase/migrations/ folder we don't use) was explained
+  but not yet confirmed resolved one way or the other. Check status
+  before assuming this is settled — two new migrations (005, 006)
+  have been added since this was last touched, so there's more to
+  apply than there was when it was set aside.
 
 ## Next safest step
-Phase 6: Assignment + legality gate. services/assignment_service.py
-— ties a crew member to a flight through a duty, calling
-core/duty_builder.py to compute the duty window and
-core/legality/pcaa_ano012_core.py to validate it before writing to
-the roster table. This is also where the confirmed live bug from the
-old repo (validate_single_assignment called without its route
-params) needs to be built correctly from the start, not retrofitted
-— there's no old buggy call site here to fix, just don't recreate
-the missing-params version of it.
+Phase 7: 28-day roster generator (Google OR-Tools CP-SAT, decided
+2026-07-19). Blocked on the route network for real content, but the
+generator engine itself — coverage constraints, fairness objective,
+legality gate reusing assign_crew_to_duty()'s validation core, the
+sliding-window freeze-and-reoptimize pattern — can be built and
+tested schedule-agnostic against synthetic data now, same as every
+other phase so far. Separate page (pages/X_Roster_Generator.py,
+decided 2026-07-20) rather than a tab on the existing Roster page —
+bulk-generate-and-review is a different interaction pattern from
+manual single-assignment, and both write through the same
+assignment_service.py regardless of the page split.
 
 ## Do not change without discussion
 - migrations/000_migration_tracking.sql — once applied anywhere,
@@ -283,3 +374,21 @@ the missing-params version of it.
   exactly how the historical block-time bug would come back. If a
   future change seems to need them merged, that's a signal to
   re-read the comments in this file first, not a green light.
+- migrations/005_roster_partial_unique_index.sql,
+  006_flights_domestic_column.sql — same immutability rule as every
+  other applied migration.
+- services/assignment_service.py — _validate_new_duty() is the single
+  validation core for BOTH assign_crew_to_duty() and
+  assign_crew_to_new_flights(). Do not let a future change duplicate
+  this logic into one of the two callers "just for this one case" —
+  that reopens exactly the two-sources-of-truth failure mode this
+  whole rebuild exists to prevent. If Roster and Control Room ever
+  need to validate differently, that's a sign the shared function
+  needs a parameter, not a fork.
+- services/assignment_service.py — _check_downstream_impact() had a
+  real, silent bug (see Recently Completed, Phase 6) where it never
+  actually included the future duty being assessed in its
+  before/after comparison. Any future change to this function needs
+  a test that asserts a SPECIFIC expected conflict with real numbers
+  — a test that only checks "doesn't crash" would not have caught
+  that bug and won't catch the next version of it either.

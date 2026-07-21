@@ -37,6 +37,7 @@ def _valid_flight(**overrides):
         "destination": "LHE",
         "dep_time_planned": dt.datetime(2026, 7, 20, 5, 0),
         "arr_time_planned": dt.datetime(2026, 7, 20, 7, 0),
+        "domestic": True,
     }
     base.update(overrides)
     return base
@@ -59,6 +60,23 @@ def test_add_flight_success_returns_id(_patch_engine):
 def test_add_flight_missing_required_field_raises(_patch_engine):
     with pytest.raises(ValueError):
         flight_service.add_flight({"origin": "KHI", "destination": "LHE"})
+
+
+def test_add_flight_domestic_false_is_not_treated_as_missing(_patch_engine):
+    """Regression test: the required-field check originally used
+    truthiness (`not value`), which incorrectly treats domestic=False
+    as missing since `not False` is True. A domestic=False flight is
+    completely valid and must not be rejected."""
+    flight_id = flight_service.add_flight(_valid_flight(domestic=False))
+    row = flight_service.get_flight(flight_id)
+    assert row["domestic"] == False
+
+
+def test_add_flight_empty_string_origin_is_still_treated_as_missing(_patch_engine):
+    """The fix for the domestic=False case must not overcorrect and
+    let an empty-string origin through as 'present'."""
+    with pytest.raises(ValueError):
+        flight_service.add_flight(_valid_flight(origin=""))
 
 
 def test_add_flight_arrival_before_departure_raises_at_service_layer(_patch_engine):

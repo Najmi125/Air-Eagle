@@ -68,7 +68,7 @@ def add_crew(crew_data: dict, app_user: Optional[str] = None) -> str:
     per the platform's "never fill missing policy with silent
     defaults" principle.
     """
-    missing = [f for f in REQUIRED_FIELDS if not crew_data.get(f)]
+    missing = [f for f in REQUIRED_FIELDS if not crew_data.get(f) and crew_data.get(f) is not False]
     if missing:
         raise ValueError(f"Missing required crew field(s): {', '.join(missing)}")
 

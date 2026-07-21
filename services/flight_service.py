@@ -18,13 +18,13 @@ from sqlalchemy import text
 from db.db import get_engine
 from services.audit_service import log_audit
 
-REQUIRED_FIELDS = {"origin", "destination", "dep_time_planned", "arr_time_planned"}
+REQUIRED_FIELDS = {"origin", "destination", "dep_time_planned", "arr_time_planned", "domestic"}
 
 UPDATABLE_FIELDS = {
     "flight_no", "origin", "destination", "aircraft",
     "dep_time_planned", "arr_time_planned",
     "dep_time_actual", "arr_time_actual",
-    "status", "cargo_dg", "remarks",
+    "status", "cargo_dg", "remarks", "domestic",
 }
 
 
@@ -36,7 +36,7 @@ def add_flight(flight_data: dict, app_user: Optional[str] = None) -> int:
     layer too (not just relying on the DB CHECK constraint) so the
     caller gets a clean ValueError instead of a raw SQL error.
     """
-    missing = [f for f in REQUIRED_FIELDS if not flight_data.get(f)]
+    missing = [f for f in REQUIRED_FIELDS if not flight_data.get(f) and flight_data.get(f) is not False]
     if missing:
         raise ValueError(f"Missing required flight field(s): {', '.join(missing)}")
 

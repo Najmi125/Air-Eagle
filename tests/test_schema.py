@@ -23,16 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 import pandas as pd
 from sqlalchemy import text
-from scripts import run_migrations as rm
 from core.duty_summary import calculate_crew_duty_summary
-
-
-@pytest.fixture
-def migrated_db(db_engine):
-    """db_engine (conftest.py) already gives a wiped-clean schema.
-    Apply all migrations on top of it for schema tests."""
-    rm.run(engine=db_engine)
-    return db_engine
 
 
 def _insert_crew(engine, crew_id="CPT-01", role="CPT"):
@@ -42,14 +33,14 @@ def _insert_crew(engine, crew_id="CPT-01", role="CPT"):
         ), {"cid": crew_id, "name": "Test Crew", "role": role})
 
 
-def _insert_flight(engine, dep=None, arr=None):
+def _insert_flight(engine, dep=None, arr=None, domestic=True):
     dep = dep or dt.datetime(2026, 7, 20, 5, 0)
     arr = arr or dt.datetime(2026, 7, 20, 9, 0)
     with engine.begin() as conn:
         result = conn.execute(text(
-            "INSERT INTO flights (origin, destination, dep_time_planned, arr_time_planned) "
-            "VALUES ('KHI', 'LHE', :dep, :arr) RETURNING flight_id"
-        ), {"dep": dep, "arr": arr})
+            "INSERT INTO flights (origin, destination, dep_time_planned, arr_time_planned, domestic) "
+            "VALUES ('KHI', 'LHE', :dep, :arr, :domestic) RETURNING flight_id"
+        ), {"dep": dep, "arr": arr, "domestic": domestic})
         return result.scalar()
 
 
@@ -98,6 +89,19 @@ def test_base_column_has_no_hardcoded_default(migrated_db):
     assert default is None
 
 
+def test_flights_domestic_is_required_not_defaulted(migrated_db):
+    """domestic must be NOT NULL with no default — Air Eagle's route
+    mix was never confirmed, so this must be an explicit decision at
+    flight-creation time, never silently assumed."""
+    with migrated_db.connect() as conn:
+        row = conn.execute(text(
+            "SELECT is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_name = 'flights' AND column_name = 'domestic'"
+        )).fetchone()
+    assert row[0] == "NO"
+    assert row[1] is None
+
+
 # ------------------------------------------------------------------
 # Constraints actually enforce what they claim to
 # ------------------------------------------------------------------
@@ -131,8 +135,8 @@ def test_flights_rejects_invalid_status(migrated_db):
         with migrated_db.begin() as conn:
             conn.execute(text(
                 "INSERT INTO flights (origin, destination, dep_time_planned, "
-                "arr_time_planned, status) VALUES ('KHI', 'LHE', "
-                "'2026-07-20 05:00', '2026-07-20 09:00', 'NOT_A_REAL_STATUS')"
+                "arr_time_planned, status, domestic) VALUES ('KHI', 'LHE', "
+                "'2026-07-20 05:00', '2026-07-20 09:00', 'NOT_A_REAL_STATUS', TRUE)"
             ))
 
 
@@ -140,8 +144,8 @@ def test_flights_rejects_arrival_before_departure(migrated_db):
     with pytest.raises(Exception):
         with migrated_db.begin() as conn:
             conn.execute(text(
-                "INSERT INTO flights (origin, destination, dep_time_planned, arr_time_planned) "
-                "VALUES ('KHI', 'LHE', '2026-07-20 09:00', '2026-07-20 05:00')"
+                "INSERT INTO flights (origin, destination, dep_time_planned, arr_time_planned, domestic) "
+                "VALUES ('KHI', 'LHE', '2026-07-20 09:00', '2026-07-20 05:00', TRUE)"
             ))
 
 
@@ -206,6 +210,62 @@ def test_two_different_crew_can_hold_same_role_same_flight(migrated_db):
             "SELECT COUNT(*) FROM roster WHERE flight_id = :fid"
         ), {"fid": flight_id}).scalar()
     assert count == 2
+
+
+def test_cancelled_assignment_does_not_block_reassignment(migrated_db):
+    """Regression test for the partial unique index (005): cancelling
+    an assignment then re-assigning the same (crew, flight, role)
+    must succeed — the old unconditional UNIQUE constraint would have
+    permanently blocked this."""
+    _insert_crew(migrated_db)
+    flight_id = _insert_flight(migrated_db)
+
+    with migrated_db.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO roster (crew_id, flight_id, duty_id, duty_date, "
+            "report_time, debrief_time, role_assigned, status) "
+            "VALUES ('CPT-01', :fid, 'D-1', '2026-07-20', "
+            "'2026-07-20 05:00', '2026-07-20 09:00', 'CPT', 'CANCELLED')"
+        ), {"fid": flight_id})
+
+    # Re-assigning the exact same (crew, flight, role) after the
+    # first one was cancelled must succeed, not raise.
+    with migrated_db.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO roster (crew_id, flight_id, duty_id, duty_date, "
+            "report_time, debrief_time, role_assigned) "
+            "VALUES ('CPT-01', :fid, 'D-2', '2026-07-20', "
+            "'2026-07-20 05:00', '2026-07-20 09:00', 'CPT')"
+        ), {"fid": flight_id})
+
+    with migrated_db.connect() as conn:
+        count = conn.execute(text(
+            "SELECT COUNT(*) FROM roster WHERE flight_id = :fid"
+        ), {"fid": flight_id}).scalar()
+    assert count == 2  # the cancelled one + the new active one, both present
+
+
+def test_two_simultaneously_active_duplicates_still_blocked(migrated_db):
+    """The partial index must still block a genuine duplicate ACTIVE
+    assignment — it only exempts cancelled rows, not all rows."""
+    _insert_crew(migrated_db)
+    flight_id = _insert_flight(migrated_db)
+    with migrated_db.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO roster (crew_id, flight_id, duty_id, duty_date, "
+            "report_time, debrief_time, role_assigned) "
+            "VALUES ('CPT-01', :fid, 'D-1', '2026-07-20', "
+            "'2026-07-20 05:00', '2026-07-20 09:00', 'CPT')"
+        ), {"fid": flight_id})
+
+    with pytest.raises(Exception):
+        with migrated_db.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO roster (crew_id, flight_id, duty_id, duty_date, "
+                "report_time, debrief_time, role_assigned) "
+                "VALUES ('CPT-01', :fid, 'D-2', '2026-07-20', "
+                "'2026-07-20 05:00', '2026-07-20 09:00', 'CPT')"
+            ), {"fid": flight_id})
 
 
 # ------------------------------------------------------------------

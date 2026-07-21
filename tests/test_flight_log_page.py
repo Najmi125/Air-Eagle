@@ -83,6 +83,7 @@ def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):
         "origin": "KHI", "destination": "LHE",
         "dep_time_planned": dt.datetime(2026, 7, 20, 5, 0),
         "arr_time_planned": dt.datetime(2026, 7, 20, 7, 0),
+        "domestic": True,
     })
 
     at = page_app.run()
