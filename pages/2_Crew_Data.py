@@ -50,8 +50,9 @@ with st.form("add_crew_form", clear_on_submit=True):
 
     with col3:
         type_rating_expiry = st.date_input("Type Rating Expiry", value=None)
-        lpc_opc_expiry = st.date_input("LPC/OPC Expiry", value=None)
-        line_check_expiry = st.date_input("Line Check Expiry", value=None)
+        ir_expiry = st.date_input("IR (Instrument Rating) Expiry", value=None)
+        sim_expiry = st.date_input("SIM Expiry", value=None)
+        route_check_expiry = st.date_input("Route Check Expiry", value=None)
         sep_expiry = st.date_input("SEP Expiry", value=None)
         crm_expiry = st.date_input("CRM Expiry", value=None)
         dg_expiry = st.date_input("DG Expiry", value=None)
@@ -77,8 +78,9 @@ with st.form("add_crew_form", clear_on_submit=True):
                 "medical_expiry": medical_expiry,
                 "contract_expiry": contract_expiry,
                 "type_rating_expiry": type_rating_expiry,
-                "lpc_opc_expiry": lpc_opc_expiry,
-                "line_check_expiry": line_check_expiry,
+                "ir_expiry": ir_expiry,
+                "sim_expiry": sim_expiry,
+                "route_check_expiry": route_check_expiry,
                 "sep_expiry": sep_expiry,
                 "crm_expiry": crm_expiry,
                 "dg_expiry": dg_expiry,

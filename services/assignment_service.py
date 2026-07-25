@@ -41,7 +41,7 @@ from services.audit_service import log_audit
 from services import crew_service, flight_service
 from core.duty_builder import build_duty, FlightLeg
 from core.legality.pcaa_ano012_core import (
-    ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus,
+    ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus, ValidationResult,
 )
 
 validator = ANO012CoreValidator()
@@ -49,6 +49,18 @@ validator = ANO012CoreValidator()
 # How far back to look when checking a crew member's rolling-window
 # history. 28-day limits need this margin; 35 gives headroom.
 LOOKBACK_DAYS = 35
+
+# Confirmed 2026-07-21: Loadmasters and Engr (line-maintenance AME,
+# not flight-deck) are NOT subject to ANO-012's FTL/FDP/rest rules —
+# those govern FLIGHT crew duty time specifically. This is a role-
+# based operational classification, not a mathematical rule, so it's
+# handled here in the orchestration layer, not inside
+# core/legality/pcaa_ano012_core.py — the core engine stays
+# role-agnostic (it only knows about CrewMember/Duty/Sector), and
+# "which roles this applies to" is a regulatory/operational decision
+# that belongs with the service that orchestrates the check, not
+# baked into the math itself.
+FTL_EXEMPT_ROLES = {"LM", "ENGR"}
 
 
 @dataclass
@@ -174,6 +186,18 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
                          origin=l.origin, destination=l.destination) for l in legs],
     )
 
+    if crew_row["role"] in FTL_EXEMPT_ROLES:
+        # No FTL rules apply to this role — don't run FDP/rest math
+        # against duty history that isn't relevant to it. Still build
+        # new_duty above (needed for the roster write and audit
+        # trail), just skip the legality computation itself.
+        validation_result = ValidationResult(
+            status=AlertStatus.LEGAL,
+            alerts=[],
+            computed={"ftl_exempt": True, "role": crew_row["role"]},
+        )
+        return validation_result, new_duty, crew_member, crew_row, duty_result
+
     lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
     existing_records = _load_duty_records_for_crew(
         engine, crew_id, crew_row["base"], start=lookback_start, end=duty_result.debrief_time)
@@ -270,8 +294,11 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         app_user=app_user,
     )
 
-    downstream_conflicts = _check_downstream_impact(
-        engine, crew_id, crew_row["base"], crew_member, new_duty)
+    if crew_row["role"] in FTL_EXEMPT_ROLES:
+        downstream_conflicts = []
+    else:
+        downstream_conflicts = _check_downstream_impact(
+            engine, crew_id, crew_row["base"], crew_member, new_duty)
 
     return AssignmentResult(
         status="ALLOWED",
@@ -390,8 +417,11 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         app_user=app_user,
     )
 
-    downstream_conflicts = _check_downstream_impact(
-        engine, crew_id, crew_row["base"], crew_member, new_duty)
+    if crew_row["role"] in FTL_EXEMPT_ROLES:
+        downstream_conflicts = []
+    else:
+        downstream_conflicts = _check_downstream_impact(
+            engine, crew_id, crew_row["base"], crew_member, new_duty)
 
     return AssignmentResult(
         status="ALLOWED",
@@ -467,7 +497,22 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     crew_ids who WOULD be legal if assigned to this duty, given their
     own existing duty history. Does not check location (not tracked —
     see HANDOVER.md) or write anything; read-only candidate search.
+
+    For FTL-exempt roles (LM, ENGR), every active crew member holding
+    that role is trivially a legal candidate — there's no FTL history
+    that could make them illegal, so the simulation loop is skipped
+    entirely rather than running validate_schedule() against rules
+    that don't apply to them.
     """
+    all_crew = crew_service.get_all_crew(active_only=True)
+    candidates_pool = all_crew[all_crew["role"] == role_assigned]
+
+    if role_assigned in FTL_EXEMPT_ROLES:
+        return [
+            cid for cid in candidates_pool["crew_id"]
+            if not (exclude_crew_id and cid == exclude_crew_id)
+        ]
+
     engine = get_engine()
     flights = [flight_service.get_flight(fid) for fid in flight_ids]
     if any(f is None for f in flights):
@@ -480,9 +525,6 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
         origin=f["origin"], destination=f["destination"],
     ) for f in flights]
     duty_result = build_duty(legs, domestic=domestic)
-
-    all_crew = crew_service.get_all_crew(active_only=True)
-    candidates_pool = all_crew[all_crew["role"] == role_assigned]
 
     legal_candidates = []
     for _, crew_row in candidates_pool.iterrows():

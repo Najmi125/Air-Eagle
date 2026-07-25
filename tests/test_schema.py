@@ -59,8 +59,10 @@ def test_all_three_tables_exist_after_migration(migrated_db):
 
 
 def test_crew_table_has_all_template_columns(migrated_db):
-    """Cross-checks against the exact template sent to the operator
-    — if this drifts, the columns won't match what comes back Monday."""
+    """Cross-checks against the reconciled schema (template + the real
+    operator terminology from migration 007: SIM/Route Check/IR) — if
+    this drifts, the columns won't match what the operator's data
+    actually uses."""
     with migrated_db.connect() as conn:
         cols = conn.execute(text(
             "SELECT column_name FROM information_schema.columns "
@@ -71,10 +73,25 @@ def test_crew_table_has_all_template_columns(migrated_db):
         "crew_id", "operator_staff_id", "name", "role", "date_of_birth",
         "nationality", "base", "phone", "email", "license_no",
         "license_expiry", "medical_expiry", "type_rating_expiry",
-        "lpc_opc_expiry", "line_check_expiry", "sep_expiry", "crm_expiry",
-        "dg_expiry", "contract_expiry", "remarks",
+        "sim_expiry", "route_check_expiry", "ir_expiry",
+        "sep_expiry", "crm_expiry", "dg_expiry", "contract_expiry", "remarks",
     }
     assert expected <= col_names
+
+
+def test_crew_table_old_column_names_are_gone(migrated_db):
+    """Migration 007 renamed lpc_opc_expiry -> sim_expiry and
+    line_check_expiry -> route_check_expiry to match the operator's
+    real terminology. The old names must not linger as leftover
+    columns — that would mean the rename silently failed to apply."""
+    with migrated_db.connect() as conn:
+        cols = conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'crew'"
+        )).fetchall()
+    col_names = {row[0] for row in cols}
+    assert "lpc_opc_expiry" not in col_names
+    assert "line_check_expiry" not in col_names
 
 
 def test_base_column_has_no_hardcoded_default(migrated_db):

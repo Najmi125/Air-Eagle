@@ -212,16 +212,16 @@ def test_downstream_conflict_includes_legal_candidates(_patch_engine):
 # ------------------------------------------------------------------
 
 def test_find_legal_candidates_excludes_illegal_crew(_patch_engine):
-    legal_crew = _add_crew("LM")
-    illegal_crew = _add_crew("LM")
+    legal_crew = _add_crew("CPT")
+    illegal_crew = _add_crew("CPT")
 
     # illegal_crew has a heavy duty ending too close to the target.
     prior_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
-    assignment_service.assign_crew_to_duty(illegal_crew, [prior_flight], "LM")
+    assignment_service.assign_crew_to_duty(illegal_crew, [prior_flight], "CPT")
 
     target_flight = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
 
-    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "LM")
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "CPT")
 
     assert legal_crew in candidates
     assert illegal_crew not in candidates
@@ -236,6 +236,114 @@ def test_find_legal_candidates_only_matches_role(_patch_engine):
 
     assert lm_crew in candidates
     assert cpt_crew not in candidates
+
+
+# ------------------------------------------------------------------
+# FTL exemption for LM / Engr (confirmed 2026-07-21: Loadmasters and
+# Engr — line-maintenance AME, not flight-deck — are not subject to
+# ANO-012's FTL/rest rules at all)
+# ------------------------------------------------------------------
+
+def test_lm_assignment_allowed_despite_rest_that_would_reject_a_cpt(_patch_engine):
+    """The exact scenario from test_insufficient_rest_after_prior_duty_is_rejected
+    (8h FDP duty, only 5h before the next one — clearly ILLEGAL for a
+    CPT under D21) must be ALLOWED for an LM, since FTL doesn't apply
+    to them at all."""
+    crew_id = _add_crew("LM")
+
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    result1 = assignment_service.assign_crew_to_duty(crew_id, [f1], "LM")
+    assert result1.status == "ALLOWED"
+    assert result1.legality_status == "LEGAL"
+
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
+    result2 = assignment_service.assign_crew_to_duty(crew_id, [f2], "LM")
+
+    assert result2.status == "ALLOWED"
+    assert result2.legality_status == "LEGAL"
+
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 2  # both duties actually written
+
+
+def test_engr_assignment_allowed_despite_rest_that_would_reject_a_cpt(_patch_engine):
+    crew_id = _add_crew("ENGR")
+
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    assignment_service.assign_crew_to_duty(crew_id, [f1], "ENGR")
+
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
+    result2 = assignment_service.assign_crew_to_duty(crew_id, [f2], "ENGR")
+
+    assert result2.status == "ALLOWED"
+    assert result2.legality_status == "LEGAL"
+
+
+def test_cpt_assignment_still_rejected_for_the_same_scenario(_patch_engine):
+    """Regression guard: the exemption must be scoped to LM/ENGR only
+    — a CPT in the identical scenario must still be REJECTED. If this
+    test ever fails, the exemption has leaked to a role it shouldn't
+    apply to."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
+    result2 = assignment_service.assign_crew_to_duty(crew_id, [f2], "CPT")
+
+    assert result2.status == "REJECTED"
+
+
+def test_ftl_exempt_crew_has_no_downstream_conflicts(_patch_engine):
+    """The identical setup that produces a downstream conflict for a
+    CPT (test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged)
+    must produce NO conflicts for an LM — there's no FTL to protect."""
+    crew_id = _add_crew("LM")
+
+    future_flight = _add_flight(dt.datetime(2026, 7, 22, 5, 45), dt.datetime(2026, 7, 22, 7, 45))
+    assignment_service.assign_crew_to_duty(crew_id, [future_flight], "LM")
+
+    adhoc_flight = _add_flight(dt.datetime(2026, 7, 21, 11, 45), dt.datetime(2026, 7, 21, 18, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [adhoc_flight], "LM")
+
+    assert result.status == "ALLOWED"
+    assert result.downstream_conflicts == []
+
+
+def test_find_legal_candidates_for_lm_returns_all_active_regardless_of_history(_patch_engine):
+    """Complementary to the CPT version of this test — for an
+    FTL-exempt role, a crew member with a heavy prior duty is still a
+    valid candidate, since there's no FTL history that could exclude
+    them."""
+    crew_a = _add_crew("LM")
+    crew_b = _add_crew("LM")
+
+    # crew_a has a duty that would be a severe FTL conflict — for a
+    # CPT this would exclude them. For LM it must not.
+    prior_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    assignment_service.assign_crew_to_duty(crew_a, [prior_flight], "LM")
+
+    target_flight = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "LM")
+
+    assert crew_a in candidates
+    assert crew_b in candidates
+
+
+def test_adhoc_ftl_exempt_assignment_via_control_room_path(_patch_engine):
+    """The exemption must apply identically through
+    assign_crew_to_new_flights() (Control Room), not just
+    assign_crew_to_duty() (Roster) — same underlying validation core,
+    so this is really confirming they stayed in sync."""
+    crew_id = _add_crew("LM")
+    flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))]
+    result1, _ = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "LM")
+    assert result1.status == "ALLOWED"
+
+    tight_flights = [_flight_data(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))]
+    result2, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, tight_flights, "LM")
+    assert result2.status == "ALLOWED"
+    assert len(flight_ids) == 1
 
 
 # ------------------------------------------------------------------

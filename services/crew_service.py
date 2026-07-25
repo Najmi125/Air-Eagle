@@ -30,8 +30,8 @@ REQUIRED_FIELDS = {"name", "role"}
 UPDATABLE_FIELDS = {
     "operator_staff_id", "name", "role", "date_of_birth", "nationality",
     "base", "phone", "email", "license_no", "license_expiry",
-    "medical_expiry", "type_rating_expiry", "lpc_opc_expiry",
-    "line_check_expiry", "sep_expiry", "crm_expiry", "dg_expiry",
+    "medical_expiry", "type_rating_expiry", "ir_expiry", "sim_expiry",
+    "route_check_expiry", "sep_expiry", "crm_expiry", "dg_expiry",
     "contract_expiry", "remarks",
 }
 

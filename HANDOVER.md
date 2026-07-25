@@ -222,24 +222,19 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Phase 6 complete (this snapshot). Phase 7 (28-day roster generator,
-OR-Tools) is next, pending confirmation — and pending the route
-network, which was still not received as of this snapshot.
+Today's work (schema reconciliation, FTL exemption, import script,
+review remediation planning) is verified locally but UNPUSHED as of
+this snapshot — see "Next safest step" for the agreed remediation
+order once pushed.
 
 ## Files changed
-Phase 6: migrations/005_roster_partial_unique_index.sql (new),
-migrations/006_flights_domestic_column.sql (new),
-services/assignment_service.py (new),
-services/flight_service.py (bugfix: required-field truthiness),
-services/crew_service.py (bugfix: same pattern, defensive fix),
-pages/3_Flight_Log.py (domestic field added to form),
-pages/4_Roster.py (new), pages/1_Control_Room.py (new),
-tests/test_schema.py (3 new tests for the partial unique index +
-domestic column), tests/test_flight_service.py (regression tests for
-the truthiness bug, domestic field added to existing helper),
-tests/test_flight_log_page.py (domestic field added to seed calls),
-tests/test_assignment_service.py (new), tests/test_control_room_page.py
-(new), tests/test_roster_page.py (new), HANDOVER.md.
+Since Phase 6's push: migrations/007_crew_columns_reconcile_real_data.sql
+(new), services/assignment_service.py (FTL_EXEMPT_ROLES),
+services/crew_service.py (UPDATABLE_FIELDS for renamed/new columns),
+pages/2_Crew_Data.py (SIM/Route Check/IR fields), scripts/
+import_crew_from_xlsx.py (new), tests/test_schema.py (+2),
+tests/test_assignment_service.py (+7), tests/test_import_crew_script.py
+(new), HANDOVER.md.
 
 ## DB changes (migrations applied)
 - 000_migration_tracking.sql (schema_migrations tracking table)
@@ -256,16 +251,26 @@ tests/test_assignment_service.py (new), tests/test_control_room_page.py
   unassign-then-reassign of the same crew/flight/role works)
 - 006_flights_domestic_column.sql (flights.domestic, NOT NULL, no
   default — required at flight-creation time, never guessed)
+- 007_crew_columns_reconcile_real_data.sql (renames lpc_opc_expiry ->
+  sim_expiry, line_check_expiry -> route_check_expiry to match the
+  operator's actual terminology; adds ir_expiry)
+- ALL SEVEN confirmed applied only against local sandbox Postgres.
+  NONE have been run against the real Supabase DB — see the
+  2026-07-21 entry above. This needs to actually happen before any
+  of this is real.
 
 ## Tests passed
-122/122 — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (14),
+140/140 — tests/test_migrations.py (4), tests/test_duty_summary.py
+(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (16),
 tests/test_audit_service.py (3), tests/test_crew_service.py (17),
 tests/test_crew_data_page.py (4), tests/test_duty_builder.py (10),
 tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py (20), tests/test_control_room_page.py
-(4), tests/test_roster_page.py (4). Against real Postgres 16 (local
-test instance; production Air Eagle DB not yet provisioned).
+tests/test_assignment_service.py (27), tests/test_control_room_page.py
+(4), tests/test_roster_page.py (4), tests/test_import_crew_script.py
+(11). Against real Postgres 16, local sandbox instance — independently
+re-confirmed via fresh clone for every phase through Phase 6; today's
+work verified locally but not yet pushed/re-confirmed as of this
+snapshot.
 
 ## Open stubs / known blockers
 - `core/duty_summary.py` is the only file still flagged by
@@ -331,17 +336,68 @@ test instance; production Air Eagle DB not yet provisioned).
   apply than there was when it was set aside.
 
 ## Next safest step
-Phase 7: 28-day roster generator (Google OR-Tools CP-SAT, decided
-2026-07-19). Blocked on the route network for real content, but the
-generator engine itself — coverage constraints, fairness objective,
-legality gate reusing assign_crew_to_duty()'s validation core, the
-sliding-window freeze-and-reoptimize pattern — can be built and
-tested schedule-agnostic against synthetic data now, same as every
-other phase so far. Separate page (pages/X_Roster_Generator.py,
-decided 2026-07-20) rather than a tab on the existing Roster page —
-bulk-generate-and-review is a different interaction pattern from
-manual single-assignment, and both write through the same
-assignment_service.py regardless of the page split.
+NOT Phase 7. Explicitly paused per the external review's core
+recommendation (agreed): an OR-Tools generator on top of a legality
+gate with known holes would efficiently produce a roster that looks
+legal and isn't. Agreed remediation order (2026-07-21), each step
+tested and pushed independently before the next, same discipline as
+every phase so far:
+
+1. Push today's already-verified-locally work (schema reconciliation,
+   FTL exemption, import script) — done, tested, just needs pushing.
+2. Fix `NEEDS_MANUAL_REVIEW` being silently treated as ALLOWED in
+   assignment_service.py (only `AlertStatus.ILLEGAL` currently blocks
+   a save — NEEDS_MANUAL_REVIEW must hold for review, not auto-pass).
+   Smallest, clearest, fully decoupled from everything else below.
+3. Fix the domestic/geographic-continuity design: `domestic` is
+   currently over-constrained as "every flight in a duty must have
+   the identical value," which would reject the real International
+   pair (KHI-LHE-DWC-KHI) the moment it's actually entered — that
+   pair legitimately mixes domestic and international-classified
+   sectors within one duty. duty_builder.build_duty() already takes
+   domestic as its own parameter; the fix is likely to stop deriving
+   it from the flights and let the caller (Roster/Control Room)
+   specify it for the duty as a whole. Also add the missing
+   geographic-continuity check (leg N's destination must equal leg
+   N+1's origin — currently only temporal ordering is checked).
+4. The qualification gate: `_crew_member()` currently passes only
+   crew_id/name/home_base into the legality check — role match,
+   is_active, license/medical/SIM/route-check validity against the
+   duty date are not checked at all during assignment. This is the
+   single biggest gap found — a deactivated captain could currently
+   be assigned through the service API today.
+5. Three related "stale data" findings, likely fixed together:
+   LOOKBACK_DAYS=35 starves the engine's own 365-day/1000h cumulative
+   check (D9.2.3) of data it needs — that rule has never once been
+   able to fire correctly; flight_service.update_flight() doesn't
+   recompute FDP or revalidate crew when actual times change (the
+   docstring already flags this gap, nothing closes it yet); cancel_
+   flight() doesn't cancel/exclude the associated roster rows from
+   future legality history.
+6. True transactional atomicity for Control Room's flight+assignment
+   write — currently 4 separate `engine.begin()` blocks, not one
+   transaction, so the "no orphan flight on rejection" guarantee
+   (tested and true today) doesn't extend to "no orphan flight if the
+   process crashes mid-sequence."
+7. Age-65 rule, once the user has the exact wording from the
+   licensing ANO (not yet received as of this snapshot — do not
+   implement from general ICAO knowledge, the exact rule shape is
+   unconfirmed).
+8. THEN revisit Phase 7.
+
+Lower-priority findings from the same review, not yet sequenced:
+airport timezones not passed to the validator (every sector defaults
+to UTC+5 regardless of actual destination — now directly relevant
+given DWC is in the real route network); standby/reserve/positioning
+duty types never reach the legality engine (duty_type is hardcoded
+to FDP always); configs/airlines/AEAGLE/ still empty; audit records
+have no real app_user or transaction_id (ties to both the no-auth
+gap and the non-atomic-transaction gap); test depth for
+pcaa_ano012_core.py is thin relative to its size and safety-criticality
+(12 tests for 1,293 lines, deliberately scoped rather than
+exhaustive — boundary-value tests, one minute under/at/over each
+limit, would be a real improvement whenever this file gets touched
+again).
 
 ## Do not change without discussion
 - migrations/000_migration_tracking.sql — once applied anywhere,
@@ -392,3 +448,154 @@ assignment_service.py regardless of the page split.
   a test that asserts a SPECIFIC expected conflict with real numbers
   — a test that only checks "doesn't crash" would not have caught
   that bug and won't catch the next version of it either.
+- scripts/import_crew_from_xlsx.py — KNOWN_CORRECTIONS is reviewed,
+  human-confirmed, row-keyed data for ONE specific data drop. Clear
+  it before the next batch (see the comment above the dict) — it
+  matches by row number alone, no cross-check against which file.
+  This exact collision happened in the test suite during development
+  (synthetic test rows also start at row 3) before being isolated
+  with an autouse fixture in tests/test_import_crew_script.py.
+- services/assignment_service.py — FTL_EXEMPT_ROLES (LM, ENGR) is a
+  role-based classification confirmed directly by the user
+  (2026-07-21: "Engr is AME... No FTL applicable... same on LM"),
+  not a general "these roles are less important" assumption. Don't
+  extend this set without an equally explicit confirmation — the
+  same operational fact needs to hold for any role added here.
+
+## 2026-07-21: real data arrived — data quality findings, FTL
+## exemption, schema reconciliation (unpushed as of this snapshot)
+
+The operator's crew data (AirEagle_Crew_Data_Simple.xlsx) came back.
+Findings and fixes, in the order they happened:
+
+- **10 clean CPT/FO rows**, 3 needed a confirmed correction (License
+  Exp read 1930, confirmed should be 2030 — recorded in
+  scripts/import_crew_from_xlsx.py's KNOWN_CORRECTIONS, not guessed).
+  Row 12's operator_staff_id was a placeholder ("-") — left genuinely
+  NULL, not stored as literal text.
+- **The Loadmaster section (rows 16-19) was misaligned** — filled in
+  against a different header row that got pasted into the data area
+  instead of adapted to the template's actual columns. Dates ended up
+  in Base/Email/License No; the real qualification columns are empty
+  for all three. NOT imported — needs redoing by the operator against
+  the actual template, not algorithmically realigned (guessing which
+  shifted date belongs where is exactly the kind of silent assumption
+  that's dangerous here).
+- **Two columns (Type Rating Exp, Contract Exp) are empty for every
+  single row** — not a per-person gap, systematic. Flagged back, not
+  silently left blank without note.
+- **scripts/import_crew_from_xlsx.py built as reusable infrastructure**,
+  not a one-off — does real validation (symmetric misalignment check:
+  a text field should never hold a date, a date field should never
+  hold arbitrary text once "-"/empty are normalized) rather than
+  trusting the spreadsheet. Found its own real bug during first run:
+  date_of_birth was miscategorized as a "text field" (should never be
+  a date), which flagged every clean row's real DOB as misaligned —
+  fixed, now correctly categorized as a date field with its own
+  plausible-year exemption (a birth year like 1960 isn't suspect the
+  way an expiry date would be). 11 tests, using synthetic workbooks,
+  not the real file. Real import verified end-to-end against local
+  Postgres: 10 rows in, all 3 corrections confirmed landed via direct
+  SQL query (not the script's own claims) — but see the note below,
+  this was NEVER run against the real Supabase DB.
+- **migrations/007_crew_columns_reconcile_real_data.sql** — the
+  operator's real column names differed from the template: "LPC/OPC
+  Exp" -> their "SIM Exp", "Line Check Exp" -> their "Route Check
+  Exp" (same concepts, their terminology — renamed, not duplicated,
+  since no real data existed yet to make renaming costly), plus a
+  genuinely new "IR" (Instrument Rating) column. crew_service.py,
+  pages/2_Crew_Data.py, and the import script's HEADER_MAP all
+  updated to match.
+- **Major architecture finding, confirmed by the user directly**:
+  "Engr is AME [line-maintenance, not flight-deck]... No FTL
+  applicable... same on LM." This means Loadmasters and Engr are NOT
+  subject to ANO-012's FDP/rest rules at all — but
+  services/assignment_service.py was running the full legality gate
+  for every role, including LM, before this was caught. Fixed:
+  FTL_EXEMPT_ROLES constant, checked in _validate_new_duty() (skips
+  history-loading and validate_schedule() entirely for exempt roles,
+  returns a synthetic LEGAL result), both _check_downstream_impact()
+  call sites (no FTL history to protect for an exempt crew member),
+  and find_legal_candidates_for_duty() (every active crew member with
+  an exempt role is trivially a candidate — no FTL history could
+  exclude them). Deliberately implemented in the orchestration layer
+  (assignment_service.py), not inside core/legality/pcaa_ano012_core.py
+  — the core engine stays role-agnostic; "which roles this applies
+  to" is an operational classification, not math. 7 new tests,
+  including a guard-rail test confirming the exemption did NOT leak
+  to CPT (the identical rest-violation scenario that's ALLOWED for LM
+  must still be REJECTED for CPT).
+- **A serious trust/process incident, worth recording plainly**: mid-
+  session, garbled/duplicated text appeared in a response
+  ("Validated data corrections and orchestrated comprehensive testing
+  infrastructure" x2) with no clear explanation for how it got there.
+  Separately, and more importantly, the user believed — reasonably,
+  given how the update was phrased — that the crew import had
+  happened against their real Supabase database. It had not. It ran
+  against the local disposable test Postgres in the sandbox, the same
+  one used for every phase's verification, for a hard, structural
+  reason: sandbox network access is allowlisted to a fixed set of
+  domains and does not include supabase.co — direct connection to
+  the real DB has never been technically possible from here, for any
+  phase, ever. This should already have been obvious from the
+  established pattern ("I verify locally, then hand you code to run
+  yourself") but wasn't stated clearly enough at the moment it
+  mattered most. Restated explicitly here so it isn't lost: **nothing
+  in this entire project has ever been run against the real Air
+  Eagle Supabase database.** Every "verified" claim in every phase of
+  this document means "verified against local sandbox Postgres,
+  independently re-confirmed via fresh git clone" — never production.
+  The user also pasted a Supabase project URL + publishable API key
+  directly into chat; flagged as bad practice regardless of that
+  specific key's lower sensitivity, key rotation suggested.
+- **Real route network received** (via chat, not yet a structured
+  file): two recurring pairs — EPE 786/787 (KHI-LHE-KHI, domestic,
+  Mon-Fri nightly) and EPE 802/804/805 (KHI-LHE-DWC-KHI,
+  international, Tue/Thu/Fri/Sat) — plus two real operated-flight
+  examples with actual crew. This resolves the Phase 7 route-network
+  blocker, but see the external review findings below — two of them
+  directly collide with this exact data (mixed domestic/international
+  within one duty; no geographic continuity check) and need fixing
+  before this data can actually be used correctly.
+- **"Eng: 2x VAI" in the real flight examples — meaning not yet
+  confirmed.** Don't assume what VAI means; ask before building
+  anything around it.
+- **Age-65 rule flagged as IMPORTANT by the user, NOT yet
+  implemented.** "At least 01 crew member below 65 yrs... applicable
+  to EPE." Checked the actual ANO-012 document (OCR'd the scanned
+  PDF, searched for "age"/"65"/"60" across all 32 pages) — confirmed
+  this document (titled "FATIGUE MANAGEMENT — FLIGHT AND CABIN CREW")
+  contains NO age-eligibility provision at all; this is a licensing
+  restriction, not an FTL/fatigue one, and lives in a different PCAA
+  order this repo doesn't have. User is getting the exact wording
+  from the licensing ANO before this gets built — do NOT implement
+  from general ICAO knowledge in the meantime, the exact rule
+  (simple 65 cutoff vs. a 60-65 sub-band rule) is still unconfirmed.
+
+## 2026-07-21: external code review — verified, mostly correct, two
+## findings now urgent given the route data above
+
+An external review of commit 85afb76 (Phase 6) raised 14 findings.
+Spot-verified the most severe ones directly against the code (not
+taken on trust) — every one checked out exactly as described,
+including confirming core/legality/pcaa_ano012_core.py genuinely
+does implement a 365-day/1000h cumulative check
+(D9.2.3_12_MONTH_FLIGHT_TIME_LIMIT) that has never once been able to
+fire correctly, since assignment_service.py only ever loads 35 days
+of history before calling it.
+
+One correction to the review itself: it reported "32 passed, 90
+skipped" from its own test run — that was its environment missing
+TEST_DATABASE_URL (tests skip loudly by design when that's unset,
+per conftest.py — not a flaw in the suite). The review's deeper
+point stands independent of that though: 12 tests for a 1,293-line
+safety-critical engine is genuinely thin, deliberately scoped to
+"rules confirmed applicable right now" rather than exhaustive
+boundary coverage.
+
+Full findings and agreed remediation order below (Next safest step)
+— none of these are fixed yet as of this snapshot. Agreed with the
+review's core strategic call: do NOT start Phase 7 (roster generator)
+until the gate is actually solid. An OR-Tools generator on top of a
+gate with these gaps would efficiently produce a roster that *looks*
+legal and isn't — worse than not having the generator at all.
