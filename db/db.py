@@ -13,7 +13,16 @@ from functools import lru_cache
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-load_dotenv()
+load_dotenv(override=True)
+# override=True: this project's own .env must always win over any
+# environment variable that happens to already be set in the shell
+# or system (e.g. a leftover DATABASE_URL from an unrelated earlier
+# project). Without override=True, python-dotenv silently keeps
+# whatever's already in os.environ and never applies .env at all —
+# confirmed as a real, confusing bug: a user's shell had a stale
+# Neon DATABASE_URL persistently set from earlier work, and every
+# connection silently went there instead of the Supabase URL just
+# configured in .env, with no error or warning of any kind.
 
 
 @lru_cache(maxsize=1)

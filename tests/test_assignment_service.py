@@ -72,8 +72,10 @@ def test_legal_assignment_is_allowed_and_written(_patch_engine):
 
 def test_multi_sector_duty_creates_one_row_per_flight_sharing_duty_id(_patch_engine):
     crew_id = _add_crew("CPT")
-    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0))
-    f2 = _add_flight(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0))
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
+                      origin="KHI", destination="LHE")
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0),
+                      origin="LHE", destination="KHI")
 
     result = assignment_service.assign_crew_to_duty(crew_id, [f1, f2], "CPT")
 
@@ -120,10 +122,59 @@ def test_rejected_assignment_still_writes_audit_record(_patch_engine):
     assert audit.iloc[0]["legality_result"] == "ILLEGAL"
 
 
-def test_mismatched_domestic_flags_across_legs_raises(_patch_engine):
+def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engine):
+    """The real KHI-LHE-DWC-KHI rotation mixes a domestic-classified
+    sector (KHI-LHE) with international ones (LHE-DWC, DWC-KHI)
+    within one duty. This must NOT be rejected — any international
+    sector makes the whole duty use the international (60/30)
+    buffer, not the domestic (45/15) one, while each flight keeps
+    its own domestic flag for Flight Log/reporting purposes."""
     crew_id = _add_crew("CPT")
-    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0), domestic=True)
-    f2 = _add_flight(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0), domestic=False)
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
+                      origin="KHI", destination="LHE", domestic=True)
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0),
+                      origin="LHE", destination="DWC", domestic=False)
+    f3 = _add_flight(dt.datetime(2026, 7, 20, 11, 0), dt.datetime(2026, 7, 20, 13, 0),
+                      origin="DWC", destination="KHI", domestic=False)
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [f1, f2, f3], "CPT")
+
+    assert result.status == "ALLOWED"
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 3
+    assert roster_df["duty_id"].nunique() == 1
+    # report_time = first dep (05:00) - 60min (international buffer,
+    # NOT domestic's 45min, since one sector is international)
+    assert roster_df.iloc[0]["report_time"] == dt.datetime(2026, 7, 20, 4, 0)
+    # debrief_time = last arr (13:00) + 30min (international, not 15)
+    assert roster_df.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 13, 30)
+
+
+def test_all_domestic_duty_still_uses_domestic_buffer(_patch_engine):
+    """Sanity check the other direction — a duty where every sector
+    is genuinely domestic must still get the domestic (45/15) buffer,
+    not be pushed to international by the fix above."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
+                      origin="KHI", destination="LHE", domestic=True)
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0),
+                      origin="LHE", destination="KHI", domestic=True)
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [f1, f2], "CPT")
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert roster_df.iloc[0]["report_time"] == dt.datetime(2026, 7, 20, 4, 15)   # 45min
+    assert roster_df.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 10, 15)  # 15min
+
+
+def test_geographically_disconnected_legs_rejected(_patch_engine):
+    """Two flights that don't actually connect (arrival city != next
+    departure city) can't form one physically continuous duty — a
+    crew member can't be in two places at once."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
+                      origin="KHI", destination="LHE")
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0),
+                      origin="KHI", destination="LHE")  # departs KHI, not LHE — disconnected
 
     with pytest.raises(ValueError):
         assignment_service.assign_crew_to_duty(crew_id, [f1, f2], "CPT")
@@ -139,6 +190,66 @@ def test_unknown_crew_id_raises(_patch_engine):
     flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0))
     with pytest.raises(ValueError):
         assignment_service.assign_crew_to_duty("NO-SUCH-CREW", [flight_id], "CPT")
+
+
+# ------------------------------------------------------------------
+# Role-match enforcement — the actual fix for a confirmed critical
+# bypass: role_assigned was never cross-checked against the crew
+# member's real registered role, while the FTL exemption decision
+# correctly used the real role. An ENGR (FTL-exempt) crew member
+# could be assigned with role_assigned="CPT", retaining the
+# exemption while being recorded as filling the Captain role with
+# zero FDP/rest checking ever applied.
+# ------------------------------------------------------------------
+
+def test_role_assigned_must_match_crew_actual_role(_patch_engine):
+    """The exact bypass scenario: an ENGR crew member (FTL-exempt)
+    must NOT be assignable with role_assigned='CPT'. This would
+    otherwise retain the FTL exemption (decided from crew_row['role'])
+    while being recorded as filling a role that should be fully
+    subject to FDP/rest checking."""
+    engr_crew = _add_crew("ENGR")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    with pytest.raises(ValueError):
+        assignment_service.assign_crew_to_duty(engr_crew, [flight_id], "CPT")
+
+
+def test_role_assigned_matching_real_role_succeeds(_patch_engine):
+    crew_id = _add_crew("CPT")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+    assert result.status == "ALLOWED"
+
+
+def test_role_match_recognizes_ame_engr_synonym(_patch_engine):
+    """A crew member registered with role 'AME' (stored as canonical
+    'ENGR') must still be assignable with role_assigned='AME' — the
+    synonym must be recognized on the comparison side too, not just
+    at storage time."""
+    crew_id = crew_service.add_crew({"name": "Test AME", "role": "AME"})
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "AME")
+    assert result.status == "ALLOWED"
+
+
+def test_role_match_is_case_insensitive(_patch_engine):
+    crew_id = _add_crew("CPT")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "cpt")
+    assert result.status == "ALLOWED"
+
+
+def test_role_mismatch_via_control_room_path_also_rejected(_patch_engine):
+    """The same enforcement must apply through
+    assign_crew_to_new_flights() (Control Room) — both paths share
+    _validate_new_duty(), so this is really confirming they stayed
+    in sync."""
+    engr_crew = _add_crew("ENGR")
+    flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))]
+
+    with pytest.raises(ValueError):
+        assignment_service.assign_crew_to_new_flights(engr_crew, flights_data, "CPT")
 
 
 # ------------------------------------------------------------------
@@ -464,11 +575,16 @@ def test_adhoc_assignment_also_detects_downstream_conflicts(_patch_engine):
     assert result.downstream_conflicts[0].flight_ids == [future_flight]
 
 
-def test_adhoc_mismatched_domestic_across_legs_raises(_patch_engine):
+def test_adhoc_mixed_domestic_international_uses_international_buffer(_patch_engine):
+    """Same fix as the Roster path, through Control Room's atomic
+    flight+assignment — must not reject a mixed-sector rotation."""
     crew_id = _add_crew("CPT")
     flights_data = [
-        _flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0), domestic=True),
-        _flight_data(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0), domestic=False),
+        _flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
+                     origin="KHI", destination="LHE", domestic=True),
+        _flight_data(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0),
+                     origin="LHE", destination="DWC", domestic=False),
     ]
-    with pytest.raises(ValueError):
-        assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
+    result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
+    assert result.status == "ALLOWED"
+    assert len(flight_ids) == 2

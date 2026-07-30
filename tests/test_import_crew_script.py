@@ -131,20 +131,42 @@ def test_implausible_dob_year_is_not_flagged(tmp_path):
     assert results["skipped_suspect_date"] == []
 
 
-def test_known_correction_applies_and_bypasses_suspect_check(tmp_path):
+def test_known_correction_applies_when_name_matches(tmp_path):
     """A row with a KNOWN_CORRECTIONS entry should import cleanly
-    with the corrected value, not get caught by the suspect-date
-    check first."""
+    with the corrected value when the row's actual name matches who
+    the correction was reviewed for."""
     path = _build_workbook([_clean_row(**{"License Exp": dt.datetime(1930, 6, 1)})], tmp_path)
 
     # The autouse fixture already isolated KNOWN_CORRECTIONS to an
     # empty dict for this test — add the one entry this test needs.
-    import_mod.KNOWN_CORRECTIONS[(3, "license_expiry")] = dt.date(2030, 6, 1)
+    import_mod.KNOWN_CORRECTIONS[(3, "license_expiry")] = {
+        "expected_name": "Test Person", "value": dt.date(2030, 6, 1),
+    }
 
     results = read_rows(path)
     assert len(results["imported"]) == 1
     row_num, record = results["imported"][0]
     assert record["license_expiry"] == dt.date(2030, 6, 1)
+
+
+def test_known_correction_does_not_apply_when_name_mismatches(tmp_path):
+    """The actual safeguard the review asked for: a correction keyed
+    to row 3 must NOT silently apply to a different person who
+    happens to also be at row 3 in some other file. Row-number match
+    alone is not enough — falls through to the normal suspect-date
+    handling instead of misapplying someone else's correction."""
+    path = _build_workbook([_clean_row(
+        Name="A Completely Different Person",
+        **{"License Exp": dt.datetime(1930, 6, 1)},
+    )], tmp_path)
+
+    import_mod.KNOWN_CORRECTIONS[(3, "license_expiry")] = {
+        "expected_name": "Test Person", "value": dt.date(2030, 6, 1),
+    }
+
+    results = read_rows(path)
+    assert results["imported"] == []
+    assert len(results["skipped_suspect_date"]) == 1
 
 
 def test_example_row_is_skipped(tmp_path):

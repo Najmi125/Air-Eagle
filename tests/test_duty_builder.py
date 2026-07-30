@@ -81,6 +81,26 @@ def test_overlapping_legs_raises():
         build_duty([leg1, leg2], domestic=True)  # leg2 departs before leg1 arrives
 
 
+def test_geographically_disconnected_legs_raises():
+    """A crew member can't be in two places at once — leg N's
+    destination must equal leg N+1's origin. This was previously
+    unchecked; only temporal ordering was validated."""
+    leg1 = FlightLeg(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0), "KHI", "LHE")
+    leg2 = FlightLeg(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0), "ISB", "KHI")
+    with pytest.raises(ValueError):
+        build_duty([leg1, leg2], domestic=True)  # leg2 departs ISB, leg1 arrived LHE
+
+
+def test_geographically_continuous_legs_succeed():
+    """Sanity check the positive case explicitly, not just via the
+    other tests' incidental correctness."""
+    leg1 = FlightLeg(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0), "KHI", "LHE")
+    leg2 = FlightLeg(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0), "LHE", "DWC")
+    leg3 = FlightLeg(dt.datetime(2026, 7, 20, 11, 0), dt.datetime(2026, 7, 20, 13, 0), "DWC", "KHI")
+    result = build_duty([leg1, leg2, leg3], domestic=False)
+    assert result.sector_count == 3
+
+
 # ------------------------------------------------------------------
 # recompute_fdp_after_delay() - the exact historical bug scenario
 # ------------------------------------------------------------------

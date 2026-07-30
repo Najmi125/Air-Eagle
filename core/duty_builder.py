@@ -92,6 +92,13 @@ def build_duty(legs: List[FlightLeg], domestic: bool) -> DutyResult:
                 f"departs ({legs[i + 1].dep_time}) — legs must be in "
                 f"chronological, non-overlapping order with time for turnaround"
             )
+        if legs[i].destination != legs[i + 1].origin:
+            raise ValueError(
+                f"Leg {i} arrives at {legs[i].destination} but leg {i + 1} "
+                f"departs from {legs[i + 1].origin} — a crew member can't be "
+                f"in two places at once. These flights don't form one "
+                f"physically continuous duty."
+            )
 
     pre = DOMESTIC_PRE_FLIGHT_MINUTES if domestic else INTERNATIONAL_PRE_FLIGHT_MINUTES
     post = DOMESTIC_POST_FLIGHT_MINUTES if domestic else INTERNATIONAL_POST_FLIGHT_MINUTES

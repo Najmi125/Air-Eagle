@@ -222,19 +222,25 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Today's work (schema reconciliation, FTL exemption, import script,
-review remediation planning) is verified locally but UNPUSHED as of
-this snapshot — see "Next safest step" for the agreed remediation
-order once pushed.
+Commit 32098e7 (schema reconciliation, FTL exemption, import script)
+is CONFIRMED PUSHED — independently verified via fresh clone earlier
+in this session. What's UNPUSHED as of this snapshot is the second
+review's fixes: role normalization/matching enforcement, mixed-
+domestic duty classification, geographic continuity check. See
+"Next safest step" below.
 
 ## Files changed
-Since Phase 6's push: migrations/007_crew_columns_reconcile_real_data.sql
-(new), services/assignment_service.py (FTL_EXEMPT_ROLES),
-services/crew_service.py (UPDATABLE_FIELDS for renamed/new columns),
-pages/2_Crew_Data.py (SIM/Route Check/IR fields), scripts/
-import_crew_from_xlsx.py (new), tests/test_schema.py (+2),
-tests/test_assignment_service.py (+7), tests/test_import_crew_script.py
-(new), HANDOVER.md.
+Since 32098e7's push: services/assignment_service.py (role-match
+enforcement in _validate_new_duty, mixed-domestic classification fix
+in 3 places, rule_applied audit label fix), services/crew_service.py
+(ROLE_SYNONYMS, _normalize_role, applied in add_crew/update_crew),
+core/duty_builder.py (geographic continuity check),
+scripts/import_crew_from_xlsx.py (KNOWN_CORRECTIONS hardened with
+expected_name cross-check), requirements.txt (openpyxl added),
+tests/test_crew_service.py (+3), tests/test_assignment_service.py
+(+5 net, 2 rewritten), tests/test_duty_builder.py (+2),
+tests/test_import_crew_script.py (name-mismatch test added),
+HANDOVER.md.
 
 ## DB changes (migrations applied)
 - 000_migration_tracking.sql (schema_migrations tracking table)
@@ -254,23 +260,25 @@ tests/test_assignment_service.py (+7), tests/test_import_crew_script.py
 - 007_crew_columns_reconcile_real_data.sql (renames lpc_opc_expiry ->
   sim_expiry, line_check_expiry -> route_check_expiry to match the
   operator's actual terminology; adds ir_expiry)
+- No new migrations for today's second batch of fixes — all logic
+  changes, no schema changes needed.
 - ALL SEVEN confirmed applied only against local sandbox Postgres.
   NONE have been run against the real Supabase DB — see the
   2026-07-21 entry above. This needs to actually happen before any
   of this is real.
 
 ## Tests passed
-140/140 — tests/test_migrations.py (4), tests/test_duty_summary.py
+155/155 — tests/test_migrations.py (4), tests/test_duty_summary.py
 (10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (16),
-tests/test_audit_service.py (3), tests/test_crew_service.py (17),
-tests/test_crew_data_page.py (4), tests/test_duty_builder.py (10),
+tests/test_audit_service.py (3), tests/test_crew_service.py (20),
+tests/test_crew_data_page.py (4), tests/test_duty_builder.py (12),
 tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py (27), tests/test_control_room_page.py
+tests/test_assignment_service.py (32), tests/test_control_room_page.py
 (4), tests/test_roster_page.py (4), tests/test_import_crew_script.py
-(11). Against real Postgres 16, local sandbox instance — independently
-re-confirmed via fresh clone for every phase through Phase 6; today's
-work verified locally but not yet pushed/re-confirmed as of this
-snapshot.
+(12), tests/test_env_override.py (2). Against real Postgres 16, local
+sandbox instance — independently re-confirmed via fresh clone through
+commit 63932da; the env-override fix (db/db.py, run_migrations.py)
+verified locally but not yet pushed/re-confirmed as of this snapshot.
 
 ## Open stubs / known blockers
 - `core/duty_summary.py` is the only file still flagged by
@@ -336,36 +344,35 @@ snapshot.
   apply than there was when it was set aside.
 
 ## Next safest step
-NOT Phase 7. Explicitly paused per the external review's core
-recommendation (agreed): an OR-Tools generator on top of a legality
-gate with known holes would efficiently produce a roster that looks
-legal and isn't. Agreed remediation order (2026-07-21), each step
-tested and pushed independently before the next, same discipline as
-every phase so far:
+NOT Phase 7. Still explicitly paused per the external review's core
+recommendation (agreed, reconfirmed by a second independent review):
+an OR-Tools generator on top of a legality gate with known holes
+would efficiently produce a roster that looks legal and isn't.
+Remaining remediation order (updated 2026-07-21), each step tested
+and pushed independently before the next, same discipline as every
+phase so far:
 
-1. Push today's already-verified-locally work (schema reconciliation,
-   FTL exemption, import script) — done, tested, just needs pushing.
+1. ~~Push already-verified-locally work~~ DONE — commit 32098e7,
+   independently confirmed via fresh clone.
 2. Fix `NEEDS_MANUAL_REVIEW` being silently treated as ALLOWED in
    assignment_service.py (only `AlertStatus.ILLEGAL` currently blocks
    a save — NEEDS_MANUAL_REVIEW must hold for review, not auto-pass).
    Smallest, clearest, fully decoupled from everything else below.
-3. Fix the domestic/geographic-continuity design: `domestic` is
-   currently over-constrained as "every flight in a duty must have
-   the identical value," which would reject the real International
-   pair (KHI-LHE-DWC-KHI) the moment it's actually entered — that
-   pair legitimately mixes domestic and international-classified
-   sectors within one duty. duty_builder.build_duty() already takes
-   domestic as its own parameter; the fix is likely to stop deriving
-   it from the flights and let the caller (Roster/Control Room)
-   specify it for the duty as a whole. Also add the missing
-   geographic-continuity check (leg N's destination must equal leg
-   N+1's origin — currently only temporal ordering is checked).
+   STILL NOT DONE — this is the actual next step.
+3. ~~Fix domestic/geographic-continuity~~ DONE (this snapshot) — any
+   international sector makes the whole duty use the international
+   buffer; each flight keeps its own domestic flag independently.
+   Geographic continuity (leg N destination == leg N+1 origin) added
+   alongside the existing temporal check. This directly unblocks the
+   real KHI-LHE-DWC-KHI rotation.
 4. The qualification gate: `_crew_member()` currently passes only
-   crew_id/name/home_base into the legality check — role match,
-   is_active, license/medical/SIM/route-check validity against the
-   duty date are not checked at all during assignment. This is the
-   single biggest gap found — a deactivated captain could currently
-   be assigned through the service API today.
+   crew_id/name/home_base into the legality check — is_active,
+   license/medical/SIM/route-check validity against the duty date
+   are not checked at all during assignment. Role match IS now
+   enforced (this snapshot — role_assigned must equal the crew
+   member's registered role), but the rest of this gate is still
+   open. This remains the single biggest gap — a deactivated captain
+   could currently be assigned through the service API today.
 5. Three related "stale data" findings, likely fixed together:
    LOOKBACK_DAYS=35 starves the engine's own 365-day/1000h cumulative
    check (D9.2.3) of data it needs — that rule has never once been
@@ -379,25 +386,69 @@ every phase so far:
    transaction, so the "no orphan flight on rejection" guarantee
    (tested and true today) doesn't extend to "no orphan flight if the
    process crashes mid-sequence."
-7. Age-65 rule, once the user has the exact wording from the
-   licensing ANO (not yet received as of this snapshot — do not
-   implement from general ICAO knowledge, the exact rule shape is
-   unconfirmed).
+7. **Age-pairing rule — now well-specified, still not built.**
+   CONFIRMED route-dependent, not uniform (updated 2026-07-21, after
+   the single-rule version above was recorded): for a rotation's
+   flight-deck pair —
+     - **Domestic**: illegal only if BOTH CPT and FO are 65 or older;
+       legal if at least one is under 65.
+     - **International**: illegal if EITHER CPT or FO is 65 or older
+       — both must be under 65. Materially stricter than domestic,
+       not the same rule applied to a different route.
+   Exactly 65 does not count as "below 65" either way. LM/AME age is
+   irrelevant to this rule regardless of route. Age calculated on the
+   rotation's first operating date. Missing DOB on either pilot ->
+   NEEDS_MANUAL_REVIEW, must not auto-save (ties directly to fixing
+   item 2 first — there's no point building a rule whose "needs
+   review" output gets silently auto-allowed anyway).
+   This can reuse the SAME duty-level `domestic` classification
+   already built for the D7.1.2 buffer fix above (any international
+   sector -> whole duty is international) — one boolean, two
+   consumers, not two separate classification schemes to keep in
+   sync. Proposed rule code: AE-CREW-PAIR-AGE-001. Belongs in the
+   orchestration layer (assignment_service.py or a dedicated crew-
+   composition policy module) as an Air Eagle operating rule, NOT
+   inside core/legality/pcaa_ano012_core.py — confirmed directly
+   against the actual ANO-012 document (OCR'd, all 32 pages searched)
+   that it contains no age-eligibility provision at all; this is a
+   licensing restriction from a different PCAA order, labeled as an
+   Air Eagle mandatory rule until/unless that source is supplied.
+   **Real architectural blocker, not yet resolved**: assignment
+   currently happens one crew member at a time
+   (assign_crew_to_duty/assign_crew_to_new_flights each take a single
+   crew_id). A pair-level rule needs a point where BOTH pilots for a
+   rotation are known at once — likely a check that runs after each
+   individual assignment, evaluating whether a complete (CPT+FO)
+   pairing now exists for that duty/rotation and validating it if so.
+   This needs real design before it's built, not just the rule logic
+   itself. crew.date_of_birth is also currently nullable with no
+   constraint forcing it for CPT/FO specifically — worth deciding
+   whether to enforce that at the schema level or catch it via
+   NEEDS_MANUAL_REVIEW at assignment time (leaning toward the latter,
+   consistent with "never silently block on missing data, flag it
+   instead" — but not yet decided).
 8. THEN revisit Phase 7.
 
-Lower-priority findings from the same review, not yet sequenced:
-airport timezones not passed to the validator (every sector defaults
-to UTC+5 regardless of actual destination — now directly relevant
-given DWC is in the real route network); standby/reserve/positioning
-duty types never reach the legality engine (duty_type is hardcoded
-to FDP always); configs/airlines/AEAGLE/ still empty; audit records
-have no real app_user or transaction_id (ties to both the no-auth
-gap and the non-atomic-transaction gap); test depth for
-pcaa_ano012_core.py is thin relative to its size and safety-criticality
-(12 tests for 1,293 lines, deliberately scoped rather than
-exhaustive — boundary-value tests, one minute under/at/over each
-limit, would be a real improvement whenever this file gets touched
-again).
+Lower-priority findings, not yet sequenced: airport timezones not
+passed to the validator (every sector defaults to UTC+5 regardless
+of actual destination — directly relevant given DWC is in the real
+route network); standby/reserve/positioning duty types never reach
+the legality engine (duty_type is hardcoded to FDP always — CONFIRMED
+by the full requirements document that Air Eagle has no standby/
+reserve arrangement at all, so this is lower priority than it looked
+initially, not zero priority since positioning is explicitly
+permitted); configs/airlines/AEAGLE/ still empty; audit records have
+no real app_user or transaction_id (ties to both the no-auth gap and
+the non-atomic-transaction gap); test depth for pcaa_ano012_core.py
+is thin relative to its size and safety-criticality (12 tests for
+1,293 lines, deliberately scoped rather than exhaustive — boundary-
+value tests, one minute under/at/over each limit, would be a real
+improvement whenever this file gets touched again); WhatsApp
+notification + acknowledgment workflow (confirmed requirement, not
+built); universal Excel export with the specific filename format
+`AirEagle_[PageName]_DD-MM-YYYY_HHMMUTC.xlsx` (confirmed requirement,
+not built) — both of these are real scope, not yet prioritized
+against the legality-gate work above.
 
 ## Do not change without discussion
 - migrations/000_migration_tracking.sql — once applied anywhere,
@@ -599,3 +650,291 @@ review's core strategic call: do NOT start Phase 7 (roster generator)
 until the gate is actually solid. An OR-Tools generator on top of a
 gate with these gaps would efficiently produce a roster that *looks*
 legal and isn't — worse than not having the generator at all.
+
+## 2026-07-21 (continued): full requirements document — three direct
+## conflicts with earlier confirmed instructions, all resolved
+
+A comprehensive Air Eagle requirements/roadmap document arrived,
+overlapping strongly with the external review above (same
+remediation sequence, independently), plus substantial genuinely new
+operational detail: PCAA Charter Class II cargo classification;
+confirmed crew package (1 CPT, 1 FO, 1 LM, 1 AME + configurable
+"Other Crew" per rotation); rostering workflow (draft -> OCC review
+-> publish, crew sees only published, no silent reshuffle on
+regeneration, explicit UNCOVERED state when no legal crew exists);
+fairness definition (proportional to actual availability); standby
+CONFIRMED not needed (validates an earlier decision made with less
+information); Flight Log field list (matches what's already built);
+WhatsApp notification requirement (not yet built); Excel export
+requirement with a specific filename format (not yet built).
+
+This document also directly contradicted three things the user had
+told me directly, earlier in this same conversation. Flagged rather
+than silently resolved either way — silently picking a number for
+either of the first two would have meant building the wrong
+safety-critical rule with full test coverage backing up the wrong
+answer. All three now resolved by the user directly:
+
+1. **Roster horizon: CONFIRMED 28 days**, not the document's 15.
+   No code impact yet — Phase 7 (roster generator) is still paused.
+2. **Age threshold: CONFIRMED "at least 1 crew member below 65"**,
+   not the document's "both >=67". Still not implemented (see below
+   — a second review arrived with a specific proposed rule shape
+   before this got built, so it's now well-specified but still not
+   coded as of this snapshot).
+3. **D7.1.2 buffers: CONFIRMED as already correctly built** —
+   45/15 domestic, 60/30 international, exactly what
+   core/duty_builder.py already implements and tests. No change
+   needed; this was the document's least accurate claim (a flat
+   60/30 for everything), and it's the one already independently
+   verified against the actual ANO-012 PDF text back in Phase 6's
+   planning.
+
+## 2026-07-21 (continued): second review — real bugs in TODAY's
+## commit found and fixed before the day's work was even pushed once
+
+A second, more detailed review (same overall direction as the first)
+specifically audited commit 32098e7 — today's crew-data-reconciliation
+commit — and found real, confirmed problems in it, not just the
+broader pre-existing gap list. All verified directly against the
+code before fixing (not taken on trust), all now fixed and tested:
+
+- **openpyxl missing from requirements.txt** — the crew import
+  script depends on it but it was only ever installed ad-hoc in the
+  sandbox, never tracked. Fixed: added to requirements.txt.
+- **FTL exemption was case-sensitive, and didn't recognize "AME" as
+  a synonym for "ENGR"** — confirmed directly: FTL_EXEMPT_ROLES =
+  {"LM", "ENGR"} did exact-case matching only. A role stored as
+  "Engr" (any case) or "AME" (the user's own real-world term for
+  the same role) would silently fail to match, wrongly subjecting an
+  actually-exempt person to FDP/rest math that doesn't apply to
+  them. Fixed at the write boundary, not scattered comparison sites:
+  services/crew_service.py now has ROLE_SYNONYMS = {"AME": "ENGR"}
+  and _normalize_role(), applied in both add_crew() and update_crew()
+  — so crew.role is always canonical (uppercase, synonyms resolved)
+  from the moment it's stored, and every downstream consumer
+  (FTL exemption check, crew_id prefix generation, role matching)
+  can trust that without repeating the normalization logic.
+- **Critical, confirmed, real bypass: role_assigned was never
+  cross-checked against the crew member's actual registered role.**
+  An ENGR (FTL-exempt, correctly decided from crew_row["role"]) could
+  be assigned with role_assigned="CPT" — retaining the FTL exemption
+  while being recorded as filling the Captain role, with zero
+  FDP/rest checking ever applied to a "Captain" assignment. Fixed:
+  _validate_new_duty() (the shared validation core for both Roster
+  and Control Room paths) now rejects with a ValueError if
+  role_assigned (normalized, synonym-aware) doesn't match
+  crew_row["role"]. Air Eagle's confirmed crew model (exactly one
+  fixed role per rotation slot: 1 CPT, 1 FO, 1 LM, 1 AME) has no
+  legitimate case where these should ever differ.
+- **KNOWN_CORRECTIONS matched by row number alone** — a stale entry
+  could silently misapply to an unrelated future row reusing the
+  same row number (this exact collision already happened once, in
+  the test suite, before being isolated — see the earlier entry).
+  Hardened: corrections are now {"expected_name": ..., "value": ...}
+  dicts, and a correction only applies if the row's actual Name
+  matches who it was reviewed for. A row-number match with a
+  mismatched name now falls through to normal suspect-date handling
+  instead of silently applying someone else's correction — verified
+  by a dedicated test.
+- **Mixed domestic/international duty was rejected outright** — this
+  was already known (Step 3 of the original remediation order) but
+  the second review gave a specific, clean, adopted design: any
+  international sector makes the WHOLE DUTY use the international
+  (60/30) buffer; each flight independently keeps its own domestic
+  flag for Flight Log/reporting. This directly unblocks the real
+  KHI-LHE-DWC-KHI rotation, which mixes a domestic-classified KHI-LHE
+  sector with international LHE-DWC/DWC-KHI sectors within one duty.
+  Fixed in both assign_crew_to_duty(), assign_crew_to_new_flights(),
+  and find_legal_candidates_for_duty() (which had the same bug in a
+  different form — only checked the FIRST flight's domestic flag).
+- **No geographic continuity check** — build_duty() only validated
+  temporal ordering, never that leg N's destination equals leg N+1's
+  origin. Added alongside the existing temporal check in
+  core/duty_builder.py — a crew member can't physically be in two
+  places at once, and nothing previously caught a duty built from
+  disconnected flights.
+- **Minor audit-accuracy fix while touching this code**: the
+  rule_applied audit label used a ternary implying D21 (rest) and
+  D8/D9 (FDP) were alternatives selected by domestic/international —
+  they're not, both always apply simultaneously. Changed to
+  accurately describe which D7.1.2 buffer was used, not which "rule"
+  was "applied" as if there were only one.
+
+13 new tests covering all of the above (153/153 total), including
+direct tests of the actual bypass scenario (ENGR assigned as CPT is
+now rejected) and the actual mixed-rotation scenario (a real
+KHI-LHE-DWC-KHI-shaped 3-leg duty is now accepted with the correct
+international buffer applied, verified against the exact
+report/debrief timestamps, not just "doesn't raise").
+
+Two of today's own test-writing mistakes are worth recording plainly,
+not glossing over: a str_replace edit accidentally deleted a test's
+body (caught immediately by syntax check, restored), and two
+existing tests had to be rewritten because their whole premise
+(mixed-domestic rejection) was the bug being fixed — both are normal
+parts of doing real work, not incidents, but the discipline of
+running the suite after every change is what caught both immediately
+rather than either shipping silently broken.
+
+## 2026-07-2x: first real attempt to connect to Supabase — a genuine
+## systemic bug found and fixed, not yet fully resolved on the user's end
+
+The user set up a real Supabase project (`bdpfkftgzsjqykkitmgx`),
+walked through finding the Session/Direct connection string
+(Supabase's dashboard now puts this behind a "Connect" button, not
+Project Settings > Database as earlier guidance assumed — corrected
+mid-conversation), and edited `.env` — with one credential-hygiene
+incident along the way: a real database password briefly appeared in
+a terminal paste shared in chat. Treated as compromised at the time;
+the user's explicit, informed choice was to keep the same password
+rather than rotate it. Worth knowing if anything about that DB looks
+wrong later — the password has been visible in this conversation's
+history since.
+
+Running `python scripts/run_migrations.py --status` against the
+freshly-configured Supabase connection first appeared to work — it
+reported "Applied: 0, Pending: 8," matching the Supabase dashboard's
+own "No migrations" indicator. Running it for real applied 000 and
+001 successfully, then failed on 002 with `UndefinedColumn: column
+"dep_time_planned" does not exist` — implying a pre-existing
+`flights` table with different, incompatible columns. But checking
+Supabase's SQL Editor directly showed the `public` schema
+completely empty — not even `crew`, which had just been reported as
+successfully applied.
+
+**Root cause, found by checking actual code rather than guessing
+further: `scripts/run_migrations.py` never called `load_dotenv()` at
+all** — it only ever read a genuine shell/system environment
+variable named `DATABASE_URL`, completely ignoring `.env`'s
+contents, with no warning of any kind. The user's shell had exactly
+such a variable already set, left over from earlier work, pointing
+to a **Neon** database (`ep-summer-haze-a1e19z0g-pooler.ap-southeast-1
+.aws.neon.tech`) — not Supabase at all. Every "Supabase" migration
+run had silently been hitting that old Neon database instead, which
+already had its own (incompatible) `flights` table from earlier
+work — explaining the exact contradiction observed.
+
+**This is not confined to one script.** `db/db.py` — the single
+connection owner used by every page, every service, everything —
+had the same class of bug in a subtler form: it *did* call
+`load_dotenv()`, but without `override=True`, which means
+python-dotenv leaves a pre-existing environment variable untouched
+and silently never applies `.env` at all when one already exists.
+The entire application has been vulnerable to this exact silent
+shadowing whenever run in an environment with any stray
+`DATABASE_URL` already set — not just this one diagnostic script.
+
+**Fixed at the root, both files**: `db/db.py` and
+`scripts/run_migrations.py` now both call `load_dotenv(override=True)`
+— the project's own `.env` always wins over anything already present
+in the shell. Confirmed via a systematic repo-wide grep that these
+are the only two files reading `DATABASE_URL` directly; everything
+else goes through `db.db.get_engine()`, so this one fix covers the
+whole application. Two new regression tests
+(tests/test_env_override.py, 155/155 total) prove both the fix
+(`.env` wins with `override=True`) and demonstrate the bug directly
+(without it, the stale value silently wins and `.env` is ignored) —
+so if either `load_dotenv(override=True)` call is ever "simplified"
+back to a bare `load_dotenv()`, this fails loudly instead of quietly
+reintroducing the exact thing that already cost real debugging time
+once.
+
+**Not yet resolved on the user's end as of this snapshot**: the fix
+exists in this sandbox, verified, but hasn't been pushed or copied
+into the user's actual local checkout yet. Once it is: the user still
+needs to either `unset DATABASE_URL` in their shell before running
+anything (temporary, per-session), or — better — find and remove
+whatever set that Neon URL persistently (Windows System/User
+Environment Variables, or a shell profile script) so it doesn't
+shadow future work in this or any other project. Also still
+unconfirmed: whether the Neon `flights` table conflict was ever
+actually resolved, or whether the user's Supabase database (which
+*was* confirmed genuinely empty, "No migrations," before any of
+this) has now actually received all 8 migrations for real. This
+needs to be re-attempted, correctly, once the fix is in the user's
+hands.
+
+## RESOLVED: the Supabase connection actually worked, for real, for
+## the first time — plus two more real bugs found in the process
+
+Continuing directly from the above: after `unset DATABASE_URL`, the
+migration status check correctly showed the real Supabase database's
+true state (`Applied: 0, Pending: 8`, matching the dashboard). But
+`python scripts/run_migrations.py` (the real apply) then hung/failed
+with `could not translate host name "db.xxx.supabase.co" to address`
+— a second, genuinely different problem: Supabase's Direct connection
+hostname is IPv6-only by default, and the user's network couldn't
+resolve it at all (confirmed via `nslookup` returning only an IPv6
+address, no IPv4). This is exactly the risk flagged back when the
+connection string was first chosen, but not actually acted on at the
+time. Fixed by switching to Supabase's **Session pooler** connection
+string instead (IPv4-proxied by design) — confirmed via `nslookup`
+returning real IPv4 addresses, then confirmed by actually running the
+migrations: **all 8 applied successfully, `Applied: 8, Pending: 0`,
+independently re-confirmed via Supabase's own dashboard.** This is
+the first time in this entire project that anything has been
+genuinely verified against the real production database, not a local
+sandbox stand-in.
+
+Two more real, confirmed bugs found immediately after, both fixed:
+
+- **Role synonym gap**: the operator's actual crew data file spells
+  the role `"CAPT"`, not `"CPT"`. Without a synonym mapping, these
+  captains would have gotten generated IDs like `CREW-01` instead of
+  `CPT-01`. Fixed the same way `AME`->`ENGR` was fixed — added to
+  `ROLE_SYNONYMS` in `services/crew_service.py`, one canonical
+  mechanism, not a new one-off special case.
+- **A second, unrelated hang, same root shape as the Supabase DNS
+  issue but in the test suite**: running `pytest` locally hung
+  indefinitely. Cause: `.env.example`'s `TEST_DATABASE_URL` used a
+  well-formed-looking placeholder string
+  (`postgresql://user:password@host:5432/dbname_test`). That string
+  *looks* unset to a human but is non-empty and therefore truthy to
+  Python — `tests/conftest.py`'s `if not test_url: pytest.skip(...)`
+  never triggers on it, so it tries to actually connect to a literal
+  host named `host`, which hangs. This had already been diagnosed in
+  an earlier session as a known gap and described as "worth fixing
+  properly later" — it then went on to block the same user a second
+  time before actually being fixed. Lesson: when a real gap is found,
+  fix it immediately, don't defer a known problem hoping it won't
+  recur. Fixed: `.env.example`'s `TEST_DATABASE_URL` is now genuinely
+  empty, not a placeholder — `conftest.py`'s existing skip logic was
+  already correct, the bug was entirely in what a fresh `.env` copy
+  contained. 4 new tests total across these two fixes (158/158),
+  including one that demonstrates the exact truthy-placeholder
+  mechanism directly (`bool(placeholder) is True`) rather than just
+  asserting the fixed behavior.
+
+**Real crew data update received from the operator**
+(`AirEagle_Crew_Data.xlsx`, distinct from the earlier
+`AirEagle_Crew_Data_Simple.xlsx`): the three 1930-dated License Exps
+are now genuinely corrected at the source (2030), and row 12's
+missing ID is now populated (`AE-153`) — both match exactly what was
+manually corrected before, confirming the operator did fix those.
+**The Loadmaster section (rows 17-19) is still exactly as misaligned
+as before** — this update touched only the pilot rows, not that
+section. Not yet imported anywhere; still needs the loadmaster
+section redone by the operator before any import happens.
+
+**Local environment cleanup, not yet done**: multiple redundant
+local folders exist from this whole zip-based delivery process
+(`K2`, `air_eagle_check`, various `air_eagle_pushN` staging folders)
+plus the original `k2` GitHub repo, all superseded by `Air-Eagle-live`
+and the `Air-Eagle` GitHub repo. User asked about deleting these;
+correctly paused pending an actual `ls` of what exists, specifically
+flagging `occ_roster` as needing confirmation before any deletion —
+that name matches the *original, deliberately separate* prototype
+project per this platform's own project structure, not necessarily a
+redundant Air Eagle copy. Not yet resolved as of this snapshot.
+
+**Still not pushed to GitHub as of this snapshot**: everything in
+this and the prior two log entries (env-override fix, role-bypass/
+mixed-domestic/geographic-continuity fix, CAPT synonym,
+TEST_DATABASE_URL hang fix) exists correctly in the user's local
+`Air-Eagle-live` working directory (individual files delivered and
+manually placed, not via zip — zips proved unreliable for delivery
+in this session) but has not yet been committed or pushed. This is
+now the single most important next step — get an actual `git push`
+confirmed before anything else, since a lot of verified-but-unpushed
+work has accumulated.

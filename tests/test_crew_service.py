@@ -82,6 +82,46 @@ def test_add_crew_unknown_role_uses_generic_prefix(_patch_engine):
     assert crew_id.startswith("CREW-")
 
 
+def test_add_crew_normalizes_role_case(_patch_engine):
+    """Regression test for a confirmed bug: role comparisons were
+    case-sensitive, so a role stored as 'Engr' or 'engr' would
+    silently fail to match FTL_EXEMPT_ROLES = {'LM', 'ENGR'} in
+    assignment_service.py. Normalization now happens once here, at
+    the write boundary."""
+    crew_id = crew_service.add_crew({"name": "Test Engineer", "role": "engr"})
+    row = crew_service.get_crew(crew_id)
+    assert row["role"] == "ENGR"
+
+
+def test_add_crew_normalizes_ame_synonym_to_engr(_patch_engine):
+    """Confirmed directly by the user: 'Engr is AME'. A role entered
+    as 'AME' (the real-world term) must be stored as the canonical
+    'ENGR' so it matches FTL_EXEMPT_ROLES and crew_id generation the
+    same way a role entered as 'ENGR' does."""
+    crew_id = crew_service.add_crew({"name": "Test AME", "role": "AME"})
+    row = crew_service.get_crew(crew_id)
+    assert row["role"] == "ENGR"
+    assert crew_id.startswith("ENGR-")  # crew_id prefix generation also benefits
+
+
+def test_add_crew_normalizes_capt_synonym_to_cpt(_patch_engine):
+    """Confirmed from the operator's actual crew data file
+    (AirEagle_Crew_Data.xlsx): Role is spelled 'CAPT', not 'CPT'.
+    Without this synonym, these captains would get generated IDs
+    like CREW-01 instead of CPT-01."""
+    crew_id = crew_service.add_crew({"name": "Test Captain", "role": "CAPT"})
+    row = crew_service.get_crew(crew_id)
+    assert row["role"] == "CPT"
+    assert crew_id.startswith("CPT-")
+
+
+def test_update_crew_normalizes_role_too(_patch_engine):
+    crew_id = crew_service.add_crew({"name": "Test Person", "role": "CPT"})
+    crew_service.update_crew(crew_id, {"role": "ame"})
+    row = crew_service.get_crew(crew_id)
+    assert row["role"] == "ENGR"
+
+
 def test_add_crew_writes_audit_record(_patch_engine):
     crew_id = crew_service.add_crew({"name": "Test Captain", "role": "CPT"}, app_user="tester")
     audit = _audit_rows(_patch_engine, "CREW_ADDED")

@@ -37,11 +37,36 @@ UPDATABLE_FIELDS = {
 
 ROLE_PREFIXES = {"CPT": "CPT", "FO": "FO", "LM": "LM", "ENGR": "ENGR"}
 
+# Known real-world synonyms for the same canonical role, confirmed
+# 2026-07-21: "Engr is AME" — the user's own operational term for
+# the role the template's dropdown calls "ENGR". Normalized here, at
+# the single write boundary, so every downstream consumer (the FTL
+# exemption check in assignment_service.py, crew_id generation
+# below, role-match validation) can trust crew.role is already
+# canonical and never needs to repeat this mapping or do its own
+# case-insensitive comparison. This is what actually closes the bug
+# a review found: a role stored as "AME" or "Engr" (any case) would
+# silently fail to match FTL_EXEMPT_ROLES = {"LM", "ENGR"}, wrongly
+# subjecting an exempt person to FDP/rest math that doesn't apply to
+# them — or, depending on where the mismatch happened, the reverse.
+ROLE_SYNONYMS = {"AME": "ENGR", "CAPT": "CPT"}
+
+
+def _normalize_role(role: str) -> str:
+    """Canonical form: uppercase, then map known synonyms. Applied
+    once here, at every write path (add_crew, update_crew) — nowhere
+    else in the codebase should need its own role normalization
+    logic if this is applied consistently at the boundary."""
+    canonical = role.strip().upper()
+    return ROLE_SYNONYMS.get(canonical, canonical)
+
 
 def _generate_crew_id(role: str) -> str:
     """CPT-01, FO-01, LM-01, ENGR-01, ... or CREW-01 for anything
-    else (the template explicitly allows role='Other')."""
-    prefix = ROLE_PREFIXES.get(role.strip().upper(), "CREW")
+    else (the template explicitly allows role='Other'). Assumes role
+    is already normalized (see _normalize_role) — callers in this
+    file always normalize before calling this."""
+    prefix = ROLE_PREFIXES.get(role, "CREW")
     engine = get_engine()
     with engine.connect() as conn:
         existing = conn.execute(text(
@@ -72,9 +97,10 @@ def add_crew(crew_data: dict, app_user: Optional[str] = None) -> str:
     if missing:
         raise ValueError(f"Missing required crew field(s): {', '.join(missing)}")
 
-    crew_id = _generate_crew_id(crew_data["role"])
-
     fields = {k: v for k, v in crew_data.items() if k in UPDATABLE_FIELDS}
+    fields["role"] = _normalize_role(fields["role"])
+
+    crew_id = _generate_crew_id(fields["role"])
     fields["crew_id"] = crew_id
 
     columns = ", ".join(fields.keys())
@@ -106,6 +132,8 @@ def update_crew(crew_id: str, updates: dict, app_user: Optional[str] = None) -> 
     fields = {k: v for k, v in updates.items() if k in UPDATABLE_FIELDS}
     if not fields:
         raise ValueError("No updatable fields provided")
+    if "role" in fields:
+        fields["role"] = _normalize_role(fields["role"])
 
     set_clause = ", ".join(f"{k} = :{k}" for k in fields.keys())
     fields["crew_id"] = crew_id

@@ -39,6 +39,7 @@ from sqlalchemy import text
 from db.db import get_engine
 from services.audit_service import log_audit
 from services import crew_service, flight_service
+from services.crew_service import ROLE_SYNONYMS
 from core.duty_builder import build_duty, FlightLeg
 from core.legality.pcaa_ano012_core import (
     ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus, ValidationResult,
@@ -156,21 +157,42 @@ def _crew_member(crew_row: pd.Series) -> CrewMember:
                        home_base=crew_row["base"] or "")
 
 
-def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool):
+def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str):
     """
     Shared validation core for both assign_crew_to_duty() (assigning
     to flights that already exist) and assign_crew_to_new_flights()
     (Control Room's atomic flight+assignment). Builds the duty, loads
     the crew member's existing history, validates — writes nothing.
 
+    Enforces role_assigned == crew_row["role"] (case-normalized).
+    This is a real, confirmed fix, not defensive boilerplate: without
+    it, role_assigned was written to the roster completely
+    unvalidated against the crew member's actual registered role,
+    while the FTL exemption decision correctly used the real role —
+    meaning an ENGR (FTL-exempt) crew member could be assigned with
+    role_assigned="CPT" and retain the exemption while being recorded
+    as filling the Captain role, with zero FDP/rest checking ever
+    applied. Air Eagle's crew model has exactly one fixed role per
+    person (1 CPT, 1 FO, 1 LM, 1 AME per rotation) — there's no
+    legitimate case where these should differ.
+
     Returns (validation_result, new_duty, crew_member, crew_row,
-    duty_result). Raises ValueError if crew_id doesn't exist.
+    duty_result). Raises ValueError if crew_id doesn't exist or
+    role_assigned doesn't match the crew member's registered role.
     """
     duty_result = build_duty(legs, domestic=domestic)
 
     crew_row = crew_service.get_crew(crew_id)
     if crew_row is None:
         raise ValueError(f"No crew member with crew_id={crew_id}")
+
+    normalized_assigned = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
+    if normalized_assigned != crew_row["role"]:
+        raise ValueError(
+            f"role_assigned '{role_assigned}' does not match {crew_id}'s "
+            f"registered role '{crew_row['role']}' — assignment rejected"
+        )
+
     crew_member = _crew_member(crew_row)
 
     new_duty_id = f"DUTY-{uuid.uuid4().hex[:12].upper()}"
@@ -233,10 +255,15 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     if missing:
         raise ValueError(f"Flight_id(s) not found: {missing}")
 
-    domestic_values = {bool(f["domestic"]) for f in flights}
-    if len(domestic_values) > 1:
-        raise ValueError("All flights in one duty must have the same domestic value")
-    domestic = domestic_values.pop()
+    # Duty-level classification for the D7.1.2 report/debrief buffer:
+    # domestic only if EVERY sector is domestic. One international
+    # sector makes the whole duty international — this is what
+    # actually allows the real KHI-LHE-DWC-KHI rotation to be built;
+    # rejecting any duty with mixed sectors would make that rotation
+    # impossible to construct at all. Each flight keeps its own
+    # domestic flag independently for Flight Log/reporting — this
+    # only affects which buffer applies to the duty as a whole.
+    domestic = all(bool(f["domestic"]) for f in flights)
 
     legs = [
         FlightLeg(
@@ -248,7 +275,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     ]
 
     validation_result, new_duty, crew_member, crew_row, duty_result = _validate_new_duty(
-        engine, crew_id, legs, domestic)
+        engine, crew_id, legs, domestic, role_assigned)
 
     if validation_result.status == AlertStatus.ILLEGAL:
         log_audit(
@@ -290,7 +317,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         affected_flight=flight_ids[0],
         affected_duty=new_duty.duty_id,
         legality_result=validation_result.status.value,
-        rule_applied="ANO-012-FSXX D21" if not domestic else "ANO-012-FSXX D8/D9",
+        rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
         app_user=app_user,
     )
 
@@ -337,10 +364,10 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     """
     engine = get_engine()
 
-    domestic_values = {bool(f["domestic"]) for f in flights_data}
-    if len(domestic_values) > 1:
-        raise ValueError("All flights in one duty must have the same domestic value")
-    domestic = domestic_values.pop()
+    # Same duty-level classification rule as assign_crew_to_duty() —
+    # see the comment there. Any international sector makes the
+    # whole duty international for D7.1.2 buffer purposes.
+    domestic = all(bool(f["domestic"]) for f in flights_data)
 
     legs = [
         FlightLeg(dep_time=f["dep_time_planned"], arr_time=f["arr_time_planned"],
@@ -349,7 +376,7 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     ]
 
     validation_result, new_duty, crew_member, crew_row, duty_result = _validate_new_duty(
-        engine, crew_id, legs, domestic)
+        engine, crew_id, legs, domestic, role_assigned)
 
     if validation_result.status == AlertStatus.ILLEGAL:
         log_audit(
@@ -412,7 +439,7 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         affected_flight=flight_ids[0],
         affected_duty=new_duty.duty_id,
         legality_result=validation_result.status.value,
-        rule_applied="ANO-012-FSXX D21" if not domestic else "ANO-012-FSXX D8/D9",
+        rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
         data_source="control_room",
         app_user=app_user,
     )
@@ -504,6 +531,8 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     entirely rather than running validate_schedule() against rules
     that don't apply to them.
     """
+    role_assigned = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
+
     all_crew = crew_service.get_all_crew(active_only=True)
     candidates_pool = all_crew[all_crew["role"] == role_assigned]
 
@@ -518,7 +547,9 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     if any(f is None for f in flights):
         raise ValueError("One or more flight_ids not found")
 
-    domestic = bool(flights[0]["domestic"])
+    # Same duty-level classification rule as assign_crew_to_duty() —
+    # any international sector makes the whole duty international.
+    domestic = all(bool(f["domestic"]) for f in flights)
     legs = [FlightLeg(
         dep_time=f["dep_time_actual"] if pd.notna(f["dep_time_actual"]) else f["dep_time_planned"],
         arr_time=f["arr_time_actual"] if pd.notna(f["arr_time_actual"]) else f["arr_time_planned"],

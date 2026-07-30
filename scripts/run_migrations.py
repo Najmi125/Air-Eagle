@@ -12,7 +12,9 @@ Usage:
     python scripts/run_migrations.py --dry-run        # show what would run
     python scripts/run_migrations.py --status          # show applied vs pending
 
-Requires DATABASE_URL in the environment (see .env.example).
+Requires DATABASE_URL — loaded from .env if present (see .env.example),
+with override=True so this project's own .env always wins over any
+environment variable that happens to already be set in the shell.
 """
 import os
 import sys
@@ -20,7 +22,19 @@ import hashlib
 import argparse
 from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+# override=True: without this, a stale DATABASE_URL already present
+# in the shell (e.g. left over from an unrelated earlier project)
+# would silently win over .env, with no error of any kind. This was
+# a real, confirmed bug — this script previously didn't call
+# load_dotenv() at all, so it only ever read a genuine shell
+# environment variable, completely ignoring .env's contents. A user
+# hit this directly: their shell had a leftover Neon DATABASE_URL,
+# and every run of this script silently connected there instead of
+# the Supabase database they'd just configured.
+load_dotenv(override=True)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 

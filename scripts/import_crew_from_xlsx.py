@@ -80,36 +80,50 @@ PLAUSIBLE_YEAR_RANGE = (2020, 2100)
 # Explicit, reviewed corrections for specific known bad values in a
 # specific data drop — NOT a general auto-correction mechanism. Each
 # entry here should trace back to an actual confirmed decision, not
-# a guess. Keyed by (row_number_in_sheet, field_name).
+# a guess. Keyed by (row_number_in_sheet, field_name), value is
+# {"expected_name": ..., "value": ...}.
 #
-# IMPORTANT: this matches by row number ALONE, with no check that
-# it's still the same file/context these corrections were reviewed
-# against. Clear the entries below once a data drop's import is
-# confirmed correct, before the next batch — a stale entry here
-# would silently "correct" an unrelated future row 3 to a value that
-# has nothing to do with it. (This exact collision happened in
-# tests/test_import_crew_script.py during development — synthetic
-# test rows also start at row 3 and were silently picking up
-# WAQAR's real correction until the tests were isolated from this
-# dict.)
+# The expected_name cross-check is the actual safeguard here, not
+# just documentation: a correction only applies if the row's real
+# Name matches who it was reviewed for. Row number alone was proven
+# unsafe during development — synthetic test rows also start at row
+# 3 and silently inherited WAQAR's real correction before this was
+# fixed. Matching by name too means even if rows get reordered,
+# inserted, or a different file reuses row 3 for someone else
+# entirely, the correction won't silently misapply — it'll be
+# reported as skipped instead (see the name-mismatch warning below).
+#
+# Still clear these entries once a data drop's import is confirmed
+# correct, before the next batch — this reduces the blast radius of
+# a collision, it doesn't make stale entries a non-issue.
 KNOWN_CORRECTIONS = {
     # 2026-07-21 drop: three License Exp dates read 01-Jun/Feb-1930,
     # confirmed by the user to be 2030 (source system likely dropped
     # the century on export).
-    (3, "license_expiry"): dt.date(2030, 6, 1),
-    (6, "license_expiry"): dt.date(2030, 2, 1),
-    (11, "license_expiry"): dt.date(2030, 6, 1),
+    (3, "license_expiry"): {"expected_name": "MUHAMMAD WAQAR", "value": dt.date(2030, 6, 1)},
+    (6, "license_expiry"): {"expected_name": "TAHIR MAHMOOD RAJA", "value": dt.date(2030, 2, 1)},
+    (11, "license_expiry"): {"expected_name": "MUHAMMAD SHAHBAZ", "value": dt.date(2030, 6, 1)},
 }
 
 
-def _clean_value(row_num, field, value):
+def _clean_value(row_num, field, value, row_name=None):
     if value is None:
         return None
     if isinstance(value, str) and value.strip() in ("-", ""):
         return None
 
     if (row_num, field) in KNOWN_CORRECTIONS:
-        return KNOWN_CORRECTIONS[(row_num, field)]
+        correction = KNOWN_CORRECTIONS[(row_num, field)]
+        expected_name = correction["expected_name"]
+        actual_name = (row_name or "").strip().upper()
+        if actual_name == expected_name.strip().upper():
+            return correction["value"]
+        # Row number matched but the name didn't — this is exactly
+        # the collision the review flagged. Don't apply a correction
+        # meant for someone else; fall through to normal handling
+        # (which will likely flag this as a suspect date instead,
+        # correctly surfacing it for review rather than silently
+        # "fixing" it wrong).
 
     if field in EXPIRY_FIELDS and isinstance(value, (dt.date, dt.datetime)):
         year = value.year
@@ -136,6 +150,7 @@ def read_rows(path):
         if "(EXAMPLE)" in str(raw.get("Name", "")):
             continue
 
+        row_name = raw.get("Name")
         record = {}
         misaligned = False
         suspect = False
@@ -144,7 +159,7 @@ def read_rows(path):
             field = HEADER_MAP.get(header)
             if field is None:
                 continue
-            cleaned = _clean_value(row_num, field, value)
+            cleaned = _clean_value(row_num, field, value, row_name=row_name)
 
             # Symmetric check: a text field should never hold a date
             # (e.g. Base='2027-04-01'), and a date field should never
