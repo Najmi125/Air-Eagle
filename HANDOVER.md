@@ -222,14 +222,19 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Step 2 of the agreed remediation order (NEEDS_MANUAL_REVIEW gate) is
-done, tested (164/164), verified locally — not yet pushed as of this
-snapshot. Everything through commit `727da58` is confirmed live on
-GitHub AND the real Supabase database now has actual schema (all 8
-migrations applied, independently confirmed both via
-`run_migrations.py --status` and Supabase's own dashboard) — the
-first genuinely real infrastructure in this entire project. See
-"Next safest step" for what's queued after this gets pushed.
+Steps 2–4 of the agreed remediation order are now done: the
+NEEDS_MANUAL_REVIEW gate, the domestic/geographic-continuity fix, and
+the crew qualification gate (AE-CREW-QUAL-001 — see the dedicated log
+entry below) are all merged into `main`. The qualification gate was
+built and iterated on branch `qualification-gate` (commits `87044d4`,
+`45252da`, `b5d9c05`) and merged after 177/177 independent
+verification against real Postgres 16 — see "Tests passed" for the
+one test added after that specific verification run. Everything
+through main's HEAD is confirmed live on GitHub; the real Supabase
+database has all 8 migrations applied (independently confirmed via
+`run_migrations.py --status` and Supabase's own dashboard). See "Next
+safest step" for what's queued next (item 5: the three stale-data
+findings, or item 7: the age-pairing rule).
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -259,17 +264,25 @@ env-override fix.
   NEEDS_MANUAL_REVIEW fix — logic-only change.
 
 ## Tests passed
-164/164 — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (16),
-tests/test_audit_service.py (3), tests/test_crew_service.py (22),
+178 total — tests/test_migrations.py (4), tests/test_duty_summary.py
+(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (15),
+tests/test_audit_service.py (3), tests/test_crew_service.py (21),
 tests/test_crew_data_page.py (4), tests/test_duty_builder.py (12),
 tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py (37), tests/test_control_room_page.py
+tests/test_assignment_service.py (52), tests/test_control_room_page.py
 (5), tests/test_roster_page.py (4), tests/test_import_crew_script.py
-(12), tests/test_env_override.py (4). Against real Postgres 16, local
-sandbox — the NEEDS_MANUAL_REVIEW fix verified locally but not yet
-pushed/re-confirmed as of this snapshot; everything before it is
-confirmed live via fresh clone.
+(12), tests/test_env_override.py (4).
+
+177/177 independently verified against real Postgres 16 (2026-07-31,
+`qualification-gate` branch, commit `45252da`) — this covers the
+crew-qualification gate itself plus the debrief-date and
+AME-synonym-test fixes that verification run required. One further
+test was added after that run (`type_rating_expiry`, commit
+`b5d9c05`), bringing the count to 178 — that one test has NOT been
+independently re-verified against a real database as of this
+snapshot. Flagging this explicitly rather than assuming it passes
+just because it follows the same pattern as the other 8 fields —
+exactly the kind of unverified claim this file exists to avoid.
 
 ## Open stubs / known blockers
 - `core/duty_summary.py` is the only file still flagged by
@@ -357,15 +370,15 @@ phase so far:
    Geographic continuity (leg N destination == leg N+1 origin) added
    alongside the existing temporal check. This directly unblocks the
    real KHI-LHE-DWC-KHI rotation.
-4. **The qualification gate — this is the actual next step.**
-   `_crew_member()` currently passes only crew_id/name/home_base into
-   the legality check — is_active, license/medical/SIM/route-check
-   validity against the duty date are not checked at all during
-   assignment. Role match IS now enforced (role_assigned must equal
-   the crew member's registered role), but the rest of this gate is
-   still open. This remains the single biggest gap — a deactivated
-   captain could currently be assigned through the service API today.
-   could currently be assigned through the service API today.
+4. ~~The qualification gate~~ DONE (2026-07-31) — see the dedicated
+   log entry below (AE-CREW-QUAL-001) for full detail. Role match was
+   already enforced (Step 2's work); this closes the rest: is_active
+   plus 9 document-expiry fields, checked against the duty's own
+   debrief (end) date — not report date, not date.today() — applied
+   to every role including FTL-exempt LM/ENGR, and folded into both
+   `_validate_new_duty()` and `find_legal_candidates_for_duty()` so an
+   unqualified crew member can no longer be suggested as a
+   downstream-swap candidate either.
 5. Three related "stale data" findings, likely fixed together:
    LOOKBACK_DAYS=35 starves the engine's own 365-day/1000h cumulative
    check (D9.2.3) of data it needs — that rule has never once been
@@ -992,3 +1005,113 @@ unsaved) duty times where available.
 164/164 total. Reachability unchanged (`core/duty_summary.py` still
 the only flag, as expected). Verified locally; not yet pushed as of
 this snapshot.
+
+## Step 4 done: crew qualification gate (AE-CREW-QUAL-001) — is_active
+## + document validity, checked against the duty's own debrief date,
+## closes the single biggest remaining gap in the assignment API
+
+The gap this closes: `_crew_member()` previously passed only
+crew_id/name/home_base into the legality engine — nothing checked
+`is_active`, or whether license/medical/type-rating/SIM/route-check/
+IR/SEP/CRM/DG were current. A deactivated captain, or one with an
+expired medical, could be assigned through the service API with zero
+checking. Role match (Step 2's earlier work) was already enforced;
+this was the rest of the gap flagged in "Next safest step" item 4.
+
+**The fix**: a new `_check_crew_qualifications(crew_row, duty_date)`
+in `services/assignment_service.py`, orchestration-layer like
+`FTL_EXEMPT_ROLES` — the core engine
+(`core/legality/pcaa_ano012_core.py`) stays qualification-agnostic;
+this is an Air Eagle operating decision, not FTL math. Every finding
+gets its own rule code under the `AE-CREW-QUAL-001` family
+(`AE-CREW-QUAL-001_INACTIVE_CREW`, `AE-CREW-QUAL-001_<FIELD>_EXPIRED`,
+`AE-CREW-QUAL-001_<FIELD>_EXPIRY_MISSING`) — expired documents or
+`is_active=False` are ILLEGAL, a missing/NULL expiry date is
+NEEDS_MANUAL_REVIEW (never a silent pass, never a silent reject on
+absent data). Every failing reason is collected, not just the first —
+this file already documents first-failure-only evaluation as a real
+bug elsewhere (`_check_downstream_impact`'s original before/after
+comparison), not a hypothetical concern here. Folded into the
+existing `ValidationResult` via `add_alert()`, so the
+NEEDS_MANUAL_REVIEW/ILLEGAL branches Step 2 already built handle this
+with zero new branching logic in `assign_crew_to_duty()` /
+`assign_crew_to_new_flights()`.
+
+**Fields checked** (9): license_expiry, medical_expiry,
+type_rating_expiry, sim_expiry, route_check_expiry, ir_expiry,
+sep_expiry, crm_expiry, dg_expiry — plus `is_active`.
+`contract_expiry` is deliberately excluded: an employment/HR date,
+not a flight-safety qualification. This is an ASSUMPTION, not an
+operator-confirmed decision, and should be revisited if Air Eagle's
+actual policy ties contract status to flight eligibility — don't
+silently start checking it without that being an explicit decision,
+same discipline as `FTL_EXEMPT_ROLES`.
+
+**Boundary convention, deliberately stricter than common aviation
+"valid through" practice**: a document is invalid ON its own expiry
+date (`expiry_date <= duty_date` is ILLEGAL), not valid through it.
+This was an explicit decision made when this gate was designed, not a
+default — revisit if Air Eagle's actual regulatory documents specify
+"valid through" instead.
+
+**Checked against the duty's debrief (end) date, not its report
+(start) date — a real correction made after the first real-Postgres
+run**: the first implementation checked
+`duty_result.report_time.date()`. Wrong for any duty crossing
+midnight — Air Eagle's real EPE 786/787 rotation (KHI-LHE-KHI,
+domestic, Mon-Fri nightly) reports 18:15 and debriefs 00:00 the
+following day; a document expiring on the debrief date would have
+incorrectly passed if only the report date were checked, since the
+crew member would already be unqualified before the duty was actually
+over. Fixed at both call sites (`_validate_new_duty()` and
+`find_legal_candidates_for_duty()`); a regression test using these
+exact EPE 786/787 timings now asserts the debrief-date boundary
+directly.
+
+**Applies to every role, including LM/ENGR**: `FTL_EXEMPT_ROLES` only
+ever exempted FDP/rest MATH — it says nothing about whether the
+person holds valid documents to be on the roster at all. The
+qualification check is NOT gated on `FTL_EXEMPT_ROLES`; a dedicated
+guard-rail test confirms the exemption doesn't leak (an ENGR with an
+expired license is still REJECTED, same as a CPT would be).
+
+**Second code path closed**: `find_legal_candidates_for_duty()` runs
+its own FDP/rest simulation independent of `_validate_new_duty()` —
+without wiring the same check in there too, a deactivated or
+expired-document crew member could still have been suggested as a
+downstream-swap candidate. Both its FTL-exempt trivial branch and its
+main per-candidate simulation loop now run the same qualification
+check before including anyone in the candidate list.
+
+**Real-data consequence, confirmed against the operator's actual crew
+file**: `type_rating_expiry` ("Type Rating Exp") is empty for every
+single row in the real data received so far (a systematic gap already
+noted earlier in this file, not a per-person one) — every real crew
+member imported to date will correctly hold for NEEDS_MANUAL_REVIEW
+on this field specifically until the operator supplies it. This is
+the gate working as designed (missing data is flagged, not silently
+passed or silently rejected), not a new bug — but it means the
+qualification gate will visibly block real assignments the moment
+real crew are actually used, not just a theoretical future concern.
+
+**Test coverage**: 14 dedicated tests in `test_assignment_service.py`
+(expired license/medical/type-rating, missing-date, inactive crew,
+multiple-failures-all-reported, duty-date-vs-today's-date,
+exact-boundary, debrief-vs-report-date using the real EPE 786/787
+timings, ENGR/LM still-subject guard-rail, candidate-search exclusion
+on both branches, Control-Room-path parity), plus qualification
+defaults added to the shared test-crew helpers in
+`test_assignment_service.py`, `test_control_room_page.py`, and
+`test_roster_page.py` so the pre-existing tests keep testing FDP/
+rest/role logic rather than tripping the new gate. Also fixed in
+passing: `test_role_match_recognizes_ame_engr_synonym` was calling
+`crew_service.add_crew()` directly, bypassing the qualification
+defaults, so it correctly (if confusingly) started failing the moment
+the gate went in — switched to the shared `_add_crew()` helper.
+
+177/177 independently verified against real Postgres 16 (not just
+sandbox collection — see "Tests passed"); one further test
+(`type_rating_expiry`) added after that run, not yet independently
+re-verified. Built and iterated on branch `qualification-gate`
+(commits `87044d4`, `45252da`, `b5d9c05`), merged into `main` after
+the verification above.

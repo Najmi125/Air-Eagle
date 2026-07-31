@@ -28,7 +28,19 @@ def page_app(migrated_db, monkeypatch):
 
 def _seed_crew():
     from services import crew_service
-    return crew_service.add_crew({"name": "Test Captain", "role": "CPT", "base": "KHI"})
+    # All qualification expiry fields set far in the future so these
+    # page tests exercise page/FDP/rest mechanics, not the
+    # qualification gate (2026-07-31) — that gate has its own
+    # dedicated tests in test_assignment_service.py.
+    far_future = dt.date(2099, 1, 1)
+    return crew_service.add_crew({
+        "name": "Test Captain", "role": "CPT", "base": "KHI",
+        "license_expiry": far_future, "medical_expiry": far_future,
+        "type_rating_expiry": far_future,
+        "sim_expiry": far_future, "route_check_expiry": far_future,
+        "ir_expiry": far_future, "sep_expiry": far_future,
+        "crm_expiry": far_future, "dg_expiry": far_future,
+    })
 
 
 def test_page_loads_without_exception(page_app):

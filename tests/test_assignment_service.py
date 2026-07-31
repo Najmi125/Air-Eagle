@@ -30,8 +30,33 @@ def _patch_engine(migrated_db, monkeypatch):
     return migrated_db
 
 
-def _add_crew(role="CPT", crew_id_hint=None):
-    cid = crew_service.add_crew({"name": f"Test {role}", "role": role, "base": "KHI"})
+# A safely-future date for every qualification expiry field, so a
+# crew member created via _add_crew() is fully qualified by default.
+# Existing tests in this file are about FDP/rest/role logic, not
+# qualifications — without this default, EVERY one of them would
+# start failing with NEEDS_REVIEW (missing expiry date) the moment
+# the qualification gate (2026-07-31) was added, which would silently
+# swap what these tests are actually verifying. Tests that need to
+# exercise the qualification gate itself override individual fields.
+_FAR_FUTURE_EXPIRY = dt.date(2099, 1, 1)
+_QUALIFICATION_DEFAULTS = {
+    "license_expiry": _FAR_FUTURE_EXPIRY,
+    "medical_expiry": _FAR_FUTURE_EXPIRY,
+    "type_rating_expiry": _FAR_FUTURE_EXPIRY,
+    "sim_expiry": _FAR_FUTURE_EXPIRY,
+    "route_check_expiry": _FAR_FUTURE_EXPIRY,
+    "ir_expiry": _FAR_FUTURE_EXPIRY,
+    "sep_expiry": _FAR_FUTURE_EXPIRY,
+    "crm_expiry": _FAR_FUTURE_EXPIRY,
+    "dg_expiry": _FAR_FUTURE_EXPIRY,
+}
+
+
+def _add_crew(role="CPT", crew_id_hint=None, **overrides):
+    crew_data = {"name": f"Test {role}", "role": role, "base": "KHI"}
+    crew_data.update(_QUALIFICATION_DEFAULTS)
+    crew_data.update(overrides)
+    cid = crew_service.add_crew(crew_data)
     return cid
 
 
@@ -274,7 +299,14 @@ def test_role_match_recognizes_ame_engr_synonym(_patch_engine):
     'ENGR') must still be assignable with role_assigned='AME' — the
     synonym must be recognized on the comparison side too, not just
     at storage time."""
-    crew_id = crew_service.add_crew({"name": "Test AME", "role": "AME"})
+    # Must go through _add_crew(), not crew_service.add_crew()
+    # directly — the qualification gate (2026-07-31) needs the
+    # expiry defaults _add_crew() sets, or this crew member has no
+    # expiry dates and correctly trips NEEDS_REVIEW instead of
+    # ALLOWED. _add_crew's role kwarg passes straight through to
+    # crew_service.add_crew(), so the AME synonym is exercised
+    # exactly as before.
+    crew_id = _add_crew("AME")
     flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
     result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "AME")
     assert result.status == "ALLOWED"
@@ -610,6 +642,216 @@ def test_adhoc_ftl_exempt_assignment_via_control_room_path(_patch_engine):
     result2, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, tight_flights, "LM")
     assert result2.status == "ALLOWED"
     assert len(flight_ids) == 1
+
+
+# ------------------------------------------------------------------
+# Crew qualification gate (2026-07-31) — is_active plus 9 expiry
+# fields (license/medical/type-rating/SIM/route-check/IR/SEP/CRM/DG).
+# Deliberately
+# orthogonal to FTL_EXEMPT_ROLES: that set only exempts FDP/rest
+# MATH, not whether the person currently holds valid documents to be
+# on the roster at all.
+# ------------------------------------------------------------------
+
+def test_expired_license_is_illegal_and_blocks_save(_patch_engine):
+    crew_id = _add_crew("CPT", license_expiry=dt.date(2020, 1, 1))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert result.legality_status == "ILLEGAL"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_LICENSE_EXPIRED" for a in result.alerts)
+    assert len(assignment_service.get_roster_for_crew(crew_id)) == 0
+
+
+def test_expired_medical_is_illegal_and_blocks_save(_patch_engine):
+    crew_id = _add_crew("CPT", medical_expiry=dt.date(2020, 1, 1))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
+
+
+def test_expired_type_rating_is_illegal_and_blocks_save(_patch_engine):
+    """type_rating_expiry was added to the gate after the fact
+    (2026-07-31, second pass) — dedicated test since it's the field
+    that changed, not just covered incidentally by the others."""
+    crew_id = _add_crew("CPT", type_rating_expiry=dt.date(2020, 1, 1))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_TYPE_RATING_EXPIRED" for a in result.alerts)
+
+
+def test_missing_expiry_date_is_needs_review_not_silently_allowed(_patch_engine):
+    """A NULL expiry is neither a silent pass nor a silent reject —
+    it's an unresolved data gap that needs a human to look at it,
+    same principle as the NEEDS_MANUAL_REVIEW gate this reuses."""
+    crew_id = _add_crew("CPT", sim_expiry=None)
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "NEEDS_REVIEW"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_SIM_EXPIRY_MISSING" for a in result.alerts)
+    assert len(assignment_service.get_roster_for_crew(crew_id)) == 0
+
+
+def test_inactive_crew_is_illegal_and_blocks_save(_patch_engine):
+    crew_id = _add_crew("CPT")
+    crew_service.deactivate_crew(crew_id)
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_INACTIVE_CREW" for a in result.alerts)
+
+
+def test_multiple_expired_documents_all_reported_not_just_first(_patch_engine):
+    """Every failing reason is collected, not just the first one hit —
+    HANDOVER.md documents first-failure-only evaluation as a real,
+    already-found bug elsewhere in this file
+    (_check_downstream_impact's original before/after comparison),
+    not a hypothetical concern here."""
+    crew_id = _add_crew(
+        "CPT",
+        license_expiry=dt.date(2020, 1, 1),
+        medical_expiry=dt.date(2021, 1, 1),
+        sep_expiry=dt.date(2019, 6, 1),
+    )
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    illegal_codes = {a.rule_code for a in result.alerts if a.status == "ILLEGAL"}
+    assert "AE-CREW-QUAL-001_LICENSE_EXPIRED" in illegal_codes
+    assert "AE-CREW-QUAL-001_MEDICAL_EXPIRED" in illegal_codes
+    assert "AE-CREW-QUAL-001_SEP_EXPIRED" in illegal_codes
+
+
+def test_qualification_checked_against_duty_date_not_todays_date(_patch_engine):
+    """A document that hasn't expired yet by 'today' but WILL have
+    expired by the actual duty date must still be caught — checking
+    against date.today() instead of the duty's own date is exactly
+    the class of bug this project's hard-lessons catalogue already
+    calls out."""
+    crew_id = _add_crew("CPT", medical_expiry=dt.date(2026, 7, 22))
+    # Duty date 2026-07-25 is after the medical's 2026-07-22 expiry,
+    # even though 2026-07-22 is still in the future relative to
+    # whatever "today" is when this test actually runs.
+    flight_id = _add_flight(dt.datetime(2026, 7, 25, 5, 45), dt.datetime(2026, 7, 25, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
+
+
+def test_qualification_valid_on_duty_date_is_not_flagged(_patch_engine):
+    """Sanity check the other direction: a document valid well past
+    the duty date must not be flagged."""
+    crew_id = _add_crew("CPT", medical_expiry=dt.date(2026, 12, 31))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "ALLOWED"
+
+
+def test_expiry_exactly_on_duty_date_is_expired(_patch_engine):
+    """Confirmed boundary convention: a document expiring ON the duty
+    date itself counts as already expired, not valid through it."""
+    crew_id = _add_crew("CPT", medical_expiry=dt.date(2026, 7, 20))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
+
+
+def test_qualification_checked_against_debrief_date_not_report_date(_patch_engine):
+    """Documents must stay valid through the END of the duty, not
+    just at report time. Uses Air Eagle's real EPE 786/787 rotation
+    timings (KHI-LHE-KHI, domestic, Mon-Fri nightly): report 18:15,
+    debrief 00:00 the following day. A document expiring ON the
+    debrief date (2026-07-21) must be caught as ILLEGAL even though
+    it's still valid on the report date (2026-07-20) — checking only
+    the report date would have incorrectly passed this."""
+    crew_id = _add_crew("CPT", medical_expiry=dt.date(2026, 7, 21))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 19, 0), dt.datetime(2026, 7, 20, 23, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.computed_report_time == dt.datetime(2026, 7, 20, 18, 15)
+    assert result.computed_debrief_time == dt.datetime(2026, 7, 21, 0, 0)
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
+
+
+def test_engr_still_subject_to_qualification_check_despite_ftl_exemption(_patch_engine):
+    """Guard-rail: FTL_EXEMPT_ROLES must not leak into qualification
+    exemption. The identical setup that's ALLOWED for an ENGR from an
+    FTL standpoint (test_engr_assignment_allowed_despite_rest_that_
+    would_reject_a_cpt) must still be REJECTED here, purely on
+    qualification grounds."""
+    crew_id = _add_crew("ENGR", license_expiry=dt.date(2020, 1, 1))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "ENGR")
+
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_LICENSE_EXPIRED" for a in result.alerts)
+
+
+def test_find_legal_candidates_excludes_inactive_or_expired_crew(_patch_engine):
+    qualified = _add_crew("CPT")
+    inactive = _add_crew("CPT")
+    crew_service.deactivate_crew(inactive)
+    expired_license = _add_crew("CPT", license_expiry=dt.date(2020, 1, 1))
+
+    target_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "CPT")
+
+    assert qualified in candidates
+    assert inactive not in candidates
+    assert expired_license not in candidates
+
+
+def test_find_legal_candidates_for_ftl_exempt_role_still_excludes_unqualified(_patch_engine):
+    """The FTL-exempt trivial branch of find_legal_candidates_for_duty
+    must not bypass the qualification gate either — otherwise a
+    deactivated/expired-document LM or ENGR could still be suggested
+    as a downstream-swap candidate."""
+    qualified_lm = _add_crew("LM")
+    unqualified_lm = _add_crew("LM", medical_expiry=dt.date(2020, 1, 1))
+
+    target_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "LM")
+
+    assert qualified_lm in candidates
+    assert unqualified_lm not in candidates
+
+
+def test_control_room_path_also_enforces_qualification_gate(_patch_engine):
+    """Same underlying validation core (_validate_new_duty) as
+    assign_crew_to_duty() — confirming the two entry points stayed in
+    sync for this gate too, same reasoning as the role-match and
+    NEEDS_MANUAL_REVIEW parity tests above."""
+    crew_id = _add_crew("CPT", license_expiry=dt.date(2020, 1, 1))
+    flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))]
+
+    result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
+
+    assert result.status == "REJECTED"
+    assert flight_ids == []
 
 
 # ------------------------------------------------------------------
