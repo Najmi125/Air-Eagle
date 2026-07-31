@@ -71,7 +71,6 @@ FTL_EXEMPT_ROLES = {"LM", "ENGR"}
 QUALIFICATION_EXPIRY_FIELDS = {
     "license_expiry": "LICENSE",
     "medical_expiry": "MEDICAL",
-    "type_rating_expiry": "TYPE_RATING",
     "sim_expiry": "SIM",
     "route_check_expiry": "ROUTE_CHECK",
     "ir_expiry": "IR",
@@ -79,10 +78,14 @@ QUALIFICATION_EXPIRY_FIELDS = {
     "crm_expiry": "CRM",
     "dg_expiry": "DG",
 }
-# contract_expiry is deliberately NOT included — an employment-
-# contract date, not a flight-safety qualification. Don't add it here
-# without an equally explicit decision, same discipline as
-# FTL_EXEMPT_ROLES above.
+# type_rating_expiry and contract_expiry are not columns on crew at
+# all (migrations/008_drop_type_rating_and_contract_expiry.sql,
+# 2026-08-01) — both were empty for every real crew row received,
+# which meant this gate would hold every real crew member for review
+# indefinitely. Decision: trust OCC's own offline process to have
+# already removed anyone unqualified, rather than gate on two fields
+# the operator shows no sign of tracking. Don't re-add either without
+# an equally explicit decision, same discipline as FTL_EXEMPT_ROLES.
 
 
 def _check_crew_qualifications(crew_row: pd.Series, duty_date) -> List[RuleAlert]:

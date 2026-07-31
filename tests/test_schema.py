@@ -72,9 +72,9 @@ def test_crew_table_has_all_template_columns(migrated_db):
     expected = {
         "crew_id", "operator_staff_id", "name", "role", "date_of_birth",
         "nationality", "base", "phone", "email", "license_no",
-        "license_expiry", "medical_expiry", "type_rating_expiry",
+        "license_expiry", "medical_expiry",
         "sim_expiry", "route_check_expiry", "ir_expiry",
-        "sep_expiry", "crm_expiry", "dg_expiry", "contract_expiry", "remarks",
+        "sep_expiry", "crm_expiry", "dg_expiry", "remarks",
     }
     assert expected <= col_names
 
@@ -92,6 +92,23 @@ def test_crew_table_old_column_names_are_gone(migrated_db):
     col_names = {row[0] for row in cols}
     assert "lpc_opc_expiry" not in col_names
     assert "line_check_expiry" not in col_names
+
+
+def test_type_rating_and_contract_expiry_columns_removed(migrated_db):
+    """Migration 008 drops type_rating_expiry and contract_expiry
+    entirely — both were empty for every real crew row, and the
+    qualification gate holding every real crew member for review over
+    two fields the operator never populates was a dead end. Confirms
+    the drop actually applied, not just that the migration ran without
+    a SQL error."""
+    with migrated_db.connect() as conn:
+        cols = conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'crew'"
+        )).fetchall()
+    col_names = {row[0] for row in cols}
+    assert "type_rating_expiry" not in col_names
+    assert "contract_expiry" not in col_names
 
 
 def test_base_column_has_no_hardcoded_default(migrated_db):

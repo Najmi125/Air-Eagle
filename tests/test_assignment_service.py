@@ -42,7 +42,6 @@ _FAR_FUTURE_EXPIRY = dt.date(2099, 1, 1)
 _QUALIFICATION_DEFAULTS = {
     "license_expiry": _FAR_FUTURE_EXPIRY,
     "medical_expiry": _FAR_FUTURE_EXPIRY,
-    "type_rating_expiry": _FAR_FUTURE_EXPIRY,
     "sim_expiry": _FAR_FUTURE_EXPIRY,
     "route_check_expiry": _FAR_FUTURE_EXPIRY,
     "ir_expiry": _FAR_FUTURE_EXPIRY,
@@ -645,9 +644,11 @@ def test_adhoc_ftl_exempt_assignment_via_control_room_path(_patch_engine):
 
 
 # ------------------------------------------------------------------
-# Crew qualification gate (2026-07-31) — is_active plus 9 expiry
-# fields (license/medical/type-rating/SIM/route-check/IR/SEP/CRM/DG).
-# Deliberately
+# Crew qualification gate (2026-07-31, revised 2026-08-01) — is_active
+# plus 8 expiry fields (license/medical/SIM/route-check/IR/SEP/CRM/DG).
+# type_rating_expiry and contract_expiry were dropped from the crew
+# schema entirely (migrations/008) — see assignment_service.py's
+# QUALIFICATION_EXPIRY_FIELDS comment for why. Deliberately
 # orthogonal to FTL_EXEMPT_ROLES: that set only exempts FDP/rest
 # MATH, not whether the person currently holds valid documents to be
 # on the roster at all.
@@ -673,19 +674,6 @@ def test_expired_medical_is_illegal_and_blocks_save(_patch_engine):
 
     assert result.status == "REJECTED"
     assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
-
-
-def test_expired_type_rating_is_illegal_and_blocks_save(_patch_engine):
-    """type_rating_expiry was added to the gate after the fact
-    (2026-07-31, second pass) — dedicated test since it's the field
-    that changed, not just covered incidentally by the others."""
-    crew_id = _add_crew("CPT", type_rating_expiry=dt.date(2020, 1, 1))
-    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
-
-    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
-
-    assert result.status == "REJECTED"
-    assert any(a.rule_code == "AE-CREW-QUAL-001_TYPE_RATING_EXPIRED" for a in result.alerts)
 
 
 def test_missing_expiry_date_is_needs_review_not_silently_allowed(_patch_engine):

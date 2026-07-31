@@ -54,21 +54,25 @@ HEADER_MAP = {
     "License Exp": "license_expiry",
     "Medical Exp": "medical_expiry",
     "IR": "ir_expiry",
-    "Type Rating Exp": "type_rating_expiry",
     "SIM Exp": "sim_expiry",
     "Route Check Exp": "route_check_expiry",
     "SEP Exp": "sep_expiry",
     "CRM Exp": "crm_expiry",
     "DG Exp": "dg_expiry",
-    "Contract Exp": "contract_expiry",
     "Remarks": "remarks",
 }
+# "Type Rating Exp" and "Contract Exp" are deliberately NOT mapped —
+# neither is a column on crew anymore
+# (migrations/008_drop_type_rating_and_contract_expiry.sql,
+# 2026-08-01). Any workbook still carrying these columns will simply
+# have them ignored (HEADER_MAP.get() returns None for unmapped
+# headers, see read_rows() below), not misfiled elsewhere.
 
 TEXT_FIELDS = {"role", "nationality", "base", "phone", "email", "license_no"}
 DATE_FIELDS = {
     "date_of_birth", "license_expiry", "medical_expiry", "ir_expiry",
-    "type_rating_expiry", "sim_expiry", "route_check_expiry", "sep_expiry",
-    "crm_expiry", "dg_expiry", "contract_expiry",
+    "sim_expiry", "route_check_expiry", "sep_expiry",
+    "crm_expiry", "dg_expiry",
 }
 # Subset of DATE_FIELDS subject to the plausible-year check below.
 # date_of_birth is deliberately excluded — a birth year like 1960 is
