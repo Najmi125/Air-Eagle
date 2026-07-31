@@ -196,6 +196,39 @@ def test_roster_rejects_debrief_before_report(migrated_db):
             ), {"fid": flight_id})
 
 
+def test_roster_status_check_allows_needs_review(migrated_db):
+    """Migration 009 (roster_needs_review_status) added NEEDS_REVIEW
+    to roster.status's allowed values, for
+    assignment_service.update_flight_actual_times_and_revalidate() to
+    flag a duty a delay recompute made no longer LEGAL/WARNING.
+    Confirms the CHECK constraint actually accepts it, not just that
+    the migration ran without a SQL error."""
+    _insert_crew(migrated_db)
+    flight_id = _insert_flight(migrated_db)
+    with migrated_db.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO roster (crew_id, flight_id, duty_id, duty_date, "
+            "report_time, debrief_time, role_assigned, status) "
+            "VALUES ('CPT-01', :fid, 'D-1', '2026-07-20', "
+            "'2026-07-20 05:00', '2026-07-20 08:00', 'CPT', 'NEEDS_REVIEW')"
+        ), {"fid": flight_id})
+
+
+def test_roster_status_check_still_rejects_invalid_values(migrated_db):
+    """Sanity check the other direction — adding NEEDS_REVIEW must not
+    have accidentally loosened the constraint to accept anything."""
+    _insert_crew(migrated_db)
+    flight_id = _insert_flight(migrated_db)
+    with pytest.raises(Exception):
+        with migrated_db.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO roster (crew_id, flight_id, duty_id, duty_date, "
+                "report_time, debrief_time, role_assigned, status) "
+                "VALUES ('CPT-01', :fid, 'D-1', '2026-07-20', "
+                "'2026-07-20 05:00', '2026-07-20 08:00', 'CPT', 'BOGUS_STATUS')"
+            ), {"fid": flight_id})
+
+
 def test_roster_unique_constraint_blocks_duplicate_assignment(migrated_db):
     """Same crew, same flight, same role assigned twice must be
     rejected — that's a data-entry error, not a legitimate case."""

@@ -984,3 +984,204 @@ def test_adhoc_mixed_domestic_international_uses_international_buffer(_patch_eng
     result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
     assert result.status == "ALLOWED"
     assert len(flight_ids) == 2
+
+
+# ------------------------------------------------------------------
+# Step 5 (2026-08-01): three "stale data" findings —
+# LOOKBACK_DAYS starving D9.2.3, cancel_flight() not excluding
+# roster history, update_flight() not recomputing FDP on delay.
+# ------------------------------------------------------------------
+
+def test_lookback_days_covers_the_365_day_cumulative_window():
+    """D9.2.3 (365-day/1000h cumulative flight time,
+    core/legality/pcaa_ano012_core.py) needs a full year of history —
+    LOOKBACK_DAYS was 35 (real bug: enough for D9's 7/14/28-day
+    windows, but silently starving D9.2.3 of the other 330 days it
+    needs, so that rule has never once been able to fire correctly
+    for any real assignment)."""
+    assert assignment_service.LOOKBACK_DAYS > 365
+
+
+def test_lookback_window_covers_40_day_old_duty_previously_excluded(_patch_engine):
+    """Confirms the fix isn't just the constant on paper — a duty 40
+    days before a new assignment (well past the old 35-day lookback,
+    within the new one) is now actually returned as history."""
+    crew_id = _add_crew("CPT")
+
+    old_flight = _add_flight(dt.datetime(2026, 6, 10, 5, 0), dt.datetime(2026, 6, 10, 7, 0))
+    _seed_duty(_patch_engine, crew_id, old_flight, "CPT",
+               dt.datetime(2026, 6, 10, 4, 15), dt.datetime(2026, 6, 10, 7, 15), 3.0)
+
+    new_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [new_flight], "CPT")
+    assert result.status == "ALLOWED"
+
+    history = assignment_service._load_duty_records_for_crew(
+        _patch_engine, crew_id, "KHI",
+        start=result.computed_report_time - dt.timedelta(days=assignment_service.LOOKBACK_DAYS),
+        end=result.computed_debrief_time,
+    )
+    assert any(r["duty"].duty_id.startswith("SEEDED-") for r in history)
+
+
+def test_cancel_flight_and_roster_cascades_cancellation(_patch_engine):
+    crew_id = _add_crew("CPT")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assignment_service.cancel_flight_and_roster(flight_id, reason="test cancel")
+
+    everyone = assignment_service.get_roster_for_crew(crew_id, include_cancelled=True)
+    assert everyone.iloc[0]["status"] == "CANCELLED"
+
+    active = assignment_service.get_roster_for_crew(crew_id, include_cancelled=False)
+    assert len(active) == 0
+
+    assert flight_service.get_flight(flight_id)["status"] == "CANCELLED"
+
+
+def test_cancel_flight_and_roster_with_no_crew_assigned_does_not_error(_patch_engine):
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    assignment_service.cancel_flight_and_roster(flight_id)
+    assert flight_service.get_flight(flight_id)["status"] == "CANCELLED"
+
+
+def test_cancelled_flight_duty_excluded_from_legality_history(_patch_engine):
+    """The actual bug this fixes: before cascading cancellation to
+    roster, a cancelled flight's duty still counted toward FDP/rest
+    history, since _load_duty_records_for_crew() only ever filtered
+    on roster.status, never flights.status."""
+    crew_id = _add_crew("CPT")
+
+    # 8h FDP prior duty, seeded directly (same reason as every other
+    # heavy-duty seed in this file — NEEDS_MANUAL_REVIEW via D25
+    # would otherwise write nothing through the real API). Requires
+    # max(12h, 2*8)=16h rest after it (D21) if still active.
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    _seed_duty(_patch_engine, crew_id, f1, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
+
+    assignment_service.cancel_flight_and_roster(f1)
+
+    # Only 5h after the (now-cancelled) prior duty's debrief — would
+    # be REJECTED (needs 16h) if the cancelled duty still counted.
+    f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [f2], "CPT")
+    assert result.status == "ALLOWED"
+
+
+def test_delay_recompute_updates_debrief_and_fdp_report_stays_fixed(_patch_engine):
+    """Small delay, stays well under D25's 6h nutrition-review
+    threshold — proves the mechanical recompute itself (report_time
+    fixed, debrief_time/fdp_hours updated) without the review-gate
+    noise, matching core/duty_builder.py's own documented
+    report-time-never-shifts principle."""
+    crew_id = _add_crew("CPT")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+    assert result.status == "ALLOWED"
+
+    assignment_service.update_flight_actual_times_and_revalidate(
+        flight_id, arr_time_actual=dt.datetime(2026, 7, 20, 8, 45))
+
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert roster_df.iloc[0]["report_time"] == dt.datetime(2026, 7, 20, 5, 0)  # unchanged
+    assert roster_df.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 9, 0)  # 08:45 + 15min
+    assert roster_df.iloc[0]["fdp_hours"] == pytest.approx(4.0)
+    assert roster_df.iloc[0]["status"] == "PLANNED"  # not flagged — still legal
+
+
+def test_delay_recompute_flags_needs_review_when_no_longer_legal(_patch_engine):
+    """A delay that pushes FDP to 8h triggers D25 nutrition-data-
+    missing (the same latent gap exercised throughout this file via
+    an 8h duty specifically — deliberately NOT a bigger delay, which
+    would also trip D8.2.1's ~13h max-FDP-for-one-sector limit and
+    turn this into an ILLEGAL case instead of the NEEDS_MANUAL_REVIEW
+    case this test is about) — confirms the roster row itself gets
+    flagged NEEDS_REVIEW, not just an audit-log alert, per the
+    explicit 'flag the row, don't just log it' decision."""
+    crew_id = _add_crew("CPT")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+    assert result.status == "ALLOWED"
+
+    outcomes = assignment_service.update_flight_actual_times_and_revalidate(
+        flight_id, arr_time_actual=dt.datetime(2026, 7, 20, 12, 45))
+
+    assert len(outcomes) == 1
+    assert outcomes[0]["validation_result"].status == "NEEDS_MANUAL_REVIEW"
+
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert roster_df.iloc[0]["status"] == "NEEDS_REVIEW"
+    assert roster_df.iloc[0]["fdp_hours"] == pytest.approx(8.0)
+
+    audit = _audit_rows(_patch_engine, "DUTY_FLAGGED_FOR_REVIEW_AFTER_DELAY")
+    assert len(audit) == 1
+
+
+def test_delay_recompute_handles_multiple_crew_on_same_flight_independently(_patch_engine):
+    """A single flight can carry several crew (CPT/FO/LM/AME), each
+    with their OWN duty_id (_validate_new_duty() generates a fresh
+    one per assignment call) — a delay must recompute EACH one
+    independently, not just the first found."""
+    cpt_id = _add_crew("CPT")
+    fo_id = _add_crew("FO")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    assignment_service.assign_crew_to_duty(cpt_id, [flight_id], "CPT")
+    assignment_service.assign_crew_to_duty(fo_id, [flight_id], "FO")
+
+    outcomes = assignment_service.update_flight_actual_times_and_revalidate(
+        flight_id, arr_time_actual=dt.datetime(2026, 7, 20, 8, 45))
+
+    assert len(outcomes) == 2
+    assert {o["crew_id"] for o in outcomes} == {cpt_id, fo_id}
+
+    cpt_roster = assignment_service.get_roster_for_crew(cpt_id)
+    fo_roster = assignment_service.get_roster_for_crew(fo_id)
+    assert cpt_roster.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 9, 0)
+    assert fo_roster.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 9, 0)
+
+
+def test_delay_recompute_for_ftl_exempt_role_updates_times_but_stays_legal(_patch_engine):
+    """LM is FTL-exempt — even a large delay must update debrief_time/
+    fdp_hours (the recompute itself always applies) but must NOT run
+    FDP/rest math (D9/D21) or D25 nutrition checks against it, same
+    exemption already enforced at assignment time."""
+    crew_id = _add_crew("LM")
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    assignment_service.assign_crew_to_duty(crew_id, [flight_id], "LM")
+
+    outcomes = assignment_service.update_flight_actual_times_and_revalidate(
+        flight_id, arr_time_actual=dt.datetime(2026, 7, 20, 18, 0))
+
+    assert outcomes[0]["validation_result"].status == "LEGAL"
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert roster_df.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 18, 15)
+    assert roster_df.iloc[0]["status"] == "PLANNED"
+
+
+def test_delay_recompute_detects_downstream_conflict_on_other_future_duties(_patch_engine):
+    """Same downstream-ripple mechanism already tested for new
+    assignments (test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged)
+    must also apply to a delay: a delay that consumes enough rest can
+    break an already-scheduled LATER duty, not just the one delayed."""
+    crew_id = _add_crew("CPT")
+
+    future_flight = _add_flight(dt.datetime(2026, 7, 22, 5, 45), dt.datetime(2026, 7, 22, 7, 45))
+    assignment_service.assign_crew_to_duty(crew_id, [future_flight], "CPT")
+
+    day2_flight = _add_flight(dt.datetime(2026, 7, 21, 14, 45), dt.datetime(2026, 7, 21, 15, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [day2_flight], "CPT")
+    assert result.status == "ALLOWED"
+    assert result.downstream_conflicts == []
+
+    # Delay pushes actual arrival late enough that the 12h floor to
+    # Day 3's 05:00 report is now violated (debrief moves from 16:00
+    # to 19:00 — only a 10h gap, same numbers as the new-assignment
+    # downstream-conflict test).
+    outcomes = assignment_service.update_flight_actual_times_and_revalidate(
+        day2_flight, arr_time_actual=dt.datetime(2026, 7, 21, 18, 45))
+
+    assert len(outcomes[0]["downstream_conflicts"]) == 1
+    assert outcomes[0]["downstream_conflicts"][0].flight_ids == [future_flight]
