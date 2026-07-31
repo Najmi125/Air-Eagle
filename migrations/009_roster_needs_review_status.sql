@@ -1,14 +1,13 @@
 -- ============================================================
--- 008_roster_needs_review_status.sql
+-- 009_roster_needs_review_status.sql
 --
--- NOTE ON NUMBERING: as of this migration's authoring, a second,
--- separate, unmerged branch (remove-type-rating-contract-fields)
--- also introduces its own migrations/008 (drop type_rating_expiry/
--- contract_expiry). These are two independent migrations both
--- numbered 008 off the same base (main at 007). Whichever branch
--- merges into main SECOND must renumber its migration to 009 before
--- merging, to avoid a real collision — flagging this now rather
--- than letting it become a silent surprise at merge time.
+-- Originally authored as migrations/008 on branch
+-- step5-stale-data-fixes, in parallel with a second, independent
+-- migrations/008 on branch remove-type-rating-contract-fields (drop
+-- type_rating_expiry/contract_expiry) — both branched off main at
+-- 007. remove-type-rating-contract-fields merged first and kept 008;
+-- this one was renumbered to 009 after rebasing onto that merge, per
+-- the plan recorded in HANDOVER.md's 2026-08-01 Step 5 entry.
 --
 -- Adds 'NEEDS_REVIEW' to roster.status's allowed values. Needed by
 -- services/assignment_service.py's update_flight_actual_times_and_

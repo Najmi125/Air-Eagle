@@ -406,9 +406,10 @@ phase so far:
    can no longer be suggested as a
    downstream-swap candidate either.
 5. ~~Three related "stale data" findings~~ DONE (2026-08-01, branch
-   `step5-stale-data-fixes` — NOT YET MERGED, NOT YET VERIFIED
-   against any real database, see the dedicated log entry below for
-   what's still needed). LOOKBACK_DAYS widened 35 -> 370 (D9.2.3's
+   `step5-stale-data-fixes` — verified by the user against real
+   Postgres 16, 190/190, D9.2.3 confirmed empirically firing with
+   ~300 seeded duties; see the dedicated log entry below for full
+   detail). LOOKBACK_DAYS widened 35 -> 370 (D9.2.3's
    365-day/1000h check can now actually see enough history to fire);
    flight_service.update_flight()'s actual-times path now recomputes
    FDP and revalidates crew via a new

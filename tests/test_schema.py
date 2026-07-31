@@ -197,7 +197,7 @@ def test_roster_rejects_debrief_before_report(migrated_db):
 
 
 def test_roster_status_check_allows_needs_review(migrated_db):
-    """Migration 008 (roster_needs_review_status) added NEEDS_REVIEW
+    """Migration 009 (roster_needs_review_status) added NEEDS_REVIEW
     to roster.status's allowed values, for
     assignment_service.update_flight_actual_times_and_revalidate() to
     flag a duty a delay recompute made no longer LEGAL/WARNING.
