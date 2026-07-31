@@ -278,22 +278,19 @@ env-override fix.
   connection.
 
 ## Tests passed
-(counts below reflect this branch pre-final-rebase-verification; see
-the 2026-08-01 log entries for the exact numbers each fix's own branch
-was verified against — 178/178 and 190/190 respectively)
-tests/test_migrations.py (4), tests/test_duty_summary.py (10),
-tests/test_pcaa_ano012_core.py (12), tests/test_schema.py,
-tests/test_audit_service.py (3), tests/test_crew_service.py (21),
-tests/test_crew_data_page.py (4), tests/test_duty_builder.py (12),
-tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py, tests/test_control_room_page.py
-(5), tests/test_roster_page.py (4), tests/test_import_crew_script.py
-(12), tests/test_env_override.py (4). The 12 new tests (2 in
-test_schema.py, 10 in test_assignment_service.py) for Step 5's three
-fixes have only been collection/syntax-checked in an environment with
-no reachable database — NOT run against Postgres, sandbox or
-Supabase. Traced by hand instead (see the log entry below for what
-that means and doesn't mean).
+190 total on `main` after both merges — tests/test_migrations.py (4),
+tests/test_duty_summary.py (10), tests/test_pcaa_ano012_core.py (12),
+tests/test_schema.py (18), tests/test_audit_service.py (3),
+tests/test_crew_service.py (21), tests/test_crew_data_page.py (4),
+tests/test_duty_builder.py (12), tests/test_flight_service.py (15),
+tests/test_flight_log_page.py (5), tests/test_assignment_service.py
+(61), tests/test_control_room_page.py (5), tests/test_roster_page.py
+(4), tests/test_import_crew_script.py (12), tests/test_env_override.py
+(4). Both merged branches independently verified by the user against
+real Postgres 16 before merging — 178/178
+(`remove-type-rating-contract-fields`) and 190/190
+(`step5-stale-data-fixes`, on top of that) — see the 2026-08-01 log
+entries for full detail on each.
 
 177/177 independently verified against real Postgres 16 (2026-07-31,
 `qualification-gate` branch, commit `45252da`) — this covers the
