@@ -40,7 +40,10 @@ from db.db import get_engine
 from services.audit_service import log_audit
 from services import crew_service, flight_service
 from services.crew_service import ROLE_SYNONYMS
-from core.duty_builder import build_duty, FlightLeg
+from core.duty_builder import (
+    build_duty, recompute_fdp_after_delay, FlightLeg,
+    DOMESTIC_POST_FLIGHT_MINUTES, INTERNATIONAL_POST_FLIGHT_MINUTES,
+)
 from core.legality.pcaa_ano012_core import (
     ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus, ValidationResult, RuleAlert,
 )
@@ -48,8 +51,23 @@ from core.legality.pcaa_ano012_core import (
 validator = ANO012CoreValidator()
 
 # How far back to look when checking a crew member's rolling-window
-# history. 28-day limits need this margin; 35 gives headroom.
-LOOKBACK_DAYS = 35
+# history. Must cover the WIDEST window any rule in
+# core/legality/pcaa_ano012_core.py actually checks — D9.2.3
+# (365-day/1000h cumulative flight time) is the widest, not the
+# 28-day duty limit. This was previously 35 (confirmed real bug,
+# 2026-08-01: enough for D9's 7/14/28-day duty/flight windows, but it
+# silently starved D9.2.3 of the 330 extra days of history it needs
+# — that rule has never once been able to fire correctly for any real
+# assignment, since _load_duty_records_for_crew() never fetched
+# enough history for it to see a breach). 370 gives a safe margin
+# past 365. Applies uniformly at every call site
+# (_validate_new_duty(), _check_downstream_impact(),
+# find_legal_candidates_for_duty()) — deliberately not split into a
+# narrower window for most checks and a wider one just for D9.2.3;
+# Air Eagle's crew pool is small enough that the extra data per query
+# is not a real cost, and one constant is one less thing to keep in
+# sync.
+LOOKBACK_DAYS = 370
 
 # Confirmed 2026-07-21: Loadmasters and Engr (line-maintenance AME,
 # not flight-deck) are NOT subject to ANO-012's FTL/FDP/rest rules —
@@ -811,6 +829,203 @@ def remove_assignment(crew_id: str, flight_id: int, role_assigned: str,
         reason=reason,
         app_user=app_user,
     )
+
+
+def cancel_flight_and_roster(flight_id: int, reason: Optional[str] = None,
+                              app_user: Optional[str] = None) -> None:
+    """
+    Cancels the flight AND cascades CANCELLED to every roster row
+    referencing it — never deletes either, same permanent-record
+    pattern as remove_assignment()/flight_service.cancel_flight().
+
+    Fixes a real gap (Step 5, 2026-08-01): flight_service.cancel_flight()
+    only ever updated flights.status. _load_duty_records_for_crew()
+    filters on roster.status, not flights.status — so a cancelled
+    flight's duty kept counting toward that crew member's FDP/rest/
+    cumulative-hours history exactly as if it had actually operated.
+    Cascading here keeps _load_duty_records_for_crew()'s existing
+    `status != 'CANCELLED'` filter as the ONE place that decides what
+    counts as active legality history, rather than teaching every
+    future query to also join against flights.status.
+
+    Lives here, not in flight_service.py: this needs to know about
+    roster, which flight_service.py deliberately doesn't (Ownership
+    Table). Pages should call this instead of flight_service.cancel_flight()
+    directly whenever the flight might have crew assigned.
+    """
+    flight_service.cancel_flight(flight_id, reason=reason, app_user=app_user)
+
+    engine = get_engine()
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE roster SET status = 'CANCELLED'
+            WHERE flight_id = :fid AND status != 'CANCELLED'
+        """), {"fid": flight_id})
+
+    log_audit(
+        action_type="ROSTER_CANCELLED_WITH_FLIGHT",
+        affected_flight=flight_id,
+        reason=reason,
+        changed_state=f"{result.rowcount} roster row(s) cancelled",
+        app_user=app_user,
+    )
+
+
+def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
+                                     app_user: Optional[str] = None):
+    """
+    Recomputes debrief_time/fdp_hours for ONE existing duty after a
+    delay changed one of its flights' actual times, updates every
+    roster row sharing that duty_id, then revalidates the whole duty
+    against the crew member's other history (FDP/rest, and the
+    qualification gate against the recomputed debrief date).
+
+    report_time is NEVER recomputed — recompute_fdp_after_delay()'s
+    docstring explains why (the historical block-time bug: a delayed
+    departure must not shift the time the crew already reported).
+
+    If the recomputed duty is no longer LEGAL/WARNING, every roster
+    row sharing this duty_id is flagged status='NEEDS_REVIEW' (not
+    just an audit-log alert) — a human decides what to do with an
+    already-recorded flight the system can't refuse to reflect, but
+    the roster row itself now visibly carries the problem. Returns
+    None if the duty isn't found (fully cancelled, or the flight
+    isn't actually part of any active duty).
+    """
+    crew_row = crew_service.get_crew(crew_id)
+    if crew_row is None:
+        return None
+
+    all_records = _load_duty_records_for_crew(engine, crew_id, crew_row["base"])
+    record = next((r for r in all_records if r["duty"].duty_id == duty_id), None)
+    if record is None:
+        return None
+
+    duty = record["duty"]
+    old_debrief_time = duty.end_utc
+    old_fdp_hours = round(duty.duration_minutes / 60, 2)
+
+    flights = [flight_service.get_flight(fid) for fid in record["flight_ids"]]
+    domestic = all(bool(f["domestic"]) for f in flights)
+    post_buffer = timedelta(minutes=(
+        DOMESTIC_POST_FLIGHT_MINUTES if domestic else INTERNATIONAL_POST_FLIGHT_MINUTES
+    ))
+    # duty.sectors already reflect actual times where recorded
+    # (COALESCE(actual, planned) — see _load_duty_records_for_crew).
+    new_debrief_time = duty.sectors[-1].arrival_utc + post_buffer
+    new_fdp_hours = recompute_fdp_after_delay(duty.start_utc, new_debrief_time)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE roster SET debrief_time = :debrief_time, fdp_hours = :fdp_hours
+            WHERE duty_id = :duty_id AND status != 'CANCELLED'
+        """), {"debrief_time": new_debrief_time, "fdp_hours": new_fdp_hours, "duty_id": duty_id})
+
+    duty.end_utc = new_debrief_time
+    crew_member = _crew_member(crew_row)
+
+    if crew_row["role"] in FTL_EXEMPT_ROLES:
+        validation_result = ValidationResult(
+            status=AlertStatus.LEGAL, alerts=[], computed={"ftl_exempt": True})
+    else:
+        lookback_start = duty.start_utc - timedelta(days=LOOKBACK_DAYS)
+        history_records = _load_duty_records_for_crew(
+            engine, crew_id, crew_row["base"], start=lookback_start, end=new_debrief_time)
+        other_duties = [r["duty"] for r in history_records if r["duty"].duty_id != duty_id]
+        all_duties = sorted(other_duties + [duty], key=lambda d: d.start_utc)
+        validation_result = validator.validate_schedule(crew_member, all_duties)
+
+    for alert in _check_crew_qualifications(crew_row, new_debrief_time.date()):
+        validation_result.add_alert(alert)
+
+    now_needs_review = validation_result.status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)
+    if now_needs_review:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE roster SET status = 'NEEDS_REVIEW'
+                WHERE duty_id = :duty_id AND status != 'CANCELLED'
+            """), {"duty_id": duty_id})
+
+    log_audit(
+        action_type="DUTY_FLAGGED_FOR_REVIEW_AFTER_DELAY" if now_needs_review else "DUTY_RECOMPUTED_AFTER_DELAY",
+        affected_crew=crew_id,
+        affected_duty=duty_id,
+        legality_result=validation_result.status.value,
+        changed_state=(
+            f"debrief_time {old_debrief_time}->{new_debrief_time}, "
+            f"fdp_hours {old_fdp_hours}->{new_fdp_hours}"
+        ),
+        warning_or_failure_reason=(
+            "; ".join(a.message for a in validation_result.alerts) if now_needs_review else None
+        ),
+        app_user=app_user,
+    )
+
+    downstream_conflicts = []
+    if crew_row["role"] not in FTL_EXEMPT_ROLES:
+        downstream_conflicts = _check_downstream_impact(engine, crew_id, crew_row["base"], crew_member, duty)
+
+    return validation_result, downstream_conflicts
+
+
+def update_flight_actual_times_and_revalidate(flight_id: int,
+                                               dep_time_actual=None,
+                                               arr_time_actual=None,
+                                               app_user: Optional[str] = None) -> list:
+    """
+    Records actual departure/arrival times on a flight AND recomputes
+    every affected duty's fdp_hours/debrief_time, revalidating each
+    one — fixes a real gap (Step 5, 2026-08-01): flight_service.update_flight()
+    only ever updated the flights table; core/duty_builder.py's
+    recompute_fdp_after_delay() existed since Phase 5 but nothing
+    called it, so a delay recorded here never propagated into the
+    roster rows built from this flight, and a duty that became
+    illegal because of the delay was never caught.
+
+    A single flight can belong to SEVERAL different duty_ids at
+    once — one per crew member assigned to it (CPT/FO/LM/AME each
+    get their own duty_id even for the exact same flight, per
+    _validate_new_duty()) — so every affected (crew_id, duty_id) pair
+    found on this flight is recomputed independently, not just one.
+
+    Lives here, not in flight_service.py, for the same reason as
+    cancel_flight_and_roster(): this needs roster/legality knowledge
+    flight_service.py deliberately doesn't have. Pages should call
+    this instead of flight_service.update_flight() directly whenever
+    the update is actual departure/arrival times on a flight that may
+    have crew assigned.
+
+    Returns a list of dicts, one per affected (crew_id, duty_id):
+    {"crew_id", "duty_id", "validation_result", "downstream_conflicts"}
+    — callers (pages) use this to surface NEEDS_REVIEW/ILLEGAL flags
+    and downstream swap alerts, same as the assignment-time UI does.
+    """
+    engine = get_engine()
+    updates = {}
+    if dep_time_actual is not None:
+        updates["dep_time_actual"] = dep_time_actual
+    if arr_time_actual is not None:
+        updates["arr_time_actual"] = arr_time_actual
+
+    flight_service.update_flight(flight_id, updates, app_user=app_user)
+
+    with engine.connect() as conn:
+        affected = conn.execute(text("""
+            SELECT DISTINCT crew_id, duty_id FROM roster
+            WHERE flight_id = :fid AND status != 'CANCELLED'
+        """), {"fid": flight_id}).fetchall()
+
+    results = []
+    for crew_id, duty_id in affected:
+        outcome = _recompute_one_duty_after_delay(engine, crew_id, duty_id, app_user=app_user)
+        if outcome is not None:
+            validation_result, downstream_conflicts = outcome
+            results.append({
+                "crew_id": crew_id, "duty_id": duty_id,
+                "validation_result": validation_result,
+                "downstream_conflicts": downstream_conflicts,
+            })
+    return results
 
 
 def get_roster_for_crew(crew_id: str, include_cancelled: bool = False) -> pd.DataFrame:

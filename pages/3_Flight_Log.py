@@ -11,7 +11,7 @@ Deliberately unstyled, matches app.py and pages/2_Crew_Data.py.
 import datetime as dt
 import streamlit as st
 
-from services import flight_service
+from services import flight_service, assignment_service
 
 st.set_page_config(page_title="Flight Log", page_icon="📘", layout="wide")
 st.title("Flight Log")
@@ -100,19 +100,41 @@ else:
                 cancel_submitted = st.form_submit_button("Cancel this flight")
 
             if save_submitted:
-                updates = {}
-                if actual_dep_date and actual_dep_time:
-                    updates["dep_time_actual"] = dt.datetime.combine(actual_dep_date, actual_dep_time)
-                if actual_arr_date and actual_arr_time:
-                    updates["arr_time_actual"] = dt.datetime.combine(actual_arr_date, actual_arr_time)
-                if updates:
-                    flight_service.update_flight(selected_id, updates)
+                dep_actual = (dt.datetime.combine(actual_dep_date, actual_dep_time)
+                              if actual_dep_date and actual_dep_time else None)
+                arr_actual = (dt.datetime.combine(actual_arr_date, actual_arr_time)
+                              if actual_arr_date and actual_arr_time else None)
+                if dep_actual or arr_actual:
+                    outcomes = assignment_service.update_flight_actual_times_and_revalidate(
+                        selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual)
                     st.success(f"Updated flight {selected_id}")
+                    for outcome in outcomes:
+                        result = outcome["validation_result"]
+                        if result.status in ("ILLEGAL", "NEEDS_MANUAL_REVIEW"):
+                            st.warning(
+                                f"⚠️ {outcome['crew_id']}'s duty {outcome['duty_id']} "
+                                f"flagged NEEDS_REVIEW after this delay — {result.status.value}."
+                            )
+                            for alert in result.alerts:
+                                st.write(f"- **{alert.rule_code}**: {alert.message}")
+                        if outcome["downstream_conflicts"]:
+                            st.error(
+                                f"⚠️ Swap alert — this delay breaks the legality of "
+                                f"{len(outcome['downstream_conflicts'])} already-scheduled "
+                                f"future duty(ies) for {outcome['crew_id']}:"
+                            )
+                            for conflict in outcome["downstream_conflicts"]:
+                                st.write(
+                                    f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
+                                    f"reports {conflict.report_time}): "
+                                    + (f"legal candidates: {', '.join(conflict.candidates)}"
+                                       if conflict.candidates else "**no legal candidates found**")
+                                )
                     st.rerun()
                 else:
                     st.warning("No actual times entered.")
 
             if cancel_submitted:
-                flight_service.cancel_flight(selected_id, reason=cancel_reason or None)
+                assignment_service.cancel_flight_and_roster(selected_id, reason=cancel_reason or None)
                 st.success(f"Cancelled flight {selected_id}")
                 st.rerun()

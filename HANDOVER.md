@@ -222,19 +222,22 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Steps 2–4 of the agreed remediation order are done and merged into
-`main` (NEEDS_MANUAL_REVIEW gate, domestic/geographic-continuity fix,
-crew qualification gate — AE-CREW-QUAL-001). On top of that,
-`type_rating_expiry`/`contract_expiry` have just been removed
-entirely — from the qualification gate AND the crew schema itself
-(migrations/008) — see the 2026-08-01 log entry below for why. This
-latest removal is on branch `remove-type-rating-contract-fields`,
-**not yet merged, not yet verified against any real database** — only
-collection/non-DB tests confirmed locally as of this snapshot. Needs
-a real `pytest` run (and, separately, migration 008 actually applied)
-before this is considered safe to merge. See "Next safest step" for
-what's queued next once this lands (item 5: the three stale-data
-findings, or item 7: the age-pairing rule).
+Steps 2–5 of the agreed remediation order are done. NEEDS_MANUAL_REVIEW
+gate, domestic/geographic-continuity fix, and the crew qualification
+gate (AE-CREW-QUAL-001) are merged into `main`. `type_rating_expiry`/
+`contract_expiry` removal (branch `remove-type-rating-contract-fields`
+— removed entirely from the qualification gate AND the crew schema,
+migrations/008) verified by the user against real Postgres 16
+(178/178) and merged into `main` first. Step 5's three "stale data"
+fixes (branch `step5-stale-data-fixes` — LOOKBACK_DAYS widened,
+delay-recompute wired up, cancel cascade wired up) verified by the
+user against real Postgres 16 (190/190, D9.2.3 confirmed empirically
+firing with ~300 seeded duties); its roster-status migration,
+originally also numbered 008 in parallel, renumbered to 009 and
+rebased onto `main` post-field-removal-merge before merging. See the
+2026-08-01 log entries for full detail on both. See "Next safest
+step" for what's queued next (item 6: Control Room transactional
+atomicity, or item 7: the age-pairing rule).
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -262,25 +265,35 @@ env-override fix.
   switching to Supabase's Session Pooler connection string instead
   (IPv4-proxied by design). No new migrations needed for the
   NEEDS_MANUAL_REVIEW fix — logic-only change.
-- **008_drop_type_rating_and_contract_expiry.sql — written but NOT
-  YET APPLIED anywhere as of this snapshot**, not even local sandbox
-  Postgres. No database was reachable in the environment this
-  migration was written in (no TEST_DATABASE_URL, no local Postgres,
-  no Docker) — so unlike every other migration in this file, this one
-  has not been run at all, not against sandbox, not against Supabase.
-  Drops both columns entirely; see the 2026-08-01 log entry below.
-  Run `python scripts/run_migrations.py --status` (against a real
-  test DB first, then Supabase) before assuming this applies cleanly.
+- **008_drop_type_rating_and_contract_expiry.sql** and
+  **009_roster_needs_review_status.sql** (originally authored as a
+  second, independent 008 — see "Current active task" for the
+  renumbering) — both independently verified by the user against real
+  Postgres 16 with existing crew data present (000-007 already
+  applied): 008 confirmed to drop both columns cleanly, no data loss.
+  Neither confirmed applied to the real Supabase database yet — the
+  verification above was against a real Postgres instance, not stated
+  to be Supabase specifically; don't assume that step is done without
+  checking `run_migrations.py --status` against the actual Supabase
+  connection.
 
 ## Tests passed
-178 total — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (16),
+(counts below reflect this branch pre-final-rebase-verification; see
+the 2026-08-01 log entries for the exact numbers each fix's own branch
+was verified against — 178/178 and 190/190 respectively)
+tests/test_migrations.py (4), tests/test_duty_summary.py (10),
+tests/test_pcaa_ano012_core.py (12), tests/test_schema.py,
 tests/test_audit_service.py (3), tests/test_crew_service.py (21),
 tests/test_crew_data_page.py (4), tests/test_duty_builder.py (12),
 tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py (51), tests/test_control_room_page.py
+tests/test_assignment_service.py, tests/test_control_room_page.py
 (5), tests/test_roster_page.py (4), tests/test_import_crew_script.py
-(12), tests/test_env_override.py (4).
+(12), tests/test_env_override.py (4). The 12 new tests (2 in
+test_schema.py, 10 in test_assignment_service.py) for Step 5's three
+fixes have only been collection/syntax-checked in an environment with
+no reachable database — NOT run against Postgres, sandbox or
+Supabase. Traced by hand instead (see the log entry below for what
+that means and doesn't mean).
 
 177/177 independently verified against real Postgres 16 (2026-07-31,
 `qualification-gate` branch, commit `45252da`) — this covers the
@@ -289,13 +302,10 @@ type_rating_expiry) plus the debrief-date and AME-synonym-test fixes
 that verification run required. Everything since — the
 type_rating_expiry addition (`b5d9c05`) AND its removal, plus the
 type_rating_expiry/contract_expiry schema drop, on branch
-`remove-type-rating-contract-fields` — has only been checked for
-collection/non-DB-test correctness in an environment with no reachable
-database (no TEST_DATABASE_URL, no local Postgres, no Docker). The net
-change in test count is zero (one test removed, one added), but that
-is not the same as re-verification — flagging this explicitly rather
-than assuming a DB-dependent change passes just because collection
-succeeds.
+`remove-type-rating-contract-fields` — was independently re-verified
+by the user against real Postgres 16: 178/178 passing, migration 008
+confirmed to drop both columns cleanly against a database already
+carrying crew data, no data loss.
 
 ## Open stubs / known blockers
 - `core/duty_summary.py` is the only file still flagged by
@@ -395,14 +405,18 @@ phase so far:
    `find_legal_candidates_for_duty()` so an unqualified crew member
    can no longer be suggested as a
    downstream-swap candidate either.
-5. Three related "stale data" findings, likely fixed together:
-   LOOKBACK_DAYS=35 starves the engine's own 365-day/1000h cumulative
-   check (D9.2.3) of data it needs — that rule has never once been
-   able to fire correctly; flight_service.update_flight() doesn't
-   recompute FDP or revalidate crew when actual times change (the
-   docstring already flags this gap, nothing closes it yet); cancel_
-   flight() doesn't cancel/exclude the associated roster rows from
-   future legality history.
+5. ~~Three related "stale data" findings~~ DONE (2026-08-01, branch
+   `step5-stale-data-fixes` — NOT YET MERGED, NOT YET VERIFIED
+   against any real database, see the dedicated log entry below for
+   what's still needed). LOOKBACK_DAYS widened 35 -> 370 (D9.2.3's
+   365-day/1000h check can now actually see enough history to fire);
+   flight_service.update_flight()'s actual-times path now recomputes
+   FDP and revalidates crew via a new
+   assignment_service.update_flight_actual_times_and_revalidate();
+   flight_service.cancel_flight()'s roster rows are now cascaded via
+   a new assignment_service.cancel_flight_and_roster(). Both new
+   wrappers live in assignment_service.py, not flight_service.py —
+   see the log entry for why.
 6. True transactional atomicity for Control Room's flight+assignment
    write — currently 4 separate `engine.begin()` blocks, not one
    transaction, so the "no orphan flight on rejection" guarantee
@@ -541,6 +555,25 @@ against the legality-gate work above.
   explicit decision — see the 2026-08-01 log entry for why they were
   removed (both empty for every real crew row, holding every real
   crew member for review indefinitely).
+- migrations/009_roster_needs_review_status.sql — same immutability
+  rule as every other applied migration. Originally authored as 008
+  in parallel with the migration above; renumbered to 009 after
+  `remove-type-rating-contract-fields` merged first — see "Current
+  active task."
+- services/assignment_service.py — LOOKBACK_DAYS must stay wide
+  enough to cover D9.2.3 (365-day/1000h cumulative flight time),
+  the widest window any rule in core/legality/pcaa_ano012_core.py
+  actually checks. Don't narrow it back down for a performance
+  concern without confirming Air Eagle's crew pool has actually grown
+  enough to make that a real cost — narrowing it silently
+  reintroduces the exact bug this fixed (2026-08-01).
+- services/assignment_service.py — cancel_flight_and_roster() and
+  update_flight_actual_times_and_revalidate() are the only sanctioned
+  way to cancel a flight or record actual times once crew may be
+  assigned to it. Don't call flight_service.cancel_flight()/
+  update_flight() directly from a page or script for these cases —
+  that bypasses the roster cascade / delay-revalidation these exist
+  specifically to guarantee.
 
 ## 2026-07-21: real data arrived — data quality findings, FTL
 ## exemption, schema reconciliation (unpushed as of this snapshot)
@@ -1164,8 +1197,7 @@ re-derive that from two fields with no real data behind them.
 **What changed**:
 - `migrations/008_drop_type_rating_and_contract_expiry.sql` (new) —
   `ALTER TABLE crew DROP COLUMN` for both. Confirmed empty for every
-  real row imported to date, so no data loss of consequence. **Not
-  yet applied anywhere** — see "DB changes" above.
+  real row imported to date, so no data loss of consequence.
 - `services/assignment_service.py` — `type_rating_expiry` removed
   from `QUALIFICATION_EXPIRY_FIELDS` (back to the original 8:
   license/medical/SIM/route-check/IR/SEP/CRM/DG). `contract_expiry`
@@ -1196,13 +1228,147 @@ re-derive that from two fields with no real data behind them.
 - `tests/test_control_room_page.py`, `tests/test_roster_page.py` —
   same default-field removal in their inline crew-seeding dicts.
 
-**Verification status — read before merging**: built and reasoned
-through in an environment with no reachable database at all (no
-TEST_DATABASE_URL, no local Postgres, no Docker). Collection and all
-non-DB tests pass locally; migration 008 has not been run anywhere,
-sandbox or Supabase. Built on branch
-`remove-type-rating-contract-fields`, not yet merged. Needs: (1) a
-real `pytest` run against a disposable test Postgres, (2) migration
-008 actually applied (sandbox first, then Supabase, same sequence as
-every prior migration), before this is safe to merge and treat as
-done.
+**Verification status**: built and reasoned through in an environment
+with no reachable database at all (no TEST_DATABASE_URL, no local
+Postgres, no Docker) — collection and non-DB tests passed locally at
+the time. **RESOLVED 2026-08-01 (same day, following verification)**:
+the user independently verified this branch against real Postgres
+16 — 178/178 passing, migration 008 confirmed to drop both columns
+cleanly against a database already carrying crew data (000-007
+applied), no data loss. Merged into `main`.
+
+## 2026-08-01: Step 5 — the three "stale data" findings — done,
+## planned before implementation, NOT yet verified against a real
+## database
+
+Branch `step5-stale-data-fixes`, forked from `main` (does not include
+the separate, also-unmerged `remove-type-rating-contract-fields`
+work — see "Current active task"). Design discussed and confirmed
+with the user before writing any code, same discipline as the
+qualification gate.
+
+**Finding 1 — LOOKBACK_DAYS=35 starving D9.2.3.** `_check_cumulative_
+limits()` in `core/legality/pcaa_ano012_core.py` already correctly
+windows 7/14/28/30/365-day sums from whatever duty list it's handed
+— the bug was entirely that `_load_duty_records_for_crew()` never
+fetched more than 35 days of history, so D9.2.3 (365-day/1000h
+cumulative flight time) has never once been able to see enough data
+to fire, for any real assignment, ever. Fixed by widening
+`LOOKBACK_DAYS` to 370 — confirmed deliberately NOT split into a
+narrower window for the D7–D28 checks and a wider one just for
+D9.2.2/D9.2.3 (user's explicit call: Air Eagle's crew pool is small
+enough that every call site (`_validate_new_duty()`,
+`_check_downstream_impact()` per future duty,
+`find_legal_candidates_for_duty()` per candidate) pulling ~10x more
+history per query is not a real cost).
+
+**Findings 2 & 3 — same underlying architecture question, resolved
+the same way.** Both `update_flight()` (recompute FDP on delay) and
+`cancel_flight()` (exclude cancelled flights from legality history)
+need to reach into `roster`, which `flight_service.py` deliberately
+doesn't know about (Ownership Table). Resolved by adding two new
+wrapper functions in `services/assignment_service.py` — which already
+depends on `flight_service.py`, never the reverse — rather than
+having `flight_service.py` import `assignment_service.py` (would
+create a circular import). Pages now call these instead of
+`flight_service.cancel_flight()`/`update_flight()` directly whenever
+crew might be assigned:
+
+- **`cancel_flight_and_roster(flight_id, reason, app_user)`** — calls
+  `flight_service.cancel_flight()`, then cascades `roster.status =
+  'CANCELLED'` to every roster row referencing that flight. Fixes the
+  real gap directly: before this, `_load_duty_records_for_crew()`'s
+  `WHERE r.status != 'CANCELLED'` filter never excluded a cancelled
+  flight's duty, since it only ever checked `roster.status`, never
+  `flights.status` — a cancelled flight kept counting toward that
+  crew member's FDP/rest/cumulative-hours history exactly as if it
+  had actually operated. Cascading here keeps that one filter as the
+  ONE place deciding what counts as active history, rather than
+  teaching every future roster+flights query to also join against
+  `flights.status`.
+
+- **`update_flight_actual_times_and_revalidate(flight_id,
+  dep_time_actual, arr_time_actual, app_user)`** — calls
+  `flight_service.update_flight()`, then finds every (crew_id,
+  duty_id) pair referencing that flight (a single flight can carry
+  SEVERAL different duty_ids at once — one per crew member assigned
+  to it, since `_validate_new_duty()` generates a fresh duty_id per
+  assignment call even for the identical flight) and recomputes each
+  one independently via a new `_recompute_one_duty_after_delay()`
+  helper: rebuilds the duty's debrief_time/fdp_hours using
+  `core/duty_builder.py`'s `recompute_fdp_after_delay()` (report_time
+  is NEVER recomputed — same historical block-time bug
+  `recompute_fdp_after_delay()`'s own docstring explains), updates
+  every roster row sharing that duty_id, then revalidates the whole
+  duty against the crew member's other history (FDP/rest via
+  `validate_schedule()`, skipped for FTL-exempt LM/ENGR same as
+  assignment time, PLUS the qualification gate re-checked against the
+  recomputed debrief date). Also re-runs the existing, already-tested
+  `_check_downstream_impact()` — a delay can break an
+  already-scheduled LATER duty's rest/cumulative math, not just the
+  one being delayed, same ripple concept already built for new
+  assignments.
+
+  **User's explicit decision on what happens when a delay makes a
+  duty no longer legal**: recompute the times regardless (the system
+  can't refuse to record what actually happened), but flag the
+  affected roster row(s) `status = 'NEEDS_REVIEW'` — not just an
+  audit-log alert — so the problem is visible in the data itself.
+  This needed `migrations/009_roster_needs_review_status.sql` to add
+  `NEEDS_REVIEW` to `roster.status`'s CHECK constraint (roster.status
+  already allowed `OPERATED`/`DISRUPTED` since 003_roster_table.sql,
+  neither ever actually written by any code path yet — this migration
+  doesn't change that).
+
+  `pages/3_Flight_Log.py` updated to call this instead of
+  `flight_service.update_flight()` directly, surfacing a warning for
+  any NEEDS_REVIEW/ILLEGAL outcome and the same downstream swap-alert
+  UI pattern already used on the Roster/Control Room pages.
+
+**Migration numbering collision, flagged deliberately, now resolved**:
+this branch's roster-status migration and
+`remove-type-rating-contract-fields`'s
+`migrations/008_drop_type_rating_and_contract_expiry.sql` were two
+independent migrations both originally numbered 008 off the same base
+(`main` at 007). Flagged here and in both migration files' own headers
+rather than letting it become a silent surprise at merge time.
+Resolved per the user's merge order: `remove-type-rating-contract-fields`
+merged first and kept 008; this branch's migration renamed to
+`migrations/009_roster_needs_review_status.sql`, rebased onto the
+updated `main`, and re-verified before merging.
+
+**Test coverage**: 12 new tests — 2 in `test_schema.py` (the
+NEEDS_REVIEW CHECK constraint actually accepts the new value, and
+still rejects garbage), 10 in `test_assignment_service.py` covering:
+the LOOKBACK_DAYS constant itself, a 40-day-old duty now actually
+loaded as history (proving the fix isn't just the constant on paper),
+cancel-cascade (both with and without crew assigned), the cancelled-
+duty-excluded-from-history scenario directly (the actual bug,
+reproduced and confirmed fixed), a small delay that stays legal
+(mechanical recompute proof — report_time fixed, debrief/fdp
+updated), a bigger delay that correctly flags NEEDS_REVIEW (deliberately
+tuned to 8h FDP, not more — a bigger delay would ALSO trip D8.2.1's
+~13h max-FDP-for-one-sector limit and turn this into an ILLEGAL case
+instead of the NEEDS_MANUAL_REVIEW case being tested — caught during
+hand-tracing, not by running the test, since no database was
+reachable here), multiple crew on one flight recomputed independently,
+an FTL-exempt role's delay recompute skipping FDP/rest math entirely,
+and a delay-triggered downstream conflict on a separate future duty.
+
+**Verification status**: built and reasoned through in an environment
+with no reachable database at all (no TEST_DATABASE_URL, no local
+Postgres, no Docker) — collection and non-DB tests passed locally at
+the time (190 total, 50 non-DB passing, 140 skipped). Every line
+touching the database was traced by hand against the actual schema
+and query behavior instead of executed, including working through one
+real mistake caught this way (the 8h-vs-bigger-delay FDP-limit
+collision above) before it could have been a silently wrong test.
+
+**RESOLVED 2026-08-01 (same day, following verification)**: the user
+independently verified this branch against real Postgres 16 —
+190/190 passing. D9.2.3 (the 365-day/1000h cumulative check
+LOOKBACK_DAYS was starving) confirmed empirically firing with ~300
+seeded duties, not just traced by hand. Migration renumbered to 009
+per the collision note above, rebased onto `main` (which by this
+point already had `remove-type-rating-contract-fields` merged), and
+merged.
