@@ -42,7 +42,7 @@ from services import crew_service, flight_service
 from services.crew_service import ROLE_SYNONYMS
 from core.duty_builder import build_duty, FlightLeg
 from core.legality.pcaa_ano012_core import (
-    ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus, ValidationResult,
+    ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus, ValidationResult, RuleAlert,
 )
 
 validator = ANO012CoreValidator()
@@ -62,6 +62,93 @@ LOOKBACK_DAYS = 35
 # that belongs with the service that orchestrates the check, not
 # baked into the math itself.
 FTL_EXEMPT_ROLES = {"LM", "ENGR"}
+
+# Confirmed gap (2026-07-31): FTL_EXEMPT_ROLES only excuses LM/ENGR
+# from FDP/rest MATH — it says nothing about whether a crew member
+# currently holds a valid license/medical/currency at all. Every
+# role, exempt or not, needs this check, which is exactly why it's
+# a separate set/function rather than folded into FTL_EXEMPT_ROLES.
+QUALIFICATION_EXPIRY_FIELDS = {
+    "license_expiry": "LICENSE",
+    "medical_expiry": "MEDICAL",
+    "sim_expiry": "SIM",
+    "route_check_expiry": "ROUTE_CHECK",
+    "ir_expiry": "IR",
+    "sep_expiry": "SEP",
+    "crm_expiry": "CRM",
+    "dg_expiry": "DG",
+}
+
+
+def _check_crew_qualifications(crew_row: pd.Series, duty_date) -> List[RuleAlert]:
+    """
+    AE-CREW-QUAL-001 — orchestration-layer crew-qualification gate,
+    same placement rationale as FTL_EXEMPT_ROLES: "is this person
+    currently qualified" is an operational/regulatory classification,
+    not FDP/rest math, so it lives here rather than in
+    core/legality/pcaa_ano012_core.py, which stays qualification-
+    agnostic.
+
+    Checked against duty_date — the actual duty's own report date,
+    NEVER date.today(). A crew member who is currently qualified can
+    be illegal on a future duty date if a document expires in
+    between; this exact today()-vs-duty-date distinction is called
+    out in the project's own hard-lessons catalogue as a past
+    production bug, not a hypothetical one.
+
+    Collects every failing reason, not just the first — HANDOVER.md
+    documents first-failure-only evaluation as a real, already-found
+    bug elsewhere in this file (_check_downstream_impact's original
+    before/after comparison), not a hypothetical concern here.
+
+    Applies to every role, including LM/ENGR — deliberately NOT
+    gated on FTL_EXEMPT_ROLES. That set only exempts flight-duty-time
+    math; it says nothing about whether the person holds a valid
+    document to be on the roster at all.
+
+    An expiry date equal to duty_date is treated as already expired
+    (valid strictly before its own expiry date, not through it).
+    """
+    alerts: List[RuleAlert] = []
+
+    if not bool(crew_row["is_active"]):
+        alerts.append(RuleAlert(
+            rule_code="AE-CREW-QUAL-001_INACTIVE_CREW",
+            status=AlertStatus.ILLEGAL,
+            severity="RED",
+            message=f"{crew_row['crew_id']} is not an active crew member (is_active=False).",
+            calculated_value="is_active=False",
+            required_limit="is_active=True",
+        ))
+
+    for field_name, label in QUALIFICATION_EXPIRY_FIELDS.items():
+        raw_value = crew_row[field_name]
+        if raw_value is None or pd.isna(raw_value):
+            alerts.append(RuleAlert(
+                rule_code=f"AE-CREW-QUAL-001_{label}_EXPIRY_MISSING",
+                status=AlertStatus.NEEDS_MANUAL_REVIEW,
+                severity="YELLOW",
+                message=f"{crew_row['crew_id']}'s {label} expiry date is not recorded.",
+                calculated_value="Missing",
+                required_limit=f"Valid {label} expiry after {duty_date}",
+            ))
+            continue
+
+        expiry_date = raw_value.date() if hasattr(raw_value, "date") else raw_value
+        if expiry_date <= duty_date:
+            alerts.append(RuleAlert(
+                rule_code=f"AE-CREW-QUAL-001_{label}_EXPIRED",
+                status=AlertStatus.ILLEGAL,
+                severity="RED",
+                message=(
+                    f"{crew_row['crew_id']}'s {label} expired {expiry_date}, "
+                    f"not valid for duty date {duty_date}."
+                ),
+                calculated_value=str(expiry_date),
+                required_limit=f"After {duty_date}",
+            ))
+
+    return alerts
 
 
 @dataclass
@@ -224,15 +311,23 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
             alerts=[],
             computed={"ftl_exempt": True, "role": crew_row["role"]},
         )
-        return validation_result, new_duty, crew_member, crew_row, duty_result
+    else:
+        lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
+        existing_records = _load_duty_records_for_crew(
+            engine, crew_id, crew_row["base"], start=lookback_start, end=duty_result.debrief_time)
+        existing_duties = [r["duty"] for r in existing_records]
 
-    lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
-    existing_records = _load_duty_records_for_crew(
-        engine, crew_id, crew_row["base"], start=lookback_start, end=duty_result.debrief_time)
-    existing_duties = [r["duty"] for r in existing_records]
+        all_duties = sorted(existing_duties + [new_duty], key=lambda d: d.start_utc)
+        validation_result = validator.validate_schedule(crew_member, all_duties)
 
-    all_duties = sorted(existing_duties + [new_duty], key=lambda d: d.start_utc)
-    validation_result = validator.validate_schedule(crew_member, all_duties)
+    # Qualification gate applies regardless of FTL exemption — see
+    # _check_crew_qualifications' docstring. Folded into the same
+    # ValidationResult via add_alert() so its existing status
+    # precedence (ILLEGAL > NEEDS_MANUAL_REVIEW > WARNING > LEGAL)
+    # and the caller's existing ILLEGAL/NEEDS_MANUAL_REVIEW branches
+    # handle this with no new branching logic there.
+    for alert in _check_crew_qualifications(crew_row, duty_result.report_time.date()):
+        validation_result.add_alert(alert)
 
     return validation_result, new_duty, crew_member, crew_row, duty_result
 
@@ -600,21 +695,19 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     see HANDOVER.md) or write anything; read-only candidate search.
 
     For FTL-exempt roles (LM, ENGR), every active crew member holding
-    that role is trivially a legal candidate — there's no FTL history
-    that could make them illegal, so the simulation loop is skipped
-    entirely rather than running validate_schedule() against rules
-    that don't apply to them.
+    that role is trivially a legal candidate from an FTL standpoint —
+    there's no FTL history that could make them illegal, so the
+    FDP/rest simulation loop is skipped for them. They still go
+    through _check_crew_qualifications() (2026-07-31): FTL exemption
+    is not qualification exemption, so a deactivated or
+    expired-document crew member must not be suggested as a
+    downstream-swap candidate just because their role skips FDP/rest
+    math.
     """
     role_assigned = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
 
     all_crew = crew_service.get_all_crew(active_only=True)
     candidates_pool = all_crew[all_crew["role"] == role_assigned]
-
-    if role_assigned in FTL_EXEMPT_ROLES:
-        return [
-            cid for cid in candidates_pool["crew_id"]
-            if not (exclude_crew_id and cid == exclude_crew_id)
-        ]
 
     engine = get_engine()
     flights = [flight_service.get_flight(fid) for fid in flight_ids]
@@ -630,6 +723,17 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
         origin=f["origin"], destination=f["destination"],
     ) for f in flights]
     duty_result = build_duty(legs, domestic=domestic)
+    duty_date = duty_result.report_time.date()
+
+    if role_assigned in FTL_EXEMPT_ROLES:
+        legal_candidates = []
+        for _, crew_row in candidates_pool.iterrows():
+            if exclude_crew_id and crew_row["crew_id"] == exclude_crew_id:
+                continue
+            qualification_alerts = _check_crew_qualifications(crew_row, duty_date)
+            if not any(a.status == AlertStatus.ILLEGAL for a in qualification_alerts):
+                legal_candidates.append(crew_row["crew_id"])
+        return legal_candidates
 
     legal_candidates = []
     for _, crew_row in candidates_pool.iterrows():
@@ -658,6 +762,9 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
 
         all_duties = sorted(existing_duties + [candidate_duty], key=lambda d: d.start_utc)
         result = validator.validate_schedule(crew_member, all_duties)
+
+        for alert in _check_crew_qualifications(crew_row, duty_date):
+            result.add_alert(alert)
 
         if result.status != AlertStatus.ILLEGAL:
             legal_candidates.append(crew_row["crew_id"])

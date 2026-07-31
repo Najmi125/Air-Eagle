@@ -28,7 +28,18 @@ def page_app(migrated_db, monkeypatch):
 
 def _seed_crew_and_flight():
     from services import crew_service, flight_service
-    crew_id = crew_service.add_crew({"name": "Test Captain", "role": "CPT", "base": "KHI"})
+    # All qualification expiry fields set far in the future so these
+    # page tests exercise page/FDP/rest mechanics, not the
+    # qualification gate (2026-07-31) — that gate has its own
+    # dedicated tests in test_assignment_service.py.
+    far_future = dt.date(2099, 1, 1)
+    crew_id = crew_service.add_crew({
+        "name": "Test Captain", "role": "CPT", "base": "KHI",
+        "license_expiry": far_future, "medical_expiry": far_future,
+        "sim_expiry": far_future, "route_check_expiry": far_future,
+        "ir_expiry": far_future, "sep_expiry": far_future,
+        "crm_expiry": far_future, "dg_expiry": far_future,
+    })
     flight_id = flight_service.add_flight({
         "origin": "KHI", "destination": "LHE",
         "dep_time_planned": dt.datetime(2026, 7, 20, 5, 45),
