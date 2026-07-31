@@ -222,18 +222,18 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Steps 2–4 of the agreed remediation order are now done: the
-NEEDS_MANUAL_REVIEW gate, the domestic/geographic-continuity fix, and
-the crew qualification gate (AE-CREW-QUAL-001 — see the dedicated log
-entry below) are all merged into `main`. The qualification gate was
-built and iterated on branch `qualification-gate` (commits `87044d4`,
-`45252da`, `b5d9c05`) and merged after 177/177 independent
-verification against real Postgres 16 — see "Tests passed" for the
-one test added after that specific verification run. Everything
-through main's HEAD is confirmed live on GitHub; the real Supabase
-database has all 8 migrations applied (independently confirmed via
-`run_migrations.py --status` and Supabase's own dashboard). See "Next
-safest step" for what's queued next (item 5: the three stale-data
+Steps 2–4 of the agreed remediation order are done and merged into
+`main` (NEEDS_MANUAL_REVIEW gate, domestic/geographic-continuity fix,
+crew qualification gate — AE-CREW-QUAL-001). On top of that,
+`type_rating_expiry`/`contract_expiry` have just been removed
+entirely — from the qualification gate AND the crew schema itself
+(migrations/008) — see the 2026-08-01 log entry below for why. This
+latest removal is on branch `remove-type-rating-contract-fields`,
+**not yet merged, not yet verified against any real database** — only
+collection/non-DB tests confirmed locally as of this snapshot. Needs
+a real `pytest` run (and, separately, migration 008 actually applied)
+before this is considered safe to merge. See "Next safest step" for
+what's queued next once this lands (item 5: the three stale-data
 findings, or item 7: the age-pairing rule).
 
 ## Files changed
@@ -262,27 +262,40 @@ env-override fix.
   switching to Supabase's Session Pooler connection string instead
   (IPv4-proxied by design). No new migrations needed for the
   NEEDS_MANUAL_REVIEW fix — logic-only change.
+- **008_drop_type_rating_and_contract_expiry.sql — written but NOT
+  YET APPLIED anywhere as of this snapshot**, not even local sandbox
+  Postgres. No database was reachable in the environment this
+  migration was written in (no TEST_DATABASE_URL, no local Postgres,
+  no Docker) — so unlike every other migration in this file, this one
+  has not been run at all, not against sandbox, not against Supabase.
+  Drops both columns entirely; see the 2026-08-01 log entry below.
+  Run `python scripts/run_migrations.py --status` (against a real
+  test DB first, then Supabase) before assuming this applies cleanly.
 
 ## Tests passed
 178 total — tests/test_migrations.py (4), tests/test_duty_summary.py
-(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (15),
+(10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (16),
 tests/test_audit_service.py (3), tests/test_crew_service.py (21),
 tests/test_crew_data_page.py (4), tests/test_duty_builder.py (12),
 tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py (52), tests/test_control_room_page.py
+tests/test_assignment_service.py (51), tests/test_control_room_page.py
 (5), tests/test_roster_page.py (4), tests/test_import_crew_script.py
 (12), tests/test_env_override.py (4).
 
 177/177 independently verified against real Postgres 16 (2026-07-31,
 `qualification-gate` branch, commit `45252da`) — this covers the
-crew-qualification gate itself plus the debrief-date and
-AME-synonym-test fixes that verification run required. One further
-test was added after that run (`type_rating_expiry`, commit
-`b5d9c05`), bringing the count to 178 — that one test has NOT been
-independently re-verified against a real database as of this
-snapshot. Flagging this explicitly rather than assuming it passes
-just because it follows the same pattern as the other 8 fields —
-exactly the kind of unverified claim this file exists to avoid.
+crew-qualification gate as it stood then (8 fields, no
+type_rating_expiry) plus the debrief-date and AME-synonym-test fixes
+that verification run required. Everything since — the
+type_rating_expiry addition (`b5d9c05`) AND its removal, plus the
+type_rating_expiry/contract_expiry schema drop, on branch
+`remove-type-rating-contract-fields` — has only been checked for
+collection/non-DB-test correctness in an environment with no reachable
+database (no TEST_DATABASE_URL, no local Postgres, no Docker). The net
+change in test count is zero (one test removed, one added), but that
+is not the same as re-verification — flagging this explicitly rather
+than assuming a DB-dependent change passes just because collection
+succeeds.
 
 ## Open stubs / known blockers
 - `core/duty_summary.py` is the only file still flagged by
@@ -370,14 +383,17 @@ phase so far:
    Geographic continuity (leg N destination == leg N+1 origin) added
    alongside the existing temporal check. This directly unblocks the
    real KHI-LHE-DWC-KHI rotation.
-4. ~~The qualification gate~~ DONE (2026-07-31) — see the dedicated
-   log entry below (AE-CREW-QUAL-001) for full detail. Role match was
-   already enforced (Step 2's work); this closes the rest: is_active
-   plus 9 document-expiry fields, checked against the duty's own
-   debrief (end) date — not report date, not date.today() — applied
-   to every role including FTL-exempt LM/ENGR, and folded into both
-   `_validate_new_duty()` and `find_legal_candidates_for_duty()` so an
-   unqualified crew member can no longer be suggested as a
+4. ~~The qualification gate~~ DONE (2026-07-31, field set revised
+   2026-08-01 — see the dedicated log entries below, AE-CREW-QUAL-001,
+   for full detail and the reversal). Role match was already enforced
+   (Step 2's work); this closes the rest: is_active plus 8
+   document-expiry fields (type_rating_expiry and contract_expiry
+   were dropped from the crew schema entirely, migrations/008 — see
+   below), checked against the duty's own debrief (end) date — not
+   report date, not date.today() — applied to every role including
+   FTL-exempt LM/ENGR, and folded into both `_validate_new_duty()` and
+   `find_legal_candidates_for_duty()` so an unqualified crew member
+   can no longer be suggested as a
    downstream-swap candidate either.
 5. Three related "stale data" findings, likely fixed together:
    LOOKBACK_DAYS=35 starves the engine's own 365-day/1000h cumulative
@@ -518,6 +534,13 @@ against the legality-gate work above.
   not a general "these roles are less important" assumption. Don't
   extend this set without an equally explicit confirmation — the
   same operational fact needs to hold for any role added here.
+- migrations/008_drop_type_rating_and_contract_expiry.sql — same
+  immutability rule as every other applied migration. Don't
+  re-add type_rating_expiry/contract_expiry as columns, and don't
+  re-add either to QUALIFICATION_EXPIRY_FIELDS, without an equally
+  explicit decision — see the 2026-08-01 log entry for why they were
+  removed (both empty for every real crew row, holding every real
+  crew member for review indefinitely).
 
 ## 2026-07-21: real data arrived — data quality findings, FTL
 ## exemption, schema reconciliation (unpushed as of this snapshot)
@@ -1115,3 +1138,71 @@ sandbox collection — see "Tests passed"); one further test
 re-verified. Built and iterated on branch `qualification-gate`
 (commits `87044d4`, `45252da`, `b5d9c05`), merged into `main` after
 the verification above.
+
+## 2026-08-01: type_rating_expiry and contract_expiry removed from
+## the qualification gate AND the crew schema entirely — a real-data
+## consequence of the gate working correctly, reversed by user decision
+
+Direct consequence of the previous entry, spotted immediately on
+review: with `type_rating_expiry` added to `QUALIFICATION_EXPIRY_FIELDS`,
+every real crew member in the operator's spreadsheet would hold at
+`NEEDS_MANUAL_REVIEW` — because `type_rating_expiry` and
+`contract_expiry` are empty for every single row (already noted in
+the 2026-07-21 data-quality findings above, not a new discovery). The
+gate was working exactly as designed — missing data flagged, not
+silently passed — but the practical effect was that the system
+couldn't assign anyone until the operator supplied two columns they
+show no sign of tracking.
+
+**User decision**: remove both fields from the qualification gate AND
+the crew data model entirely, rather than wait on data that may never
+arrive. Explicit reasoning given: assume OCC has already done its job
+and removed any crew member who isn't actually qualified from the
+pool being worked with — this system doesn't need to independently
+re-derive that from two fields with no real data behind them.
+
+**What changed**:
+- `migrations/008_drop_type_rating_and_contract_expiry.sql` (new) —
+  `ALTER TABLE crew DROP COLUMN` for both. Confirmed empty for every
+  real row imported to date, so no data loss of consequence. **Not
+  yet applied anywhere** — see "DB changes" above.
+- `services/assignment_service.py` — `type_rating_expiry` removed
+  from `QUALIFICATION_EXPIRY_FIELDS` (back to the original 8:
+  license/medical/SIM/route-check/IR/SEP/CRM/DG). `contract_expiry`
+  was never in the gate in the first place (excluded from the start
+  as an HR/employment field, not a flight-safety qualification) —
+  both are now absent for the same underlying reason: no column,
+  nothing to check.
+- `services/crew_service.py` — both removed from `UPDATABLE_FIELDS`.
+- `scripts/import_crew_from_xlsx.py` — both removed from `HEADER_MAP`
+  and `DATE_FIELDS`. A future workbook still carrying "Type Rating
+  Exp"/"Contract Exp" columns will simply have them ignored
+  (`HEADER_MAP.get()` returns `None` for unmapped headers), not
+  misfiled into some other field.
+- `pages/2_Crew_Data.py` — the two `st.date_input` widgets and their
+  corresponding `add_crew()` dict entries removed from the add-crew
+  form. The edit-crew form never referenced either field.
+- `tests/test_schema.py` — `test_crew_table_has_all_template_columns`'s
+  expected set updated; new
+  `test_type_rating_and_contract_expiry_columns_removed` added,
+  mirroring the existing `test_crew_table_old_column_names_are_gone`
+  pattern from migration 007's rename — confirms the drop actually
+  applied, not just that the migration ran without a SQL error.
+- `tests/test_assignment_service.py` — `type_rating_expiry` removed
+  from the shared `_QUALIFICATION_DEFAULTS`; the dedicated
+  `test_expired_type_rating_is_illegal_and_blocks_save` deleted (the
+  field it tested no longer exists to set). Net test count unchanged
+  (one removed, one added in test_schema.py).
+- `tests/test_control_room_page.py`, `tests/test_roster_page.py` —
+  same default-field removal in their inline crew-seeding dicts.
+
+**Verification status — read before merging**: built and reasoned
+through in an environment with no reachable database at all (no
+TEST_DATABASE_URL, no local Postgres, no Docker). Collection and all
+non-DB tests pass locally; migration 008 has not been run anywhere,
+sandbox or Supabase. Built on branch
+`remove-type-rating-contract-fields`, not yet merged. Needs: (1) a
+real `pytest` run against a disposable test Postgres, (2) migration
+008 actually applied (sandbox first, then Supabase, same sequence as
+every prior migration), before this is safe to merge and treat as
+done.

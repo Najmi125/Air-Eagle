@@ -36,7 +36,6 @@ def _seed_crew_and_flight():
     crew_id = crew_service.add_crew({
         "name": "Test Captain", "role": "CPT", "base": "KHI",
         "license_expiry": far_future, "medical_expiry": far_future,
-        "type_rating_expiry": far_future,
         "sim_expiry": far_future, "route_check_expiry": far_future,
         "ir_expiry": far_future, "sep_expiry": far_future,
         "crm_expiry": far_future, "dg_expiry": far_future,

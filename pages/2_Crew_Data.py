@@ -46,10 +46,8 @@ with st.form("add_crew_form", clear_on_submit=True):
         license_no = st.text_input("License No")
         license_expiry = st.date_input("License Expiry", value=None)
         medical_expiry = st.date_input("Medical Expiry", value=None)
-        contract_expiry = st.date_input("Contract Expiry", value=None)
 
     with col3:
-        type_rating_expiry = st.date_input("Type Rating Expiry", value=None)
         ir_expiry = st.date_input("IR (Instrument Rating) Expiry", value=None)
         sim_expiry = st.date_input("SIM Expiry", value=None)
         route_check_expiry = st.date_input("Route Check Expiry", value=None)
@@ -76,8 +74,6 @@ with st.form("add_crew_form", clear_on_submit=True):
                 "license_no": license_no or None,
                 "license_expiry": license_expiry,
                 "medical_expiry": medical_expiry,
-                "contract_expiry": contract_expiry,
-                "type_rating_expiry": type_rating_expiry,
                 "ir_expiry": ir_expiry,
                 "sim_expiry": sim_expiry,
                 "route_check_expiry": route_check_expiry,
