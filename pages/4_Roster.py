@@ -96,6 +96,22 @@ with st.form("assign_crew_form"):
                     st.error(f"REJECTED — {result.legality_status}")
                     for alert in result.alerts:
                         st.write(f"- **{alert.rule_code}**: {alert.message}")
+                elif result.status == "NEEDS_REVIEW":
+                    st.warning(
+                        f"HELD FOR MANUAL REVIEW — {result.legality_status}. "
+                        f"Nothing was saved. This isn't a known violation, just "
+                        f"something the system can't determine automatically — "
+                        f"an authorized reviewer needs to make this call."
+                    )
+                    for alert in result.alerts:
+                        st.write(f"- **{alert.rule_code}**: {alert.message}")
+                    if result.computed_report_time:
+                        st.write(
+                            f"Computed duty (not saved): report "
+                            f"{result.computed_report_time}, debrief "
+                            f"{result.computed_debrief_time}, "
+                            f"FDP {result.computed_fdp_hours}h"
+                        )
                 else:
                     st.success(f"ALLOWED — assigned as {role_choice} (duty {result.duty_id})")
                     if result.legality_status != "LEGAL":

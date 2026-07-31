@@ -52,6 +52,39 @@ def _audit_rows(engine, action_type=None):
     return pd.read_sql(text(q), engine, params=params)
 
 
+def _seed_duty(engine, crew_id, flight_id, role_assigned, report_time, debrief_time, fdp_hours):
+    """
+    Insert a roster row directly via SQL, bypassing
+    assign_crew_to_duty()/assign_crew_to_new_flights() entirely.
+
+    Needed because an 8h+ FDP duty now correctly triggers
+    NEEDS_MANUAL_REVIEW (D25 nutrition-data-missing — meal/snack
+    provision is never populated by this codebase yet) and therefore
+    never gets written through the real assignment API. Several
+    tests need such a duty to already exist as GIVEN history (to set
+    up a D21 rest-conflict scenario, or to test candidate exclusion
+    against existing history) without re-exercising the
+    NEEDS_MANUAL_REVIEW gate itself — that gate has its own dedicated
+    tests. This mirrors the same "seed given state via raw SQL"
+    pattern already used in tests/test_schema.py.
+    """
+    import uuid
+    duty_id = f"SEEDED-{uuid.uuid4().hex[:8]}"
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
+                report_time, debrief_time, fdp_hours, role_assigned)
+            VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
+                :report_time, :debrief_time, :fdp_hours, :role_assigned)
+        """), {
+            "crew_id": crew_id, "flight_id": flight_id, "duty_id": duty_id,
+            "duty_date": report_time.date(), "report_time": report_time,
+            "debrief_time": debrief_time, "fdp_hours": fdp_hours,
+            "role_assigned": role_assigned,
+        })
+    return duty_id
+
+
 # ------------------------------------------------------------------
 # Immediate legality gate
 # ------------------------------------------------------------------
@@ -91,12 +124,18 @@ def test_multi_sector_duty_creates_one_row_per_flight_sharing_duty_id(_patch_eng
 def test_insufficient_rest_after_prior_duty_is_rejected(_patch_engine):
     """8h FDP duty requires max(12h, 2*8)=16h rest after (D21).
     A next assignment only 5h later must be REJECTED, and nothing
-    written to roster."""
+    written to roster for it."""
     crew_id = _add_crew("CPT")
 
+    # Seeded directly, not via the real API: an 8h FDP duty now
+    # correctly triggers NEEDS_MANUAL_REVIEW through assign_crew_to_duty()
+    # (meal/snack data is never populated), which has its own dedicated
+    # tests. This test is about what a SECOND, shorter assignment does
+    # given such a duty already exists in history — not about re-testing
+    # that gate.
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
-    result1 = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
-    assert result1.status == "ALLOWED"  # 8h FDP duty (04:15-12:15), first duty, no prior history
+    _seed_duty(_patch_engine, crew_id, f1, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
 
     # Only 5h after debrief (12:15) — needs 16h. Should reject.
     f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
@@ -106,13 +145,14 @@ def test_insufficient_rest_after_prior_duty_is_rejected(_patch_engine):
     assert result2.legality_status == "ILLEGAL"
 
     roster_df = assignment_service.get_roster_for_crew(crew_id)
-    assert len(roster_df) == 1  # only the first duty was ever written
+    assert len(roster_df) == 1  # only the seeded prior duty, nothing for the rejected one
 
 
 def test_rejected_assignment_still_writes_audit_record(_patch_engine):
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
-    assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+    _seed_duty(_patch_engine, crew_id, f1, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
 
     f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
     assignment_service.assign_crew_to_duty(crew_id, [f2], "CPT", app_user="tester")
@@ -125,10 +165,17 @@ def test_rejected_assignment_still_writes_audit_record(_patch_engine):
 def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engine):
     """The real KHI-LHE-DWC-KHI rotation mixes a domestic-classified
     sector (KHI-LHE) with international ones (LHE-DWC, DWC-KHI)
-    within one duty. This must NOT be rejected — any international
-    sector makes the whole duty use the international (60/30)
-    buffer, not the domestic (45/15) one, while each flight keeps
-    its own domestic flag for Flight Log/reporting purposes."""
+    within one duty. This must NOT be rejected with a ValueError —
+    any international sector makes the whole duty use the
+    international (60/30) buffer, not the domestic (45/15) one,
+    while each flight keeps its own domestic flag for Flight
+    Log/reporting purposes.
+
+    This particular duty is 9.5h, which correctly triggers
+    NEEDS_MANUAL_REVIEW (D25 nutrition data missing) — nothing gets
+    written to roster for a held assignment, so the buffer
+    calculation itself is checked via computed_report_time/
+    computed_debrief_time, which are populated regardless of status."""
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
                       origin="KHI", destination="LHE", domestic=True)
@@ -139,15 +186,15 @@ def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engi
 
     result = assignment_service.assign_crew_to_duty(crew_id, [f1, f2, f3], "CPT")
 
-    assert result.status == "ALLOWED"
-    roster_df = assignment_service.get_roster_for_crew(crew_id)
-    assert len(roster_df) == 3
-    assert roster_df["duty_id"].nunique() == 1
+    assert result.status == "NEEDS_REVIEW"  # 9.5h FDP, no meal data — correctly held
     # report_time = first dep (05:00) - 60min (international buffer,
     # NOT domestic's 45min, since one sector is international)
-    assert roster_df.iloc[0]["report_time"] == dt.datetime(2026, 7, 20, 4, 0)
+    assert result.computed_report_time == dt.datetime(2026, 7, 20, 4, 0)
     # debrief_time = last arr (13:00) + 30min (international, not 15)
-    assert roster_df.iloc[0]["debrief_time"] == dt.datetime(2026, 7, 20, 13, 30)
+    assert result.computed_debrief_time == dt.datetime(2026, 7, 20, 13, 30)
+
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 0  # held, not written
 
 
 def test_all_domestic_duty_still_uses_domestic_buffer(_patch_engine):
@@ -253,6 +300,99 @@ def test_role_mismatch_via_control_room_path_also_rejected(_patch_engine):
 
 
 # ------------------------------------------------------------------
+# NEEDS_MANUAL_REVIEW gate — confirmed bug, now fixed: this status
+# previously fell through to the same write path as LEGAL/WARNING
+# and was silently treated as ALLOWED, directly contradicting its
+# own defined meaning ("cannot be determined deterministically,
+# requires authorized review"). A 7h+ FDP duty reliably produces this
+# status via D25 (meal/snack provision data is never populated by
+# this codebase), which is what these tests use to exercise it with
+# a real rule firing, not a synthetic/mocked one.
+# ------------------------------------------------------------------
+
+def test_needs_manual_review_does_not_write_and_returns_needs_review_status(_patch_engine):
+    crew_id = _add_crew("CPT")
+    # 7h FDP, no prior history, no other violation — the ONLY thing
+    # flagged should be D25 nutrition-data-missing.
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))
+    result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+
+    assert result.status == "NEEDS_REVIEW"
+    assert result.legality_status == "NEEDS_MANUAL_REVIEW"
+    assert any(a.rule_code == "D25_NUTRITION_DATA_MISSING" for a in result.alerts)
+    assert result.roster_ids == []
+
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 0  # nothing written — held, not silently allowed
+
+
+def test_needs_manual_review_still_reports_computed_duty_times(_patch_engine):
+    """A human reviewing a held assignment needs to see what WAS
+    computed, even though nothing was saved."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))
+    result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+
+    assert result.status == "NEEDS_REVIEW"
+    assert result.computed_report_time == dt.datetime(2026, 7, 20, 4, 15)
+    assert result.computed_debrief_time == dt.datetime(2026, 7, 20, 11, 15)
+    assert result.computed_fdp_hours == 7.0
+
+
+def test_needs_manual_review_writes_audit_record_with_held_action_type(_patch_engine):
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))
+    assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT", app_user="tester")
+
+    audit = _audit_rows(_patch_engine, "ASSIGNMENT_HELD_FOR_REVIEW")
+    assert len(audit) == 1
+    assert audit.iloc[0]["legality_result"] == "NEEDS_MANUAL_REVIEW"
+    assert audit.iloc[0]["app_user"] == "tester"
+
+    # Must NOT also appear as a normal creation or rejection record.
+    assert len(_audit_rows(_patch_engine, "ASSIGNMENT_CREATED")) == 0
+    assert len(_audit_rows(_patch_engine, "ASSIGNMENT_REJECTED")) == 0
+
+
+def test_needs_manual_review_via_control_room_saves_neither_flight_nor_assignment(_patch_engine):
+    """Same fix, Control Room path — consistent with the existing
+    'no orphan flight' guarantee for ILLEGAL, now extended to
+    NEEDS_MANUAL_REVIEW too."""
+    crew_id = _add_crew("CPT")
+    flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))]
+
+    result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
+
+    assert result.status == "NEEDS_REVIEW"
+    assert flight_ids == []
+    assert len(flight_service.get_all_flights()) == 0
+
+    audit = _audit_rows(_patch_engine, "ADHOC_FLIGHT_HELD_FOR_REVIEW")
+    assert len(audit) == 1
+
+
+def test_warning_only_status_still_allowed_and_written(_patch_engine):
+    """Regression guard: WARNING must NOT be swept up into the same
+    hold-for-review treatment as NEEDS_MANUAL_REVIEW — only genuine
+    uncertainty gets held, not a legal-but-flagged duty. A duty just
+    over 4h but at or under 6h gets the snack-required WARNING
+    (D2.18_D25_SNACK_REQUIRED needs snack_provided is False
+    specifically, which never fires here since it's never set to
+    False — only None) — so this test instead confirms a duty with
+    NO alerts at all (comfortably under every threshold) writes
+    normally, as the plainest possible regression guard that the new
+    branch didn't accidentally start blocking LEGAL too."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+
+    assert result.status == "ALLOWED"
+    assert result.legality_status == "LEGAL"
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 1
+
+
+# ------------------------------------------------------------------
 # Downstream impact detection — the actual "catch" from the spec
 # ------------------------------------------------------------------
 
@@ -260,9 +400,16 @@ def test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged(_patch_en
     """
     Crew already has a future scheduled duty (Day 3, 05:00) that is
     currently legal (nothing precedes it). Assigning them to a NEW
-    ad-hoc duty (Day 2, 8h FDP, needs 16h rest after) that debriefs
-    only 10h before the future duty's report time must flag a
-    downstream conflict on that future duty.
+    ad-hoc duty (Day 2, 5h FDP, needs the 12h rest floor) that
+    debriefs only 10h before the future duty's report time must flag
+    a downstream conflict on that future duty.
+
+    Deliberately kept under 6h FDP (5h, not the original 8h) so this
+    stays LEGAL/ALLOWED on its own — an 8h+ duty now correctly
+    triggers NEEDS_MANUAL_REVIEW (no meal/snack data), which is a
+    separate, already-tested gate. The 12h rest floor applies
+    regardless of duty length, so this still tests the same
+    downstream-conflict mechanism with the same numbers.
     """
     crew_id = _add_crew("CPT")
 
@@ -272,9 +419,9 @@ def test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged(_patch_en
     assert future_result.status == "ALLOWED"
     assert future_result.downstream_conflicts == []  # nothing before it yet
 
-    # New ad-hoc duty: Day 2, 8h FDP (11:00-19:00), needs 16h rest after.
+    # New ad-hoc duty: Day 2, 5h FDP (14:00-19:00), needs the 12h floor.
     # Gap to future duty's 05:00 Day 3 report = only 10h. Should conflict.
-    adhoc_flight = _add_flight(dt.datetime(2026, 7, 21, 11, 45), dt.datetime(2026, 7, 21, 18, 45))
+    adhoc_flight = _add_flight(dt.datetime(2026, 7, 21, 14, 45), dt.datetime(2026, 7, 21, 18, 45))
     adhoc_result = assignment_service.assign_crew_to_duty(crew_id, [adhoc_flight], "CPT")
 
     assert adhoc_result.status == "ALLOWED"  # the ad-hoc duty itself is legal
@@ -310,7 +457,9 @@ def test_downstream_conflict_includes_legal_candidates(_patch_engine):
     future_flight = _add_flight(dt.datetime(2026, 7, 22, 5, 45), dt.datetime(2026, 7, 22, 7, 45))
     assignment_service.assign_crew_to_duty(crew_a, [future_flight], "CPT")
 
-    adhoc_flight = _add_flight(dt.datetime(2026, 7, 21, 11, 45), dt.datetime(2026, 7, 21, 18, 45))
+    # 5h FDP, under the 6h nutrition-review threshold — see the
+    # comment on test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged
+    adhoc_flight = _add_flight(dt.datetime(2026, 7, 21, 14, 45), dt.datetime(2026, 7, 21, 18, 45))
     result = assignment_service.assign_crew_to_duty(crew_a, [adhoc_flight], "CPT")
 
     assert len(result.downstream_conflicts) == 1
@@ -326,9 +475,14 @@ def test_find_legal_candidates_excludes_illegal_crew(_patch_engine):
     legal_crew = _add_crew("CPT")
     illegal_crew = _add_crew("CPT")
 
-    # illegal_crew has a heavy duty ending too close to the target.
+    # illegal_crew has a heavy duty ending too close to the target —
+    # seeded directly since an 8h FDP duty now correctly triggers
+    # NEEDS_MANUAL_REVIEW through the real API (see _seed_duty's
+    # docstring). This test is about candidate exclusion given
+    # existing history, not about that gate.
     prior_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
-    assignment_service.assign_crew_to_duty(illegal_crew, [prior_flight], "CPT")
+    _seed_duty(_patch_engine, illegal_crew, prior_flight, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
 
     target_flight = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
 
@@ -397,7 +551,8 @@ def test_cpt_assignment_still_rejected_for_the_same_scenario(_patch_engine):
     apply to."""
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
-    assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+    _seed_duty(_patch_engine, crew_id, f1, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
 
     f2 = _add_flight(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))
     result2 = assignment_service.assign_crew_to_duty(crew_id, [f2], "CPT")
@@ -528,10 +683,14 @@ def test_illegal_adhoc_assignment_creates_no_flight_at_all(_patch_engine):
     Nothing gets saved to either table."""
     crew_id = _add_crew("CPT")
 
-    # Prior duty requiring 16h rest after (8h FDP, D21).
-    prior_flights = [_flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))]
-    prior_result, _ = assignment_service.assign_crew_to_new_flights(crew_id, prior_flights, "CPT")
-    assert prior_result.status == "ALLOWED"
+    # Prior duty requiring 16h rest after (8h FDP, D21) — seeded
+    # directly (flight created normally, roster row seeded via raw
+    # SQL) since an 8h duty now correctly triggers NEEDS_MANUAL_REVIEW
+    # through the real assign_crew_to_new_flights() call, which has
+    # its own dedicated tests.
+    prior_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    _seed_duty(_patch_engine, crew_id, prior_flight, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
 
     flights_before = len(flight_service.get_all_flights())
 
@@ -548,8 +707,9 @@ def test_illegal_adhoc_assignment_creates_no_flight_at_all(_patch_engine):
 
 def test_illegal_adhoc_assignment_writes_audit_without_a_flight_reference(_patch_engine):
     crew_id = _add_crew("CPT")
-    prior_flights = [_flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))]
-    assignment_service.assign_crew_to_new_flights(crew_id, prior_flights, "CPT")
+    prior_flight = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 12, 0))
+    _seed_duty(_patch_engine, crew_id, prior_flight, "CPT",
+               dt.datetime(2026, 7, 20, 4, 15), dt.datetime(2026, 7, 20, 12, 15), 8.0)
 
     illegal_flights = [_flight_data(dt.datetime(2026, 7, 20, 17, 45), dt.datetime(2026, 7, 20, 19, 45))]
     assignment_service.assign_crew_to_new_flights(crew_id, illegal_flights, "CPT", app_user="tester")
@@ -561,13 +721,17 @@ def test_illegal_adhoc_assignment_writes_audit_without_a_flight_reference(_patch
 
 def test_adhoc_assignment_also_detects_downstream_conflicts(_patch_engine):
     """The downstream check must work identically for the ad-hoc path
-    — it's the same underlying mechanism, not a separate one."""
+    — it's the same underlying mechanism, not a separate one.
+
+    5h FDP (not the original 8h) — see the comment on
+    test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged
+    for why."""
     crew_id = _add_crew("CPT")
 
     future_flight = _add_flight(dt.datetime(2026, 7, 22, 5, 45), dt.datetime(2026, 7, 22, 7, 45))
     assignment_service.assign_crew_to_duty(crew_id, [future_flight], "CPT")
 
-    adhoc_flights = [_flight_data(dt.datetime(2026, 7, 21, 11, 45), dt.datetime(2026, 7, 21, 18, 45))]
+    adhoc_flights = [_flight_data(dt.datetime(2026, 7, 21, 14, 45), dt.datetime(2026, 7, 21, 18, 45))]
     result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, adhoc_flights, "CPT")
 
     assert result.status == "ALLOWED"
@@ -577,12 +741,14 @@ def test_adhoc_assignment_also_detects_downstream_conflicts(_patch_engine):
 
 def test_adhoc_mixed_domestic_international_uses_international_buffer(_patch_engine):
     """Same fix as the Roster path, through Control Room's atomic
-    flight+assignment — must not reject a mixed-sector rotation."""
+    flight+assignment — must not reject a mixed-sector rotation with
+    a ValueError. Kept under 6h FDP total so this stays ALLOWED
+    (proving the save actually succeeds), not just NEEDS_REVIEW."""
     crew_id = _add_crew("CPT")
     flights_data = [
         _flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
                      origin="KHI", destination="LHE", domestic=True),
-        _flight_data(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 10, 0),
+        _flight_data(dt.datetime(2026, 7, 20, 8, 0), dt.datetime(2026, 7, 20, 9, 0),
                      origin="LHE", destination="DWC", domestic=False),
     ]
     result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")

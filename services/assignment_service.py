@@ -76,12 +76,18 @@ class DownstreamConflict:
 
 @dataclass
 class AssignmentResult:
-    status: str  # "ALLOWED" or "REJECTED"
+    status: str  # "ALLOWED", "REJECTED", or "NEEDS_REVIEW"
     legality_status: str
     alerts: list
     roster_ids: List[int] = field(default_factory=list)
     duty_id: Optional[str] = None
     downstream_conflicts: List[DownstreamConflict] = field(default_factory=list)
+    # Populated regardless of status — a human reviewing a
+    # NEEDS_REVIEW result still needs to see what was actually
+    # computed (report/debrief/FDP), even though nothing was written.
+    computed_report_time: Optional[object] = None
+    computed_debrief_time: Optional[object] = None
+    computed_fdp_hours: Optional[float] = None
 
 
 # ------------------------------------------------------------------
@@ -291,9 +297,43 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             status="REJECTED",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            computed_report_time=duty_result.report_time,
+            computed_debrief_time=duty_result.debrief_time,
+            computed_fdp_hours=duty_result.fdp_hours,
         )
 
-    # Passed the immediate gate — write to roster, one row per sector.
+    if validation_result.status == AlertStatus.NEEDS_MANUAL_REVIEW:
+        # Confirmed bug, now fixed: this branch previously didn't
+        # exist, so NEEDS_MANUAL_REVIEW fell through to the write
+        # path below and was silently treated exactly like LEGAL or
+        # WARNING — directly contradicting its own defined meaning
+        # ("cannot be determined deterministically, requires
+        # authorized review"). Nothing gets written here — same as
+        # ILLEGAL in that respect — but this is reported as HELD, not
+        # REJECTED, since it isn't a known violation, just an
+        # unresolved uncertainty that needs a human decision.
+        log_audit(
+            action_type="ASSIGNMENT_HELD_FOR_REVIEW",
+            affected_crew=crew_id,
+            affected_flight=flight_ids[0],
+            affected_duty=new_duty.duty_id,
+            legality_result=validation_result.status.value,
+            warning_or_failure_reason="; ".join(
+                a.message for a in validation_result.alerts
+                if a.status == AlertStatus.NEEDS_MANUAL_REVIEW),
+            app_user=app_user,
+        )
+        return AssignmentResult(
+            status="NEEDS_REVIEW",
+            legality_status=validation_result.status.value,
+            alerts=validation_result.alerts,
+            computed_report_time=duty_result.report_time,
+            computed_debrief_time=duty_result.debrief_time,
+            computed_fdp_hours=duty_result.fdp_hours,
+        )
+
+    # Only LEGAL or WARNING reach here — passed the immediate gate,
+    # write to roster, one row per sector.
     roster_ids = []
     with engine.begin() as conn:
         for fid in flight_ids:
@@ -334,6 +374,9 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         roster_ids=roster_ids,
         duty_id=new_duty.duty_id,
         downstream_conflicts=downstream_conflicts,
+        computed_report_time=duty_result.report_time,
+        computed_debrief_time=duty_result.debrief_time,
+        computed_fdp_hours=duty_result.fdp_hours,
     )
 
 
@@ -391,10 +434,38 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             status="REJECTED",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            computed_report_time=duty_result.report_time,
+            computed_debrief_time=duty_result.debrief_time,
+            computed_fdp_hours=duty_result.fdp_hours,
         ), []
 
-    # LEGAL — now actually create the flight(s) and the assignment
-    # together. Two separate statements, but both only run after the
+    if validation_result.status == AlertStatus.NEEDS_MANUAL_REVIEW:
+        # Same fix as assign_crew_to_duty() above, same reasoning.
+        # Nothing gets saved here either — no flight, no assignment —
+        # consistent with the atomic "gate before save" guarantee
+        # this function already provides for ILLEGAL.
+        log_audit(
+            action_type="ADHOC_FLIGHT_HELD_FOR_REVIEW",
+            affected_crew=crew_id,
+            affected_duty=new_duty.duty_id,
+            legality_result=validation_result.status.value,
+            warning_or_failure_reason="; ".join(
+                a.message for a in validation_result.alerts
+                if a.status == AlertStatus.NEEDS_MANUAL_REVIEW),
+            app_user=app_user,
+        )
+        return AssignmentResult(
+            status="NEEDS_REVIEW",
+            legality_status=validation_result.status.value,
+            alerts=validation_result.alerts,
+            computed_report_time=duty_result.report_time,
+            computed_debrief_time=duty_result.debrief_time,
+            computed_fdp_hours=duty_result.fdp_hours,
+        ), []
+
+    # Only LEGAL or WARNING reach here — now actually create the
+    # flight(s) and the assignment together. Two separate statements,
+    # but both only run after the
     # gate already passed, so there's no window where an illegal
     # assignment could leave a saved flight behind.
     flight_ids = []
@@ -457,6 +528,9 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         roster_ids=roster_ids,
         duty_id=new_duty.duty_id,
         downstream_conflicts=downstream_conflicts,
+        computed_report_time=duty_result.report_time,
+        computed_debrief_time=duty_result.debrief_time,
+        computed_fdp_hours=duty_result.fdp_hours,
     ), flight_ids
 
 

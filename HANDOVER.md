@@ -222,63 +222,54 @@ assessment is in the FTLguard project chat history, 2026-07-19.
   speculatively rebuild it now.
 
 ## Current active task
-Commit 32098e7 (schema reconciliation, FTL exemption, import script)
-is CONFIRMED PUSHED — independently verified via fresh clone earlier
-in this session. What's UNPUSHED as of this snapshot is the second
-review's fixes: role normalization/matching enforcement, mixed-
-domestic duty classification, geographic continuity check. See
-"Next safest step" below.
+Step 2 of the agreed remediation order (NEEDS_MANUAL_REVIEW gate) is
+done, tested (164/164), verified locally — not yet pushed as of this
+snapshot. Everything through commit `727da58` is confirmed live on
+GitHub AND the real Supabase database now has actual schema (all 8
+migrations applied, independently confirmed both via
+`run_migrations.py --status` and Supabase's own dashboard) — the
+first genuinely real infrastructure in this entire project. See
+"Next safest step" for what's queued after this gets pushed.
 
 ## Files changed
-Since 32098e7's push: services/assignment_service.py (role-match
-enforcement in _validate_new_duty, mixed-domestic classification fix
-in 3 places, rule_applied audit label fix), services/crew_service.py
-(ROLE_SYNONYMS, _normalize_role, applied in add_crew/update_crew),
-core/duty_builder.py (geographic continuity check),
-scripts/import_crew_from_xlsx.py (KNOWN_CORRECTIONS hardened with
-expected_name cross-check), requirements.txt (openpyxl added),
-tests/test_crew_service.py (+3), tests/test_assignment_service.py
-(+5 net, 2 rewritten), tests/test_duty_builder.py (+2),
-tests/test_import_crew_script.py (name-mismatch test added),
-HANDOVER.md.
+Since commit `727da58`'s push: services/assignment_service.py
+(NEEDS_MANUAL_REVIEW branch in both assignment functions,
+computed_report_time/debrief_time/fdp_hours added to
+AssignmentResult), pages/4_Roster.py and pages/1_Control_Room.py
+(NEEDS_REVIEW UI branch — Control Room's missing branch would have
+caused a real IndexError on flight_ids[0]), tests/test_assignment_service.py
+(5 new dedicated tests + 12 existing tests repaired — see the
+NEEDS_MANUAL_REVIEW log entry above for why so many broke),
+tests/test_control_room_page.py (seed fix + 1 new UI test),
+HANDOVER.md. Also: services/crew_service.py got a CAPT->CPT synonym
+added (confirmed from the operator's real data file spelling role as
+"CAPT" not "CPT") — small, separate, already pushed alongside the
+env-override fix.
 
 ## DB changes (migrations applied)
-- 000_migration_tracking.sql (schema_migrations tracking table)
-- 001_crew_table.sql (crew — matches the 19-column operator template
-  plus operator_staff_id; no hardcoded base default)
-- 002_flights_table.sql (flights — flight_no nullable for ad-hoc ops,
-  CHECK-constrained status, CHECK on arr > dep)
-- 003_roster_table.sql (roster — one row per crew per flight sector,
-  duty_id NOT NULL, FKs to crew/flights, CHECK on debrief > report)
-- 004_audit_log.sql (audit_log — single unified table, all action
-  types, per Section 16's required field list)
-- 005_roster_partial_unique_index.sql (replaces roster's UNIQUE
-  constraint with a partial index — non-cancelled rows only — so
-  unassign-then-reassign of the same crew/flight/role works)
-- 006_flights_domestic_column.sql (flights.domestic, NOT NULL, no
-  default — required at flight-creation time, never guessed)
-- 007_crew_columns_reconcile_real_data.sql (renames lpc_opc_expiry ->
-  sim_expiry, line_check_expiry -> route_check_expiry to match the
-  operator's actual terminology; adds ir_expiry)
-- No new migrations for today's second batch of fixes — all logic
-  changes, no schema changes needed.
-- ALL SEVEN confirmed applied only against local sandbox Postgres.
-  NONE have been run against the real Supabase DB — see the
-  2026-07-21 entry above. This needs to actually happen before any
-  of this is real.
+- 000_migration_tracking.sql through 007_crew_columns_reconcile_real_data.sql
+  (8 total — see earlier entries in this file for what each does)
+- **CONFIRMED applied to the real Supabase database**, not just
+  local sandbox Postgres — `Applied: 8, Pending: 0`, cross-checked
+  against Supabase's own dashboard. This took several real detours
+  to get right: Direct connection failed (IPv6-only hostname, no
+  IPv4 on the user's network — confirmed via `nslookup`), fixed by
+  switching to Supabase's Session Pooler connection string instead
+  (IPv4-proxied by design). No new migrations needed for the
+  NEEDS_MANUAL_REVIEW fix — logic-only change.
 
 ## Tests passed
-155/155 — tests/test_migrations.py (4), tests/test_duty_summary.py
+164/164 — tests/test_migrations.py (4), tests/test_duty_summary.py
 (10), tests/test_pcaa_ano012_core.py (12), tests/test_schema.py (16),
-tests/test_audit_service.py (3), tests/test_crew_service.py (20),
+tests/test_audit_service.py (3), tests/test_crew_service.py (22),
 tests/test_crew_data_page.py (4), tests/test_duty_builder.py (12),
 tests/test_flight_service.py (15), tests/test_flight_log_page.py (5),
-tests/test_assignment_service.py (32), tests/test_control_room_page.py
-(4), tests/test_roster_page.py (4), tests/test_import_crew_script.py
-(12), tests/test_env_override.py (2). Against real Postgres 16, local
-sandbox instance — independently re-confirmed via fresh clone through
-commit 63932da; the env-override fix (db/db.py, run_migrations.py)
-verified locally but not yet pushed/re-confirmed as of this snapshot.
+tests/test_assignment_service.py (37), tests/test_control_room_page.py
+(5), tests/test_roster_page.py (4), tests/test_import_crew_script.py
+(12), tests/test_env_override.py (4). Against real Postgres 16, local
+sandbox — the NEEDS_MANUAL_REVIEW fix verified locally but not yet
+pushed/re-confirmed as of this snapshot; everything before it is
+confirmed live via fresh clone.
 
 ## Open stubs / known blockers
 - `core/duty_summary.py` is the only file still flagged by
@@ -354,24 +345,26 @@ phase so far:
 
 1. ~~Push already-verified-locally work~~ DONE — commit 32098e7,
    independently confirmed via fresh clone.
-2. Fix `NEEDS_MANUAL_REVIEW` being silently treated as ALLOWED in
-   assignment_service.py (only `AlertStatus.ILLEGAL` currently blocks
-   a save — NEEDS_MANUAL_REVIEW must hold for review, not auto-pass).
-   Smallest, clearest, fully decoupled from everything else below.
-   STILL NOT DONE — this is the actual next step.
-3. ~~Fix domestic/geographic-continuity~~ DONE (this snapshot) — any
+2. ~~Fix `NEEDS_MANUAL_REVIEW` being silently treated as ALLOWED~~
+   DONE (this snapshot) — see the dedicated log entry above. Had a
+   much bigger ripple effect than expected (12 existing tests needed
+   repair) and surfaced a second real bug in the process (both
+   Roster and Control Room pages were missing a UI branch for this
+   status — Control Room's gap would have caused a real IndexError).
+3. ~~Fix domestic/geographic-continuity~~ DONE — any
    international sector makes the whole duty use the international
    buffer; each flight keeps its own domestic flag independently.
    Geographic continuity (leg N destination == leg N+1 origin) added
    alongside the existing temporal check. This directly unblocks the
    real KHI-LHE-DWC-KHI rotation.
-4. The qualification gate: `_crew_member()` currently passes only
-   crew_id/name/home_base into the legality check — is_active,
-   license/medical/SIM/route-check validity against the duty date
-   are not checked at all during assignment. Role match IS now
-   enforced (this snapshot — role_assigned must equal the crew
-   member's registered role), but the rest of this gate is still
-   open. This remains the single biggest gap — a deactivated captain
+4. **The qualification gate — this is the actual next step.**
+   `_crew_member()` currently passes only crew_id/name/home_base into
+   the legality check — is_active, license/medical/SIM/route-check
+   validity against the duty date are not checked at all during
+   assignment. Role match IS now enforced (role_assigned must equal
+   the crew member's registered role), but the rest of this gate is
+   still open. This remains the single biggest gap — a deactivated
+   captain could currently be assigned through the service API today.
    could currently be assigned through the service API today.
 5. Three related "stale data" findings, likely fixed together:
    LOOKBACK_DAYS=35 starves the engine's own 365-day/1000h cumulative
@@ -928,13 +921,74 @@ that name matches the *original, deliberately separate* prototype
 project per this platform's own project structure, not necessarily a
 redundant Air Eagle copy. Not yet resolved as of this snapshot.
 
-**Still not pushed to GitHub as of this snapshot**: everything in
-this and the prior two log entries (env-override fix, role-bypass/
-mixed-domestic/geographic-continuity fix, CAPT synonym,
-TEST_DATABASE_URL hang fix) exists correctly in the user's local
-`Air-Eagle-live` working directory (individual files delivered and
-manually placed, not via zip — zips proved unreliable for delivery
-in this session) but has not yet been committed or pushed. This is
-now the single most important next step — get an actual `git push`
-confirmed before anything else, since a lot of verified-but-unpushed
-work has accumulated.
+**RESOLVED**: the above was pushed as commit `727da58`, independently
+re-cloned and re-verified (14/14 files byte-identical, 158/158 tests
+with real Postgres, 50/108 pass/skip with TEST_DATABASE_URL genuinely
+unset confirming no hang, secrets check clean). This closed out a
+large amount of accumulated, previously-unpushed work.
+
+## Step 2 done: `NEEDS_MANUAL_REVIEW` no longer silently treated as
+## ALLOWED — the smallest, most decoupled item in the remediation
+## order, now fixed, with a much larger ripple effect than expected
+
+The fix itself: `assign_crew_to_duty()` and `assign_crew_to_new_flights()`
+previously only branched on `AlertStatus.ILLEGAL` — everything else
+(LEGAL, WARNING, **and NEEDS_MANUAL_REVIEW**) fell through to the
+same write path and was reported as `status="ALLOWED"`. Added a
+dedicated branch: `NEEDS_MANUAL_REVIEW` now returns
+`status="NEEDS_REVIEW"`, writes nothing (same as ILLEGAL in that
+respect), and logs a distinct audit action type
+(`ASSIGNMENT_HELD_FOR_REVIEW` / `ADHOC_FLIGHT_HELD_FOR_REVIEW`) — not
+a rejection, since it isn't a known violation, just an unresolved
+uncertainty needing a human decision. `AssignmentResult` gained
+`computed_report_time`/`computed_debrief_time`/`computed_fdp_hours`,
+populated regardless of status, so a human reviewing a held
+assignment can still see what was computed even though nothing saved.
+
+**The real discovery**: this codebase never populates
+`meal_provided`/`snack_provided` on any Duty it builds, and
+`core/legality/pcaa_ano012_core.py`'s D25 rule fires
+`NEEDS_MANUAL_REVIEW` for any FDP over 6h with `meal_provided is
+None` (its actual default). This means **every real assignment
+attempt over 6h FDP has ALWAYS been secretly returning
+NEEDS_MANUAL_REVIEW**, silently auto-allowed by the bug just fixed.
+12 existing tests broke as a direct, correct consequence — every one
+had used an 8h "prior duty" as an assumed-written precondition for
+something else under test (D21 rest-conflict scenarios, downstream
+candidate exclusion). Fixed two ways depending on what each test
+actually needed:
+- Tests that only needed a >6h duty to establish REST history (the
+  D21 "scales above 12h floor" case specifically requires >6h FDP to
+  be meaningful): switched to a new `_seed_duty()` test helper that
+  inserts a roster row directly via SQL, bypassing the assignment
+  API entirely for that "given" precondition — mirrors the existing
+  raw-SQL seeding pattern already used in test_schema.py.
+- Tests where the >6h duty wasn't actually essential to the point
+  being tested (most downstream-conflict tests only needed the 12h
+  rest FLOOR, which applies to duties of any length): shortened to
+  5h FDP, preserving the same conflict-triggering gap to the future
+  duty with the same numbers, avoiding the nutrition trigger entirely
+  rather than working around it.
+5 new dedicated tests added for the fix itself (not just the ripple
+repairs) — confirming a real 7h duty genuinely returns NEEDS_REVIEW,
+writes nothing, logs the right audit action type, and that this
+extends correctly to the Control Room path too.
+
+**A second, real bug found and fixed while finishing this**: neither
+`pages/4_Roster.py` nor `pages/1_Control_Room.py` had a branch for
+this new third status — both only checked `if status == "REJECTED"`
+with an implicit "else = ALLOWED." A held assignment would have
+fallen into that else branch and displayed as a success message. In
+Control Room specifically this would have been worse than
+cosmetically wrong: that branch references `flight_ids[0]`, but
+`flight_ids` is genuinely empty for a held assignment — a real
+`IndexError`, not caught until a dedicated AppTest was added
+specifically to exercise this path (`test_needs_review_adhoc_assignment
+_shows_warning_not_success`), which confirmed the crash would have
+happened before the fix and doesn't after. Both pages now show a
+distinct `st.warning` for `NEEDS_REVIEW`, including the computed (but
+unsaved) duty times where available.
+
+164/164 total. Reachability unchanged (`core/duty_summary.py` still
+the only flag, as expected). Verified locally; not yet pushed as of
+this snapshot.

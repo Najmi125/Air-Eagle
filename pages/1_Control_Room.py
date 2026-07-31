@@ -86,6 +86,23 @@ with st.form("control_room_form"):
                     )
                     for alert in result.alerts:
                         st.write(f"- **{alert.rule_code}**: {alert.message}")
+                elif result.status == "NEEDS_REVIEW":
+                    st.warning(
+                        f"HELD FOR MANUAL REVIEW — {result.legality_status}. "
+                        f"Nothing was saved — no flight, no assignment. This "
+                        f"isn't a known violation, just something the system "
+                        f"can't determine automatically — an authorized "
+                        f"reviewer needs to make this call."
+                    )
+                    for alert in result.alerts:
+                        st.write(f"- **{alert.rule_code}**: {alert.message}")
+                    if result.computed_report_time:
+                        st.write(
+                            f"Computed duty (not saved): report "
+                            f"{result.computed_report_time}, debrief "
+                            f"{result.computed_debrief_time}, "
+                            f"FDP {result.computed_fdp_hours}h"
+                        )
                 else:
                     st.success(f"ALLOWED — flight {flight_ids[0]} saved, {crew_id} assigned as {role_choice}")
                     if result.legality_status != "LEGAL":
