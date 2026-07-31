@@ -298,7 +298,14 @@ def test_role_match_recognizes_ame_engr_synonym(_patch_engine):
     'ENGR') must still be assignable with role_assigned='AME' — the
     synonym must be recognized on the comparison side too, not just
     at storage time."""
-    crew_id = crew_service.add_crew({"name": "Test AME", "role": "AME"})
+    # Must go through _add_crew(), not crew_service.add_crew()
+    # directly — the qualification gate (2026-07-31) needs the
+    # expiry defaults _add_crew() sets, or this crew member has no
+    # expiry dates and correctly trips NEEDS_REVIEW instead of
+    # ALLOWED. _add_crew's role kwarg passes straight through to
+    # crew_service.add_crew(), so the AME synonym is exercised
+    # exactly as before.
+    crew_id = _add_crew("AME")
     flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
     result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "AME")
     assert result.status == "ALLOWED"
@@ -751,6 +758,25 @@ def test_expiry_exactly_on_duty_date_is_expired(_patch_engine):
 
     result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
 
+    assert result.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
+
+
+def test_qualification_checked_against_debrief_date_not_report_date(_patch_engine):
+    """Documents must stay valid through the END of the duty, not
+    just at report time. Uses Air Eagle's real EPE 786/787 rotation
+    timings (KHI-LHE-KHI, domestic, Mon-Fri nightly): report 18:15,
+    debrief 00:00 the following day. A document expiring ON the
+    debrief date (2026-07-21) must be caught as ILLEGAL even though
+    it's still valid on the report date (2026-07-20) — checking only
+    the report date would have incorrectly passed this."""
+    crew_id = _add_crew("CPT", medical_expiry=dt.date(2026, 7, 21))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 19, 0), dt.datetime(2026, 7, 20, 23, 45))
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.computed_report_time == dt.datetime(2026, 7, 20, 18, 15)
+    assert result.computed_debrief_time == dt.datetime(2026, 7, 21, 0, 0)
     assert result.status == "REJECTED"
     assert any(a.rule_code == "AE-CREW-QUAL-001_MEDICAL_EXPIRED" for a in result.alerts)
 

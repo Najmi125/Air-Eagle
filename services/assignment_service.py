@@ -89,12 +89,17 @@ def _check_crew_qualifications(crew_row: pd.Series, duty_date) -> List[RuleAlert
     core/legality/pcaa_ano012_core.py, which stays qualification-
     agnostic.
 
-    Checked against duty_date — the actual duty's own report date,
-    NEVER date.today(). A crew member who is currently qualified can
-    be illegal on a future duty date if a document expires in
-    between; this exact today()-vs-duty-date distinction is called
-    out in the project's own hard-lessons catalogue as a past
-    production bug, not a hypothetical one.
+    Checked against duty_date — the actual duty's own debrief (end)
+    date, NOT its report (start) date, and NEVER date.today(). A
+    document must remain valid through the END of the duty, not just
+    at report time: for any duty that crosses midnight (e.g. Air
+    Eagle's real EPE 786/787 KHI-LHE-KHI rotation, which reports
+    18:15 and debriefs 00:00 the following day), checking only the
+    report date would incorrectly pass a document that's already
+    expired before the duty is actually over. Separately, checking
+    against date.today() instead of either duty date is the class of
+    bug this project's hard-lessons catalogue already calls out as a
+    past production incident, not a hypothetical one.
 
     Collects every failing reason, not just the first — HANDOVER.md
     documents first-failure-only evaluation as a real, already-found
@@ -326,7 +331,7 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
     # precedence (ILLEGAL > NEEDS_MANUAL_REVIEW > WARNING > LEGAL)
     # and the caller's existing ILLEGAL/NEEDS_MANUAL_REVIEW branches
     # handle this with no new branching logic there.
-    for alert in _check_crew_qualifications(crew_row, duty_result.report_time.date()):
+    for alert in _check_crew_qualifications(crew_row, duty_result.debrief_time.date()):
         validation_result.add_alert(alert)
 
     return validation_result, new_duty, crew_member, crew_row, duty_result
@@ -723,7 +728,10 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
         origin=f["origin"], destination=f["destination"],
     ) for f in flights]
     duty_result = build_duty(legs, domestic=domestic)
-    duty_date = duty_result.report_time.date()
+    # debrief date, not report date — see _check_crew_qualifications'
+    # docstring: a document must stay valid through the END of the
+    # duty, not just at report time.
+    duty_date = duty_result.debrief_time.date()
 
     if role_assigned in FTL_EXEMPT_ROLES:
         legal_candidates = []
