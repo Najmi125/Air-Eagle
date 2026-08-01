@@ -29,6 +29,7 @@ Every assignment goes through two checks, not one:
    suggest candidates, not auto-reassign.
 """
 import uuid
+import datetime as dt
 from datetime import timedelta
 from typing import Optional, List
 from dataclasses import dataclass, field
@@ -1071,3 +1072,63 @@ def get_roster_for_flight(flight_id: int, include_cancelled: bool = False) -> pd
     if not include_cancelled:
         query += " AND status != 'CANCELLED'"
     return pd.read_sql(text(query), engine, params={"flight_id": flight_id})
+
+
+def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = None,
+                   date_from=None, date_to=None, include_cancelled: bool = False) -> pd.DataFrame:
+    """
+    Sector-level roster search across crew/date range — the query
+    services/assistant/reports.py's crew_duty_history template needs.
+    get_roster_for_crew() doesn't cover this: it takes a single
+    crew_id, not a list, and has no date filtering at all.
+
+    Returns ONE ROW PER SECTOR (same shape roster itself stores) —
+    report_time/debrief_time/fdp_hours REPEAT across every sector
+    belonging to one duty; duty_id is what actually identifies a
+    duty. DO NOT sum fdp_hours across rows from this function's
+    output without grouping by duty_id first (see
+    core/duty_summary.py's group_roster_rows_into_duties()) — this is
+    the exact same warning migrations/003_roster_table.sql's own
+    header carries: "the single most repeated bug in this platform's
+    history." A report-layer consumer of this data is exactly where
+    that mistake would happen again if this warning weren't repeated
+    here too.
+    """
+    engine = get_engine()
+    query = """
+        SELECT r.roster_id, r.crew_id, c.name AS crew_name, r.flight_id,
+               r.duty_id, r.duty_date, r.report_time, r.debrief_time,
+               r.fdp_hours, r.role_assigned, r.status,
+               f.flight_no, f.origin, f.destination,
+               f.dep_time_planned, f.arr_time_planned,
+               f.dep_time_actual, f.arr_time_actual, f.domestic
+        FROM roster r
+        JOIN flights f ON r.flight_id = f.flight_id
+        JOIN crew c ON r.crew_id = c.crew_id
+    """
+    conditions = []
+    params: dict = {}
+    if not include_cancelled:
+        conditions.append("r.status != 'CANCELLED'")
+    if crew_ids:
+        conditions.append("r.crew_id = ANY(:crew_ids)")
+        params["crew_ids"] = list(crew_ids)
+    if role:
+        conditions.append("r.role_assigned = :role")
+        params["role"] = role
+    if date_from is not None:
+        conditions.append("r.report_time >= :date_from")
+        params["date_from"] = date_from
+    if date_to is not None:
+        # Same inclusive-calendar-date widening as
+        # flight_service.get_all_flights() — a bare `<=` against a
+        # bare date would silently exclude duties reporting later
+        # that same day.
+        if isinstance(date_to, dt.date) and not isinstance(date_to, dt.datetime):
+            date_to = dt.datetime.combine(date_to, dt.time.max)
+        conditions.append("r.report_time <= :date_to")
+        params["date_to"] = date_to
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY r.report_time, r.duty_id"
+    return pd.read_sql(text(query), engine, params=params)
