@@ -9,10 +9,28 @@ This is NOT the same file as the old repo's utils/audit_service.py
 (which wrote to a smaller override_audit table with fewer fields).
 Rebuilt here against the full audit_log schema from Section 16.
 """
-from typing import Optional
+import datetime as dt
+from typing import List, Optional
+import pandas as pd
 from sqlalchemy import text
 
 from db.db import get_engine
+
+# Action types the audit_compliance report template treats as
+# "blocked, held" — the actual, currently-implemented subset of that
+# template's description. Nothing in this codebase writes an
+# "override" action_type yet (override_reason exists as a column,
+# per Section 16's required field list, but no write path populates
+# it — Section 14's downstream-conflict handling is "alert + suggest
+# candidates, human confirms," not an auto-override mechanism). This
+# list reflects what's actually queryable today; extend it here, in
+# one place, if/when an override write path is ever built, rather
+# than each caller guessing its own action_type list.
+COMPLIANCE_ACTION_TYPES = [
+    "ASSIGNMENT_REJECTED", "ASSIGNMENT_HELD_FOR_REVIEW",
+    "ADHOC_FLIGHT_REJECTED", "ADHOC_FLIGHT_HELD_FOR_REVIEW",
+    "DUTY_FLAGGED_FOR_REVIEW_AFTER_DELAY",
+]
 
 
 def log_audit(
@@ -79,3 +97,40 @@ def log_audit(
             "linked_disruption_event": linked_disruption_event,
             "data_source": data_source,
         })
+
+
+def get_audit_log(date_from=None, date_to=None,
+                   action_types: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    This file's first read function — audit_service.py was write-only
+    (log_audit() only) until services/assistant/reports.py's
+    audit_compliance template needed a query surface (2026-08-01).
+
+    Filters on "timestamp" (when the row was written), not on any
+    duty/flight date of its own — an audit event for a duty scheduled
+    next month is logged NOW, when the assignment attempt happened,
+    not on the duty's own future date.
+    """
+    engine = get_engine()
+    query = "SELECT * FROM audit_log"
+    conditions = []
+    params: dict = {}
+    if date_from is not None:
+        conditions.append('"timestamp" >= :date_from')
+        params["date_from"] = date_from
+    if date_to is not None:
+        # Same inclusive-calendar-date widening as
+        # flight_service.get_all_flights()/assignment_service.
+        # search_roster() — a bare date must mean "through the end of
+        # that day," not "before midnight at its start."
+        if isinstance(date_to, dt.date) and not isinstance(date_to, dt.datetime):
+            date_to = dt.datetime.combine(date_to, dt.time.max)
+        conditions.append('"timestamp" <= :date_to')
+        params["date_to"] = date_to
+    if action_types:
+        conditions.append("action_type = ANY(:action_types)")
+        params["action_types"] = list(action_types)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += ' ORDER BY "timestamp" DESC'
+    return pd.read_sql(text(query), engine, params=params)

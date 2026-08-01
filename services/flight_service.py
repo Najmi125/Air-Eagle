@@ -11,6 +11,7 @@ flights.status CHECK constraint (migrations/002_flights_table.sql)
 already only allows PLANNED/OPERATED/CANCELLED/DISRUPTED, so this
 mirrors what the schema was already built to support.
 """
+import datetime as dt
 from typing import Optional
 import pandas as pd
 from sqlalchemy import text
@@ -125,15 +126,64 @@ def get_flight(flight_id: int) -> Optional[pd.Series]:
     return df.iloc[0]
 
 
-def get_all_flights(status_filter: Optional[str] = None) -> pd.DataFrame:
+def get_all_flights(
+    status_filter: Optional[str] = None,
+    date_from=None,
+    date_to=None,
+    origin: Optional[str] = None,
+    destination: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> pd.DataFrame:
     """Defaults to showing EVERY flight, cancelled included — this is
     a permanent log, not a live/active-only view. Pass status_filter
-    to narrow it down."""
+    to narrow it down.
+
+    date_from/date_to/flight_no added for services/assistant/reports.py's
+    flight_records template (2026-08-01) — extending this single
+    canonical read path rather than adding a parallel query function,
+    per the one-read-path-per-table convention already followed
+    elsewhere in this file. Filters on dep_time_planned, matching the
+    existing ORDER BY; a flight is "in range" by when it was
+    scheduled to depart, not by any actual/delayed time.
+
+    flight_no is matched with spaces stripped and case-folded on both
+    sides (REPLACE/UPPER in SQL): query_parser.parse_flight_no()
+    returns "EPE 786" (with a space), but the real stored format
+    wasn't confirmed against actual data at the time this was written
+    — comparing loosely avoids a silent zero-row result if the DB
+    turns out to store "EPE786" instead."""
     engine = get_engine()
     query = "SELECT * FROM flights"
+    conditions = []
     params = {}
     if status_filter:
-        query += " WHERE status = :status"
+        conditions.append("status = :status")
         params["status"] = status_filter
+    if flight_no:
+        conditions.append("REPLACE(UPPER(flight_no), ' ', '') = REPLACE(UPPER(:flight_no), ' ', '')")
+        params["flight_no"] = flight_no
+    if date_from is not None:
+        conditions.append("dep_time_planned >= :date_from")
+        params["date_from"] = date_from
+    if date_to is not None:
+        # date_to is an inclusive CALENDAR DATE (e.g. "through July
+        # 31"), but dep_time_planned is a timestamp — a bare
+        # `<= date_to` would silently mean "on or before midnight of
+        # date_to", excluding every flight later that same day. Widen
+        # to end-of-day only when date_to has no time component of
+        # its own; a caller that already passed a real datetime is
+        # trusted to mean exactly that instant.
+        if isinstance(date_to, dt.date) and not isinstance(date_to, dt.datetime):
+            date_to = dt.datetime.combine(date_to, dt.time.max)
+        conditions.append("dep_time_planned <= :date_to")
+        params["date_to"] = date_to
+    if origin:
+        conditions.append("origin = :origin")
+        params["origin"] = origin
+    if destination:
+        conditions.append("destination = :destination")
+        params["destination"] = destination
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY dep_time_planned DESC"
     return pd.read_sql(text(query), engine, params=params)

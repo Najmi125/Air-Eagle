@@ -272,6 +272,20 @@ the same branch), plus the same encoding class of bug in
 `scripts/run_migrations.py` (also fixed). See the dedicated log entry
 below — this ended up being the larger part of this piece of work.
 
+**New, separate piece started 2026-08-01**: the seven report
+functions that actually execute a `query_parser.ReportRequest` against
+the real schema — `services/assistant/reports.py`, on branch
+`assistant-report-functions`, off `main` at commit `28b5da3`. This is
+what makes the parser's output do something; the parser itself never
+touches a database. Also added: `services/reporting.py` (general-
+purpose `Dataset`/CSV/XLSX/Markdown export, reused by every future
+data-bearing page's export button, not assistant-only) and
+`services/assistant/regulation_reference.py` (curated ANO-012 section
+summaries backing the `regulation` template). See the dedicated log
+entry below for full detail. **Deliberately not merged** — same
+discipline as every prior piece, awaiting the user's own real-Postgres
+verification.
+
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
 (NEEDS_MANUAL_REVIEW branch in both assignment functions,
@@ -351,13 +365,58 @@ by the user against real Postgres 16: 178/178 passing, migration 008
 confirmed to drop both columns cleanly against a database already
 carrying crew data, no data loss.
 
+**Unmerged, on branch `assistant-report-functions`**: 301 total (255
+already on `main` as of the `query-parser` merge this branch was cut
+from, + 46 genuinely new — 18 in the new tests/test_reporting_export.py,
+28 in the new tests/test_assistant_reports.py; `flight_service.get_all_flights()`
+and `assignment_service.search_roster()` were extended in place, not
+duplicated, so neither adds a test file of its own). Verified locally: 128 passed,
+173 skipped (no `TEST_DATABASE_URL` in this sandbox, same limitation as
+every prior piece). The 18 pure-logic export tests and 8 pure-logic
+regulation-boundary tests among the 28 in test_assistant_reports.py
+were additionally confirmed correct by direct interpreter execution,
+bypassing the DB-gated pytest fixture that would otherwise skip them
+here too — see the dedicated log entry below. The remaining 20 DB-
+integration tests (one/two per report function, against real seeded
+crew/flights/roster/audit_log rows) are traced by hand, not run — flag
+this explicitly when verifying. `check_reachability.py`: exactly
+`services/assistant/reports.py` flagged (correctly — not wired into
+any page yet); `core/duty_summary.py` no longer appears, since
+`utilization()` is now its first real caller anywhere in this app.
+
 ## Open stubs / known blockers
-- `core/duty_summary.py` is the only file still flagged by
-  `scripts/check_reachability.py`. Correctly so — it's for cumulative-
-  hours reporting/dashboards, not the assignment flow (which uses
-  pcaa_ano012_core.py's validator directly on Duty objects, a
-  different code path). No page uses it yet. Not urgent; would matter
-  for a future crew-profile or compliance-dashboard page.
+- `services/assistant/reports.py` is the only file currently flagged
+  by `scripts/check_reachability.py` (as of the `assistant-report-
+  functions` branch, 2026-08-01). Correctly so — nothing calls
+  `run_report()` yet; there's no assistant UI page. `core/duty_summary.py`
+  is no longer flagged: `reports.py`'s `utilization()` function is now
+  its first real caller anywhere in this app.
+- `query_parser.py`'s `parse()` never actually populates
+  `ReportRequest.status_filter`, even though "cancelled"/"delayed"/
+  "diverted" are scoring keywords for the `flight_records` template.
+  A question like "which flights were cancelled in June" correctly
+  routes to `flight_records` but currently returns ALL flights in
+  June, not just cancelled ones, because `request.status_filter` stays
+  `None`. `reports.flight_records()` already passes `request.status_filter`
+  through to `flight_service.get_all_flights()`, so this fixes itself
+  the moment the parser starts setting it — a small, separate parser
+  enhancement, not touched as part of the report functions themselves.
+- `roster_coverage`'s required-crew-count-per-role is UNCONFIRMED and
+  currently assumed to be "at least 1" (a role is `UNCOVERED` only
+  when its crew_id list is empty, never when it holds more than one).
+  Real Air Eagle flight data shows at least one rotation with 2
+  engineers assigned ("Eng: 2x VAI") — deliberately NOT flagged as an
+  anomaly. If the operator ever confirms an exact required count per
+  role (e.g. "always exactly 1 CPT, never 2"), tighten this into a
+  real over/under-staffing check rather than presence/absence only.
+- `services/assistant/regulation_reference.py`'s numbers are boundary-
+  tested against the real validator for D9.1.1/D9.1.2/D9.1.3/D9.2.1/
+  D9.2.2/D9.2.3/D21.1/D8.2.1 (see `tests/test_assistant_reports.py`).
+  D23.1/D23.2/D25 are NOT independently boundary-tested — those three
+  entries rely on the plain-English description matching the
+  docstrings/comments at the cited `pcaa_ano012_core.py` line ranges,
+  not a re-derived test. If any of those three's enforcement logic
+  ever changes, this file has no automatic guard for it yet.
 - The `crew` table schema (001_crew_table.sql) is built against the
   19-column template, not yet against real operator data. When the
   route network + crew data comes back: check it actually matches
@@ -1830,3 +1889,201 @@ genuinely, currently unwired, which is correct.
 `ReportRequest` objects but nothing consumes them yet; the seven
 report functions are the next piece. Built on branch `query-parser`,
 off `main` at commit `8441817`.
+
+## 2026-08-01 (continued): the seven report functions — the piece
+## that makes query_parser.py's output actually run against the
+## schema. NOT MERGED.
+
+Design conversation happened first (plan approved with three answers
+and one correction before any code was written), then implementation
+proceeded on branch `assistant-report-functions`, off `main` at
+`28b5da3` (the `query-parser` merge commit).
+
+**Three new files, one deliberate split**:
+
+- `services/reporting.py` — general-purpose export layer: `Dataset`
+  (frozen dataclass, `build()` classmethod validates row-width
+  consistency), `AirlineIdentity`, `dataset_to_csv/xlsx/markdown()`,
+  `report_filename()`. Deliberately NOT under `services/assistant/`:
+  the operator's Excel-export requirement ("every data-bearing page
+  should download its currently filtered data as .xlsx, filename
+  `AirEagle_[PageName]_DD-MM-YYYY_HHMMUTC.xlsx`") applies to Flight
+  Log/Crew Data/Roster too, not just the assistant — this way every
+  page's own export button and the assistant's report functions share
+  one implementation instead of two. `Dataset`/`AirlineIdentity` are
+  taken from the assistant bundle's `services/assistant/models.py`
+  (received 2026-08-01); that file also defines `ToolResult`/
+  `QueryRequest`/`AuditEvent`/`AssistantAnswer`, which look like
+  remnants of a different, LLM-tool-calling architecture
+  (`provider_mode`, `citations`, `tools_used`) than the deterministic,
+  no-LLM approach already built — only `Dataset`/`AirlineIdentity` are
+  used; the rest of that file is not brought in.
+  `report_filename()`'s original bundled version used `%Y%m%d` and
+  `airline.code` — fixed to the operator's actual required format
+  (`%d-%m-%Y_%H%MUTC`, `airline.name` not `.code`) per this session's
+  explicit correction; smoke-tested to an exact match:
+  `report_filename(ds, AIR_EAGLE, 'xlsx', now=2026-07-24 17:35 UTC)`
+  -> `AirEagle_FlightLog_24-07-2026_1735UTC.xlsx`.
+- `services/assistant/regulation_reference.py` — curated, plain-
+  English ANO-012 section summaries for the `regulation` template,
+  scoped to exactly the sections `pcaa_ano012_core.py` actually
+  enforces today (D7.1.2, D8.2.1, D9.1.1-3, D9.2.1-3, D21.1, D23.1,
+  D23.2, D25). Deliberately excludes AE-CREW-QUAL-001 and the
+  age-pairing rule — both are confirmed Air Eagle OPERATING decisions,
+  not ANO-012 provisions; a regulation lookup answering with either
+  would misattribute an airline policy to the regulator. D7.1.2's
+  numbers are imported directly from `core/duty_builder.py`'s named
+  constants (can't drift, by construction). The other sections have no
+  named constants in `pcaa_ano012_core.py` (inline literals inside
+  `_check_cumulative_limits`/`required_rest_minutes`/etc.) — deliberately
+  NOT extracting those into named constants as part of this change, to
+  avoid touching the one file this project's own rules protect most
+  heavily for a reporting-only feature. Cross-checked instead by
+  boundary tests exercising the ACTUAL validator (see below) rather
+  than trusting a second, independently-typed copy of the same
+  numbers to stay in sync on its own.
+- `services/assistant/reports.py` — the seven functions
+  (`crew_duty_history`, `flight_records`, `crew_qualifications`,
+  `utilization`, `roster_coverage`, `audit_compliance`, `regulation`)
+  plus `run_report()`, a dispatcher keyed on `request.template`. Each
+  function reuses an existing canonical read function where one
+  exists, extended rather than duplicated, per the Ownership Table's
+  one-read-path-per-table convention:
+  - `crew_duty_history`/`utilization` -> `assignment_service.search_roster()`
+    (new — `get_roster_for_crew()` takes one crew_id and has no date
+    filtering; this branch's search needs a crew_id LIST plus a date
+    range).
+  - `flight_records`/`roster_coverage` -> `flight_service.get_all_flights()`
+    (extended with `date_from`/`date_to`/`flight_no` — was
+    `status_filter`/`origin`/`destination` only).
+  - `crew_qualifications` -> `crew_service.get_all_crew()` (unchanged;
+    filtered/reshaped here using `assignment_service.QUALIFICATION_EXPIRY_FIELDS`
+    as the single source of truth for which 8 fields matter, not a
+    second hardcoded list).
+  - `audit_compliance` -> `audit_service.get_audit_log()` (new —
+    `audit_service.py` was write-only, `log_audit()` only, until now;
+    this is the file's first-ever read function).
+  - `regulation` -> `services/assistant/regulation_reference.py`'s
+    `lookup()`.
+  `REPORT_FUNCTIONS`'s dict keys are asserted equal to
+  `query_parser.TEMPLATES`'s keys (minus `regulation`, handled as a
+  special case — see below) at import time — a future template added
+  to the parser without a matching report function now fails loudly at
+  import, not silently at runtime, per the plan's explicit SSOT
+  requirement.
+
+**The three approved-plan decisions, as actually implemented**:
+
+1. `crew_duty_history` stays sector-level (one row per roster row, not
+   deduped to one row per duty) with `duty_id` visible as its own
+   column, plus a `Dataset.notes` entry citing the Section 9
+   warning directly: "fdp_hours, report_time, and debrief_time are
+   duty-level values that repeat across every sector row sharing the
+   same duty_id ... do not sum fdp_hours across these rows without
+   first grouping by duty_id ... this is the single most repeated bug
+   in this platform's history." `utilization` is the function that
+   actually does the duty-level dedup, via `core/duty_summary.py`'s
+   `group_roster_rows_into_duties()`/`calculate_crew_duty_summary()` —
+   **this file's first real caller anywhere in this app**, confirmed
+   by `check_reachability.py` no longer flagging it once `reports.py`
+   existed. When `request.window_days` is set (a rolling-window
+   phrasing like "last 28 days"), `utilization` additionally calls
+   `calculate_max_rolling_fdp(duty_df, window_days)` and adds a
+   `peak_N_day_fdp_hours` column — a genuinely different number from
+   the range's own total, never conflated with it.
+2. `roster_coverage` scoped to the 4 confirmed-required roles (CPT,
+   FO, LM, ENGR — "Other Crew" deferred), each shown as a comma-joined
+   list of assigned crew_ids rather than a single value, `UNCOVERED`
+   only when a role's list is empty (not "not exactly 1") — because
+   real Air Eagle data shows a flight with 2 engineers assigned ("Eng:
+   2x VAI"), so more-than-one is expected, not an anomaly. A
+   `Dataset.notes` entry and an `Open stubs` bullet (above) both flag
+   that the actual required count per role is unconfirmed.
+3. `regulation` derives its answers from `pcaa_ano012_core.py`'s
+   actual enforced constants (via `regulation_reference.py`), not a
+   stored copy of the ANO-012 text extract that exists elsewhere in
+   the wider assistant bundle (verified, with SHA-256 provenance, but
+   not used here) — confirmed as the right v1 approach specifically
+   because the boundary tests below make drift detectable, which a
+   stored-text copy wouldn't be.
+
+**Gap resolved during implementation, not part of the original
+plan**: `query_parser.ReportRequest` doesn't carry the original
+question text forward once resolved (by design — the parser stays a
+pure form-filler). `regulation()` needs the raw question to know which
+D-section was actually asked about. Resolved by accepting `question:
+str` as an explicit second parameter on `regulation()` (and threaded
+through `run_report(request, question="")`), re-extracting the section
+via `query_parser.SECTION_RE` — the exact same regex the parser itself
+used to route to `regulation` in the first place — rather than
+modifying the already-merged, already-tested `query_parser.py` to
+retroactively store something it was deliberately built not to.
+
+**One filter enhancement found while wiring `flight_records`, not
+originally scoped**: `query_parser.parse_flight_no()` already extracts
+a flight number (e.g. "EPE 786") that had nowhere to go —
+`flight_service.get_all_flights()` had no flight_no parameter at all.
+Added one, extending the same canonical function rather than a new
+query path. The real stored format for `flights.flight_no` wasn't
+confirmed against actual operator data at the time this was written
+(only prose mentions of "EPE 786/787" exist in this file, not a
+verified column value), so the SQL match normalizes both sides
+(`REPLACE(UPPER(...), ' ', '')`) rather than assuming a specific
+spacing convention — proven in
+`test_flight_records_flight_no_matches_regardless_of_spacing` (a
+flight stored as `"EPE786"` still matches a request for `"EPE 786"`).
+
+**Boundary tests added specifically to backstop `regulation_reference.py`
+against drift** (`tests/test_assistant_reports.py`, no DB needed — the
+validator's methods are called directly): D9.1.1 (60h/7d),
+D9.1.2 (110h/14d), D9.1.3 (190h/28d), D9.2.1 (35h/7d), D9.2.2
+(100h/30d), D9.2.3 (1000h/365d) each get an exact at-limit/over-limit
+pair — confirmed the real `_check_cumulative_limits()` check is
+strictly-greater-than, not at-or-over, and confirmed the specific rule
+code only fires past its exact stated threshold, not before. D21.1
+(charter rest, `max(12h, 2xFDP)`) and D8.2.1 (the 13h00/12h00/11h00
+report-time bands) get one boundary test each, reusing the same
+`required_rest_minutes()`/`get_max_fdp_minutes()` public methods
+`test_pcaa_ano012_core.py` already exercises. D23.1/D23.2/D25 are NOT
+independently boundary-tested this round — flagged explicitly in
+`Open stubs` above rather than silently claimed as covered; re-deriving
+those three would need a materially larger duty-sequence setup than
+the others. All 8 boundary tests were confirmed to actually pass by
+direct interpreter execution in this sandbox (bypassing the DB-gated
+pytest fixture the same tests sit behind in the actual test file,
+which has no reachable database here) — genuinely run, not just
+traced by hand.
+
+**Test coverage**: 46 new tests. `tests/test_reporting_export.py` (18,
+pure logic, genuinely run here, all passing): `Dataset.build()`
+row-width validation, CSV/XLSX/Markdown rendering including the notes
+section/sheet, and `report_filename()` matching the operator's exact
+required format plus its sanitize-backstop behavior. `tests/test_assistant_reports.py`
+(28: 8 pure-logic boundary tests confirmed passing by direct
+interpreter execution as described above; 20 DB-integration tests, one
+or two per report function plus the `run_report()` dispatcher, traced
+by hand only — not run, no reachable database in this sandbox, flag
+this explicitly when verifying) — covers: sector-level, non-deduped
+`crew_duty_history` output with `duty_id` visible; `flight_records`
+including cancelled flights by default and the flight_no
+space-normalization fix; `crew_qualifications`'s expiry-window
+filtering; `utilization`'s duty-level dedup (the exact Section 9
+mistake, at the report layer) and its window_days peak column;
+`roster_coverage`'s uncovered-role detection and multi-crew-per-role
+handling (engineers) plus cancelled-flight exclusion;
+`audit_compliance`'s action-type and crew-id filtering;
+`regulation`'s question-text section extraction and its two distinct
+"nothing to say" cases (no section mentioned vs. a real but unimplemented
+section); `run_report()`'s rejection of unresolved requests and
+unknown templates, its `regulation`-question routing, and every
+template running end-to-end without error against an empty database.
+
+**Verification status**: 301 total on this branch — see "Tests
+passed" above for the exact breakdown. `pytest tests/`: 128 passed, 173
+skipped (no `TEST_DATABASE_URL` here). `check_reachability.py`:
+`services/assistant/reports.py` flagged (correct — not wired into a
+page yet); `core/duty_summary.py` no longer flagged. **NOT MERGED —
+explicit**, same discipline as every prior piece: the 20 DB-integration
+tests and every report function's actual behavior against real
+crew/flight/roster/audit_log data still need the user's own real-
+Postgres verification before this merges.
