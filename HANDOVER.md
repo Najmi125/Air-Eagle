@@ -235,9 +235,27 @@ user against real Postgres 16 (190/190, D9.2.3 confirmed empirically
 firing with ~300 seeded duties); its roster-status migration,
 originally also numbered 008 in parallel, renumbered to 009 and
 rebased onto `main` post-field-removal-merge before merging. See the
-2026-08-01 log entries for full detail on both. See "Next safest
-step" for what's queued next (item 6: Control Room transactional
-atomicity, or item 7: the age-pairing rule).
+2026-08-01 log entries for full detail on both.
+
+On top of that: the user's own real-Postgres verification of Step 5
+surfaced a new, real problem — a single assignment against ~300
+seeded duties returned 2,215 alerts across 11 rule codes in 1.26s
+(one alert per breached rule PER historical duty, not one per breach
+— `_check_cumulative_limits()`'s per-duty loop, now with 370 days of
+history to iterate instead of 35), rendered in uncapped loops on all
+three pages, and joined unfiltered into one audit_log row (~150KB
+measured). Fixed on branch `alert-summarization` — see the dedicated
+log entry below for full detail. **Not yet merged, not yet verified
+against any real database** — collection/non-DB tests confirmed
+locally only (12 new pure-logic tests in tests/test_alert_summary.py
+actually executed and passing here, since they need no DB; the 5 new
+DB-integration tests in test_assignment_service.py are hand-traced
+only, same limitation as every DB-dependent piece of this session's
+work). See "Next safest step" for what's queued next once this lands
+(item 6: Control Room transactional atomicity, item 7: the
+age-pairing rule, or find_legal_candidates_for_duty()'s separate
+per-candidate performance problem, explicitly deferred out of this
+branch's scope).
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -278,19 +296,31 @@ env-override fix.
   connection.
 
 ## Tests passed
-190 total on `main` after both merges — tests/test_migrations.py (4),
+207 total on branch `alert-summarization` (190 on `main` + 17 new: 12
+pure-logic in the new tests/test_alert_summary.py, 5 DB-integration in
+test_assignment_service.py) — tests/test_migrations.py (4),
 tests/test_duty_summary.py (10), tests/test_pcaa_ano012_core.py (12),
 tests/test_schema.py (18), tests/test_audit_service.py (3),
 tests/test_crew_service.py (21), tests/test_crew_data_page.py (4),
 tests/test_duty_builder.py (12), tests/test_flight_service.py (15),
 tests/test_flight_log_page.py (5), tests/test_assignment_service.py
-(61), tests/test_control_room_page.py (5), tests/test_roster_page.py
+(66), tests/test_control_room_page.py (5), tests/test_roster_page.py
 (4), tests/test_import_crew_script.py (12), tests/test_env_override.py
-(4). Both merged branches independently verified by the user against
-real Postgres 16 before merging — 178/178
-(`remove-type-rating-contract-fields`) and 190/190
-(`step5-stale-data-fixes`, on top of that) — see the 2026-08-01 log
-entries for full detail on each.
+(4), tests/test_alert_summary.py (12, new).
+
+Both merged branches independently verified by the user against real
+Postgres 16 before merging — 178/178 (`remove-type-rating-contract-fields`)
+and 190/190 (`step5-stale-data-fixes`, on top of that) — see the
+2026-08-01 log entries for full detail on each.
+
+`alert-summarization`'s 12 new pure-logic tests were actually run and
+pass locally (0.41s, no DB needed — see the dedicated log entry
+below). Its 5 new DB-integration tests, and re-verification of the
+190 pre-existing ones on top of the new AssignmentResult.alert_summary
+field, have **not** been run against any database — **TBC pending the
+user's real-Postgres re-run of the ~300-duty scenario**, which will
+also produce the actual before/after alert-count and audit-row-size
+numbers for the dedicated log entry below (currently placeholders).
 
 177/177 independently verified against real Postgres 16 (2026-07-31,
 `qualification-gate` branch, commit `45252da`) — this covers the
@@ -415,6 +445,24 @@ phase so far:
    a new assignment_service.cancel_flight_and_roster(). Both new
    wrappers live in assignment_service.py, not flight_service.py —
    see the log entry for why.
+5b. ~~Alert-volume explosion, found during Step 5's own real-Postgres
+   verification~~ DONE (2026-08-01, branch `alert-summarization` —
+   NOT YET MERGED, NOT YET VERIFIED against a real database, see the
+   dedicated log entry below). A direct, unplanned consequence of item
+   5: with 370 days of history to iterate instead of 35,
+   `_check_cumulative_limits()`'s one-alert-per-breached-rule-PER-
+   HISTORICAL-DUTY design produced 2,215 alerts for a single
+   assignment against ~300 seeded duties. New `services/alert_summary.py`
+   collapses historical repetition into per-rule-code counts (never
+   touching `ValidationResult.status`/`legality_status` — an
+   assignment resting on a genuine historical breach still reports
+   ILLEGAL) and adds `blocked_by_history_only` so a controller can
+   tell whether an assignment attempt is itself the cause or the crew
+   member already had disqualifying history. Also fixed one real
+   correctness bug found in passing: one of 5 audit-log join sites
+   (`_recompute_one_duty_after_delay()`) was unfiltered by status
+   entirely. `find_legal_candidates_for_duty()`'s own, separate,
+   larger per-candidate cost is explicitly deferred, not touched here.
 6. True transactional atomicity for Control Room's flight+assignment
    write — currently 4 separate `engine.begin()` blocks, not one
    transaction, so the "no orphan flight on rejection" guarantee
@@ -572,6 +620,24 @@ against the legality-gate work above.
   update_flight() directly from a page or script for these cases —
   that bypasses the roster cascade / delay-revalidation these exist
   specifically to guarantee.
+- services/alert_summary.py — summarize_alerts()'s blocked_by_history_only
+  gate requires ALL of target_duty_alerts, qualification_alerts, AND
+  schedule_level_alerts to be zero-ILLEGAL, not just target_duty_alerts.
+  This is a deliberate, explicitly-confirmed conservative choice
+  (2026-08-01) — narrowing it to only check target_duty_alerts would
+  reopen the exact case this was built to prevent (an expired
+  medical, or a 7th-consecutive-duty-day, reported as "blocked by
+  pre-existing history, this duty is not the cause" — backwards).
+  Don't add a 5th bucket without checking whether it also needs to
+  gate this field.
+- core/legality/pcaa_ano012_core.py — any new `_check_*` method that
+  builds a RuleAlert without passing `duty_id` will be classified by
+  services/alert_summary.py's summarize_alerts() as either a
+  qualification alert (if rule_code starts with "AE-CREW-QUAL-001")
+  or a schedule-level alert (everything else with duty_id=None) —
+  there is no third silent category. If a future rule genuinely needs
+  its own bucket, that's a deliberate change to summarize_alerts(),
+  not something to work around by giving it a fake duty_id.
 
 ## 2026-07-21: real data arrived — data quality findings, FTL
 ## exemption, schema reconciliation (unpushed as of this snapshot)
@@ -1370,3 +1436,172 @@ seeded duties, not just traced by hand. Migration renumbered to 009
 per the collision note above, rebased onto `main` (which by this
 point already had `remove-type-rating-contract-fields` merged), and
 merged.
+
+## 2026-08-01: alert-volume explosion found during Step 5's own
+## verification — fixed via services/alert_summary.py, planned before
+## implementation, NOT yet verified against a real database
+
+Direct, unplanned consequence of Step 5's own LOOKBACK_DAYS widening
+(35 -> 370), caught by the user's real-Postgres re-verification of
+that same change: `core/legality/pcaa_ano012_core.py`'s
+`_check_cumulative_limits()` emits one `RuleAlert` per breached rule
+**per historical duty** in the crew member's rolling window, not one
+per breach overall — with 35 days of history this was rarely visible;
+with 370, a crew member who has been over a limit for months now
+generates one alert per historical duty in that stretch. Measured: a
+single assignment attempt against ~300 seeded duties returned **2,215
+alerts across 11 rule codes in 1.26s**. `pages/4_Roster.py` and
+`pages/1_Control_Room.py` (3 render loops each) and
+`pages/3_Flight_Log.py` (1 loop, multipliable across several crew/duty
+pairs affected by one delay) all rendered `result.alerts` in uncapped
+loops — a controller making one assignment would see thousands of
+lines. Separately, `services/assignment_service.py` joined alert
+messages into `audit_log.warning_or_failure_reason` (a `TEXT` column,
+no length limit, so no write failure — but **~150KB in one row**
+measured against the 2,215-alert case) at 5 sites; one of those 5
+(`_recompute_one_duty_after_delay()`) had **no status filter at all**
+— a real correctness bug independent of volume, since it could log
+WARNING/LEGAL-tier alert text into a NEEDS_REVIEW/ILLEGAL audit entry.
+
+**Planned before implementation, same discipline as every fix this
+session**: proposed a plan, the user verified two specific claims
+against the actual code before approving (the unfiltered join site,
+and that `_check_crew_qualifications()` also builds `duty_id`-less
+alerts — a 4th classification, not the 3 originally proposed), and
+confirmed the conservative design for the new diagnostic field before
+any code was written.
+
+**The fix — new `services/alert_summary.py`**, pure Python, no
+`streamlit`/`get_engine()` import — same placement principle as
+`FTL_EXEMPT_ROLES`/the qualification gate: presentation/orchestration
+decisions stay out of `core/legality/pcaa_ano012_core.py`, which stays
+a pure, airline/UI-agnostic rule engine. Mirrors `core/duty_summary.py`'s
+shape (a separate, pure, presentation module tested without a DB
+fixture).
+
+`summarize_alerts(validation_result, target_duty_id)` buckets every
+alert into exactly one of four groups, by `duty_id`/`rule_code`:
+- **target_duty_alerts** — `duty_id == target_duty_id`: the duty this
+  call is actually about.
+- **qualification_alerts** — `duty_id is None`, `rule_code` starts
+  with `AE-CREW-QUAL-001` (from `_check_crew_qualifications()` in this
+  same file — the crew member's *current* documents, not duty
+  history).
+- **schedule_level_alerts** — `duty_id is None`, everything else
+  (currently only `D23.1_MANDATORY_5_DAYS_OFF` /
+  `D23.2_SEVENTH_DAY_OFF` — genuine whole-schedule patterns, not tied
+  to one duty).
+- **historical_counts** — everything else (`duty_id` set, not
+  `target_duty_id`), collapsed to one `HistoricalAlertCount` per
+  `rule_code` — this is what actually fixes the 2,215-alert case:
+  "D9.2.3 breached in 187 historical duties," not 187 separate lines.
+
+`ValidationResult.status`/`AssignmentResult.legality_status` are
+completely untouched by any of this — `summarize_alerts()` only
+reshapes what's displayed/logged, never what determines legality. An
+assignment resting on a real historical breach still reports ILLEGAL.
+
+**New field: `blocked_by_history_only`** — `True` only when overall
+status is ILLEGAL AND `target_duty_alerts` + `qualification_alerts` +
+`schedule_level_alerts` contain zero ILLEGAL alerts between them, i.e.
+every ILLEGAL alert present is historical. Deliberately conservative,
+confirmed explicitly with the user rather than assumed: a genuinely
+ambiguous case (this duty is what pushes a 6-day streak to a 7th, or
+the crew member's medical happens to have expired) must report
+`False`, not guess `True`. The 4th-bucket catch matters concretely
+here — without separating qualification alerts from schedule-level
+ones, an expired medical could have been reported as "blocked by
+pre-existing history, this duty is not the cause," which is exactly
+backwards and the single most misleading thing this feature could
+say. Both the schedule-level-alone and qualification-alone cases have
+dedicated regression tests, at both the pure-logic and DB-integration
+level.
+
+**Also in `services/alert_summary.py`**: `build_audit_reason(summary,
+statuses)` replaces all 5 previously-duplicated inline audit-message
+joins in `assignment_service.py` — includes non-historical alerts
+matching `statuses` in full, summarizes historical ones to one line
+per rule_code. The `_recompute_one_duty_after_delay()` call site now
+correctly filters to `{ILLEGAL, NEEDS_MANUAL_REVIEW}` (matching the
+`now_needs_review` condition that already gated it) instead of joining
+every alert unfiltered — the correctness fix, not just the volume one.
+`format_alert_lines(summary)` produces the markdown lines all 7 page
+render loops now use (3 in `4_Roster.py`, 3 in `1_Control_Room.py`, 1
+in `3_Flight_Log.py`) instead of the previous uncapped
+`for alert in result.alerts` loops.
+
+**Wiring**: `AssignmentResult` gained one additive field,
+`alert_summary` (the existing `alerts` field is untouched — nothing
+that already reads it needed to change). Computed once per call in
+`assign_crew_to_duty()`/`assign_crew_to_new_flights()` right after
+`_validate_new_duty()`, passed into all 6 `AssignmentResult(...)`
+construction sites. `_recompute_one_duty_after_delay()`'s return
+widened from a 2-tuple to a 3-tuple (safe — exactly one caller in the
+whole codebase); `update_flight_actual_times_and_revalidate()`'s
+result dicts gained one additive key to match.
+`find_legal_candidates_for_duty()` — **not touched**, confirmed it
+never reads `.alerts`, never builds `AssignmentResult`, never calls
+`log_audit()`. Its own, separate, larger per-candidate cost (runs full
+`validate_schedule()` once per candidate, discards every alert for a
+single boolean) is explicitly deferred — likely a `fail_fast`
+early-exit parameter on `validate_schedule()` itself later, a
+core-engine change rather than a presentation one.
+
+**Test coverage**: 12 new pure-logic tests in the new
+`tests/test_alert_summary.py` (no DB — `RuleAlert`/`ValidationResult`/
+`AlertSummary` are plain dataclasses, same principle as
+`test_pcaa_ano012_core.py`/`test_duty_summary.py`) — **these actually
+ran and passed locally, 0.41s**, the first tests all session able to
+execute for real in this environment rather than only being traced by
+hand. Cover: bucketing by `duty_id`, collapsing many historical alerts
+to one count per rule_code, qualification vs. schedule-level
+non-conflation, `blocked_by_history_only` true/false in five distinct
+scenarios (pure-historical, target-duty-has-its-own, schedule-level-alone,
+qualification-alone, status-not-ILLEGAL-at-all),
+`build_audit_reason()` filtering and historical summarization,
+`format_alert_lines()` section-omission and the exact blocked-by-history
+sentence.
+
+5 new DB-integration tests added to `test_assignment_service.py`, via
+a new `_seed_many_duties()` helper (spacing duties 3 days apart, not
+daily, specifically to avoid tripping `D23.1`/`D23.2` while
+accumulating a genuine `D9.1.3` breach — see that helper's own
+docstring for the reasoning) plus a shared
+`_seed_heavy_history_and_assign_far_future()` setup: a pure-historical
+ILLEGAL breach correctly reports `blocked_by_history_only=True`
+(and, in a dedicated separately-named test, that `status`/
+`legality_status` stay correctly `"ILLEGAL"` — the core guarantee);
+the identical seed with the new duty placed inside the still-breached
+window instead reports `blocked_by_history_only=False`; the
+schedule-level edge case (6 legal daily duties, a 7th tripping only
+`D23.2_SEVENTH_DAY_OFF`) at the integration level, not just unit
+level; and the audit-row-size regression test (historical rule's
+message appears exactly once, row stays under a fixed bound). One
+existing test extended with an audit-non-empty assertion, confirming
+the now-filtered `_recompute_one_duty_after_delay()` call site is
+wired correctly (filter correctness itself already proven at the unit
+level).
+
+**Verification status — read before merging**: built and reasoned
+through in an environment with no reachable database at all (no
+TEST_DATABASE_URL, no local Postgres, no Docker) — same limitation as
+every DB-dependent piece of this session's work. Unlike everything
+else, though, the 12 new pure-logic tests genuinely executed here and
+passed, since `summarize_alerts()`/`build_audit_reason()`/
+`format_alert_lines()` need no database at all. The 5 new
+DB-integration tests, and the 190 pre-existing tests re-running
+against the new `AssignmentResult.alert_summary` field, were traced by
+hand against the actual schema and query behavior, including working
+through a real correction mid-way (the "very next day" scenario's
+dominant failure mode turned out to be the D21 rest floor, not
+D9.1.3, as first assumed — fixed in the test's own docstring before
+it could have been a misleading comment, not a wrong assertion).
+
+**TBC — pending the user's real-Postgres re-run of the ~300-duty
+scenario**: measured alert count before/after this fix, and the
+measured `audit_log.warning_or_failure_reason` row size before/after.
+Both numbers will be filled in here once available; do not assume
+either without checking back on this entry.
+
+Built on branch `alert-summarization`, off `main` at commit `245a13d`.
+Not yet merged.

@@ -12,6 +12,7 @@ called through the service layer.
 import streamlit as st
 
 from services import crew_service, flight_service, assignment_service
+from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
 st.title("Roster")
@@ -94,8 +95,8 @@ with st.form("assign_crew_form"):
             if result is not None:
                 if result.status == "REJECTED":
                     st.error(f"REJECTED — {result.legality_status}")
-                    for alert in result.alerts:
-                        st.write(f"- **{alert.rule_code}**: {alert.message}")
+                    for line in format_alert_lines(result.alert_summary):
+                        st.write(line)
                 elif result.status == "NEEDS_REVIEW":
                     st.warning(
                         f"HELD FOR MANUAL REVIEW — {result.legality_status}. "
@@ -103,8 +104,8 @@ with st.form("assign_crew_form"):
                         f"something the system can't determine automatically — "
                         f"an authorized reviewer needs to make this call."
                     )
-                    for alert in result.alerts:
-                        st.write(f"- **{alert.rule_code}**: {alert.message}")
+                    for line in format_alert_lines(result.alert_summary):
+                        st.write(line)
                     if result.computed_report_time:
                         st.write(
                             f"Computed duty (not saved): report "
@@ -116,8 +117,8 @@ with st.form("assign_crew_form"):
                     st.success(f"ALLOWED — assigned as {role_choice} (duty {result.duty_id})")
                     if result.legality_status != "LEGAL":
                         st.warning(f"Status: {result.legality_status}")
-                        for alert in result.alerts:
-                            st.write(f"- **{alert.rule_code}**: {alert.message}")
+                        for line in format_alert_lines(result.alert_summary):
+                            st.write(line)
 
                     if result.downstream_conflicts:
                         st.error(

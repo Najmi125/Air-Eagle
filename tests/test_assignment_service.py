@@ -109,6 +109,66 @@ def _seed_duty(engine, crew_id, flight_id, role_assigned, report_time, debrief_t
     return duty_id
 
 
+def _seed_many_duties(engine, crew_id, role, start_date, count, duty_hours=24, spacing_days=3):
+    """
+    Seeds `count` historical duties via _add_flight() + _seed_duty()
+    (both existing helpers above, untouched) — bypasses the
+    assignment API entirely, same reason as every other _seed_duty()
+    use in this file. Each duty needs its own distinct flight_id: the
+    active partial unique index on (crew_id, flight_id, role_assigned)
+    (migrations/005_roster_partial_unique_index.sql) only allows one
+    ACTIVE assignment per (flight, role) at a time.
+
+    Duties are spaced `spacing_days` apart (default 3, not 1) and
+    each duty's report_time/debrief_time span is exactly duty_hours.
+    Deliberately NOT consecutive calendar dates: with spacing_days=3,
+    no duty-date streak ever exceeds 1, so D23.2_SEVENTH_DAY_OFF never
+    fires, and duty-days per calendar month stay well under 20, so
+    D23.1_MANDATORY_5_DAYS_OFF's `represented_days < 20` skip also
+    keeps it from firing — both are schedule-level checks unrelated
+    to what a caller seeding "many historical duties" is usually
+    trying to set up, and either firing would land an unwanted
+    ILLEGAL alert in schedule_level_alerts, contaminating a
+    blocked_by_history_only=True scenario. The underlying flight's
+    dep/arr exactly matches report/debrief (no buffer), so
+    flight_time == duty_time for D9.2.x purposes too — callers
+    choosing count/duty_hours should keep the total under 1000h to
+    avoid also tripping D9.2.3 (1000h/365-day) alongside D9.1.3
+    (190h/28-day).
+    """
+    duty_ids = []
+    for i in range(count):
+        report = start_date + dt.timedelta(days=i * spacing_days)
+        debrief = report + dt.timedelta(hours=duty_hours)
+        flight_id = _add_flight(report, debrief)
+        duty_ids.append(_seed_duty(engine, crew_id, flight_id, role, report, debrief,
+                                    fdp_hours=float(duty_hours)))
+    return duty_ids
+
+
+def _seed_heavy_history_and_assign_far_future(engine, crew_id):
+    """
+    Shared setup for the alert-summarization tests below: 40 historical
+    duties (spacing_days=3, duty_hours=24 -> ~216h in any dense 28-day
+    window, comfortably over D9.1.3's 190h limit; 960h total, safely
+    under D9.2.3's 1000h/365-day limit) followed by one new short
+    domestic assignment 45 days after the last seeded duty ends — far
+    enough that the new duty's OWN 7/14/28-day windows are clean, but
+    still inside LOOKBACK_DAYS=370 so the historical breaches are
+    still loaded and re-evaluated (the actual mechanism behind the
+    2,215-alert scenario this feature fixes).
+    """
+    start = dt.datetime(2026, 1, 1, 6, 0)
+    _seed_many_duties(engine, crew_id, "CPT", start, count=40, duty_hours=24, spacing_days=3)
+
+    # Last seeded duty (i=39): report = start + 117d, debrief = +118d.
+    last_debrief = start + dt.timedelta(days=39 * 3, hours=24)
+    new_dep = last_debrief + dt.timedelta(days=45)
+    new_arr = new_dep + dt.timedelta(hours=2)
+    flight_id = _add_flight(new_dep, new_arr)
+    return assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+
 # ------------------------------------------------------------------
 # Immediate legality gate
 # ------------------------------------------------------------------
@@ -1117,6 +1177,14 @@ def test_delay_recompute_flags_needs_review_when_no_longer_legal(_patch_engine):
 
     audit = _audit_rows(_patch_engine, "DUTY_FLAGGED_FOR_REVIEW_AFTER_DELAY")
     assert len(audit) == 1
+    # Confirms the now-filtered build_audit_reason() call at
+    # _recompute_one_duty_after_delay() (previously an unfiltered
+    # "; ".join(a.message for a in validation_result.alerts) — a real
+    # correctness bug, not just a volume one) is actually wired up:
+    # a genuine NEEDS_MANUAL_REVIEW case must still produce a real
+    # reason, not None. Filter correctness itself is proven at the
+    # unit level in tests/test_alert_summary.py.
+    assert audit.iloc[0]["warning_or_failure_reason"]
 
 
 def test_delay_recompute_handles_multiple_crew_on_same_flight_independently(_patch_engine):
@@ -1185,3 +1253,107 @@ def test_delay_recompute_detects_downstream_conflict_on_other_future_duties(_pat
 
     assert len(outcomes[0]["downstream_conflicts"]) == 1
     assert outcomes[0]["downstream_conflicts"][0].flight_ids == [future_flight]
+
+
+# ------------------------------------------------------------------
+# Alert summarization (2026-08-01) — see services/alert_summary.py.
+# Bucketing/collapsing correctness is proven at the unit level in
+# tests/test_alert_summary.py; these confirm the real wiring: many
+# historical duties genuinely produce many historical RuleAlerts
+# through the real assignment API, AssignmentResult.alert_summary
+# reflects the correct buckets, status is unaffected by summarization,
+# and the audit log actually gets a bounded reason instead of one
+# line per historical duty.
+# ------------------------------------------------------------------
+
+def test_assign_crew_to_duty_illegal_from_pure_historical_breach_reports_blocked_by_history_true(_patch_engine):
+    crew_id = _add_crew("CPT")
+    result = _seed_heavy_history_and_assign_far_future(_patch_engine, crew_id)
+
+    assert result.status == "REJECTED"
+    assert not any(a.status == "ILLEGAL" for a in result.alert_summary.target_duty_alerts)
+    assert any(hc.status == "ILLEGAL" for hc in result.alert_summary.historical_counts)
+    assert result.alert_summary.blocked_by_history_only is True
+
+
+def test_assign_crew_to_duty_status_stays_illegal_even_though_only_historical_data_breaches(_patch_engine):
+    """The core correctness guarantee, named explicitly per the
+    requirement: summarization must never change what actually
+    determines legality — an assignment resting on a genuine
+    historical breach must still report ILLEGAL overall."""
+    crew_id = _add_crew("CPT")
+    result = _seed_heavy_history_and_assign_far_future(_patch_engine, crew_id)
+
+    assert result.status == "REJECTED"
+    assert result.legality_status == "ILLEGAL"
+
+
+def test_assign_crew_to_duty_illegal_from_its_own_breach_reports_blocked_by_history_false(_patch_engine):
+    """Same 40-duty seed, but the new duty is the very next day —
+    only ~23h after a 24h-FDP duty, well under the D21 rest floor
+    (max(12h, 2x24h)=48h) required after it, so the new duty's OWN
+    checks breach too (rest, and/or D9.1.3's 28-day window, which is
+    still dominated by the recent seeded stretch this close to it).
+    blocked_by_history_only must be False either way: this duty
+    genuinely contributes to the breach, not just pre-existing
+    history."""
+    crew_id = _add_crew("CPT")
+    start = dt.datetime(2026, 1, 1, 6, 0)
+    _seed_many_duties(_patch_engine, crew_id, "CPT", start, count=40, duty_hours=24, spacing_days=3)
+
+    last_debrief = start + dt.timedelta(days=39 * 3, hours=24)
+    new_dep = last_debrief + dt.timedelta(days=1)
+    new_arr = new_dep + dt.timedelta(hours=2)
+    flight_id = _add_flight(new_dep, new_arr)
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "REJECTED"
+    assert any(a.status == "ILLEGAL" for a in result.alert_summary.target_duty_alerts)
+    assert result.alert_summary.blocked_by_history_only is False
+
+
+def test_seventh_day_off_illegal_alone_does_not_claim_blocked_by_history(_patch_engine):
+    """Schedule-level edge case at the integration level: 6 short
+    legal daily duties, a 7th that trips only D23.2_SEVENTH_DAY_OFF —
+    genuinely could be caused by this duty (it's the 7th consecutive
+    day), so blocked_by_history_only must stay False, the confirmed
+    conservative default."""
+    crew_id = _add_crew("CPT")
+    base = dt.datetime(2026, 3, 1, 5, 45)
+    for day in range(6):
+        dep = base + dt.timedelta(days=day)
+        arr = dep + dt.timedelta(hours=2)
+        flight_id = _add_flight(dep, arr)
+        result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+        assert result.status == "ALLOWED", f"day {day} setup failed: {result.legality_status}"
+
+    seventh_dep = base + dt.timedelta(days=6)
+    seventh_arr = seventh_dep + dt.timedelta(hours=2)
+    seventh_flight = _add_flight(seventh_dep, seventh_arr)
+    result = assignment_service.assign_crew_to_duty(crew_id, [seventh_flight], "CPT")
+
+    assert result.status == "REJECTED"
+    assert result.legality_status == "ILLEGAL"
+    assert any(
+        a.rule_code == "D23.2_SEVENTH_DAY_OFF" and a.status == "ILLEGAL"
+        for a in result.alert_summary.schedule_level_alerts
+    )
+    assert result.alert_summary.blocked_by_history_only is False
+
+
+def test_audit_log_reason_bounded_for_many_historical_breaches(_patch_engine):
+    """Direct regression test for the measured ~150KB audit row: the
+    historical rule's message must appear exactly once (summarized
+    with a count), not once per historical duty."""
+    crew_id = _add_crew("CPT")
+    result = _seed_heavy_history_and_assign_far_future(_patch_engine, crew_id)
+    assert result.status == "REJECTED"
+
+    audit = _audit_rows(_patch_engine, "ASSIGNMENT_REJECTED")
+    assert len(audit) == 1
+    reason = audit.iloc[0]["warning_or_failure_reason"]
+    assert reason is not None
+    assert len(reason) < 5000
+
+    historical_rule = result.alert_summary.historical_counts[0].rule_code
+    assert reason.count(historical_rule) == 1
