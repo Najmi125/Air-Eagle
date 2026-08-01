@@ -244,14 +244,14 @@ seeded duties returned 2,215 alerts across 11 rule codes in 1.26s
 — `_check_cumulative_limits()`'s per-duty loop, now with 370 days of
 history to iterate instead of 35), rendered in uncapped loops on all
 three pages, and joined unfiltered into one audit_log row (~150KB
-measured). Fixed on branch `alert-summarization` — see the dedicated
-log entry below for full detail. **Not yet merged, not yet verified
-against any real database** — collection/non-DB tests confirmed
-locally only (12 new pure-logic tests in tests/test_alert_summary.py
-actually executed and passing here, since they need no DB; the 5 new
-DB-integration tests in test_assignment_service.py are hand-traced
-only, same limitation as every DB-dependent piece of this session's
-work). See "Next safest step" for what's queued next once this lands
+measured). Fixed on branch `alert-summarization`, **verified by the
+user against real Postgres 16 and merged into `main`** — 207/207
+passing; the same 299-duty scenario re-measured on both `main` and
+the branch showed display lines 2,216 -> 29 (-98.7%) and the audit
+row 128,685 -> 2,253 chars (-98.3%), with the raw alert count (2,216)
+and the REJECTED/ILLEGAL result identical on both — confirming
+summarization is display-only. See the dedicated log entry below for
+full detail. See "Next safest step" for what's queued next
 (item 6: Control Room transactional atomicity, item 7: the
 age-pairing rule, or find_legal_candidates_for_duty()'s separate
 per-candidate performance problem, explicitly deferred out of this
@@ -308,19 +308,11 @@ tests/test_flight_log_page.py (5), tests/test_assignment_service.py
 (4), tests/test_import_crew_script.py (12), tests/test_env_override.py
 (4), tests/test_alert_summary.py (12, new).
 
-Both merged branches independently verified by the user against real
-Postgres 16 before merging — 178/178 (`remove-type-rating-contract-fields`)
-and 190/190 (`step5-stale-data-fixes`, on top of that) — see the
-2026-08-01 log entries for full detail on each.
-
-`alert-summarization`'s 12 new pure-logic tests were actually run and
-pass locally (0.41s, no DB needed — see the dedicated log entry
-below). Its 5 new DB-integration tests, and re-verification of the
-190 pre-existing ones on top of the new AssignmentResult.alert_summary
-field, have **not** been run against any database — **TBC pending the
-user's real-Postgres re-run of the ~300-duty scenario**, which will
-also produce the actual before/after alert-count and audit-row-size
-numbers for the dedicated log entry below (currently placeholders).
+All three merged branches independently verified by the user against
+real Postgres 16 before merging — 178/178 (`remove-type-rating-contract-fields`),
+190/190 (`step5-stale-data-fixes`, on top of that), and 207/207
+(`alert-summarization`, on top of that) — see the 2026-08-01 log
+entries for full detail on each.
 
 177/177 independently verified against real Postgres 16 (2026-07-31,
 `qualification-gate` branch, commit `45252da`) — this covers the
@@ -447,8 +439,9 @@ phase so far:
    see the log entry for why.
 5b. ~~Alert-volume explosion, found during Step 5's own real-Postgres
    verification~~ DONE (2026-08-01, branch `alert-summarization` —
-   NOT YET MERGED, NOT YET VERIFIED against a real database, see the
-   dedicated log entry below). A direct, unplanned consequence of item
+   verified by the user against real Postgres 16, 207/207, merged
+   into `main`; see the dedicated log entry below for the full
+   measured before/after). A direct, unplanned consequence of item
    5: with 370 days of history to iterate instead of 35,
    `_check_cumulative_limits()`'s one-alert-per-breached-rule-PER-
    HISTORICAL-DUTY design produced 2,215 alerts for a single
@@ -456,10 +449,11 @@ phase so far:
    collapses historical repetition into per-rule-code counts (never
    touching `ValidationResult.status`/`legality_status` — an
    assignment resting on a genuine historical breach still reports
-   ILLEGAL) and adds `blocked_by_history_only` so a controller can
-   tell whether an assignment attempt is itself the cause or the crew
-   member already had disqualifying history. Also fixed one real
-   correctness bug found in passing: one of 5 audit-log join sites
+   ILLEGAL, confirmed on the exact same measured scenario) and adds
+   `blocked_by_history_only` so a controller can tell whether an
+   assignment attempt is itself the cause or the crew member already
+   had disqualifying history. Also fixed one real correctness bug
+   found in passing: one of 5 audit-log join sites
    (`_recompute_one_duty_after_delay()`) was unfiltered by status
    entirely. `find_legal_candidates_for_duty()`'s own, separate,
    larger per-candidate cost is explicitly deferred, not touched here.
@@ -1582,26 +1576,51 @@ the now-filtered `_recompute_one_duty_after_delay()` call site is
 wired correctly (filter correctness itself already proven at the unit
 level).
 
-**Verification status — read before merging**: built and reasoned
-through in an environment with no reachable database at all (no
-TEST_DATABASE_URL, no local Postgres, no Docker) — same limitation as
-every DB-dependent piece of this session's work. Unlike everything
-else, though, the 12 new pure-logic tests genuinely executed here and
-passed, since `summarize_alerts()`/`build_audit_reason()`/
-`format_alert_lines()` need no database at all. The 5 new
-DB-integration tests, and the 190 pre-existing tests re-running
-against the new `AssignmentResult.alert_summary` field, were traced by
-hand against the actual schema and query behavior, including working
-through a real correction mid-way (the "very next day" scenario's
-dominant failure mode turned out to be the D21 rest floor, not
-D9.1.3, as first assumed — fixed in the test's own docstring before
-it could have been a misleading comment, not a wrong assertion).
+**Verification status, at the time this was written**: built and
+reasoned through in an environment with no reachable database at all
+(no TEST_DATABASE_URL, no local Postgres, no Docker) — same limitation
+as every DB-dependent piece of this session's work. The 12 new
+pure-logic tests genuinely executed here and passed, since
+`summarize_alerts()`/`build_audit_reason()`/`format_alert_lines()` need
+no database at all. The 5 new DB-integration tests, and the 190
+pre-existing tests re-running against the new
+`AssignmentResult.alert_summary` field, were traced by hand against
+the actual schema and query behavior, including working through a
+real correction mid-way (the "very next day" scenario's dominant
+failure mode turned out to be the D21 rest floor, not D9.1.3, as first
+assumed — fixed in the test's own docstring before it could have been
+a misleading comment, not a wrong assertion).
 
-**TBC — pending the user's real-Postgres re-run of the ~300-duty
-scenario**: measured alert count before/after this fix, and the
-measured `audit_log.warning_or_failure_reason` row size before/after.
-Both numbers will be filled in here once available; do not assume
-either without checking back on this entry.
+**RESOLVED 2026-08-01 (same day, following verification)**: the user
+independently verified this branch against real Postgres 16 —
+207/207 passing, zero failures. Re-measured the same before/after
+scenario on both `main` and this branch with identical seeded data
+(299 duties, 2,168 flight hours) rather than the earlier ~300-duty
+estimate:
 
-Built on branch `alert-summarization`, off `main` at commit `245a13d`.
+| Metric | Before (`main`) | After (this branch) | Change |
+|---|---|---|---|
+| Display lines rendered | 2,216 | 29 | -98.7% |
+| `audit_log.warning_or_failure_reason` size | 128,685 chars | 2,253 chars | -98.3% |
+| Assignment time | 0.78s | 0.84s | negligible |
+| Raw alert count | 2,216 | 2,216 (unchanged) | — |
+| Result | REJECTED / ILLEGAL | REJECTED / ILLEGAL (unchanged) | — |
+
+The unchanged raw alert count and unchanged REJECTED/ILLEGAL result
+across both runs is the direct confirmation that summarization is
+display-only — the deterministic legality outcome was never touched.
+(The original ~150KB estimate quoted earlier in this file was an
+estimate from the initial bug report, not a measurement — 128,685
+chars is the actual measured figure and supersedes it; the 2,215 vs.
+2,216 and "~300" vs. 299-duty figures are two distinct measurement
+runs with their own exact seed data, not a discrepancy.)
+
+Bucket breakdown on the measured scenario: 7 target-duty alerts, 0
+qualification alerts, 11 schedule-level alerts, 8 distinct
+historical-collapsed rule codes. `blocked_by_history_only=False` —
+correctly so, since the target duty itself carried real ILLEGAL
+alerts in this scenario, not a pure-historical-only breach.
+
+Built on branch `alert-summarization`, off `main` at commit `245a13d`,
+merged into `main` after the verification above.
 Not yet merged.
