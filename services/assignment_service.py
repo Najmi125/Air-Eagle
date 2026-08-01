@@ -47,6 +47,7 @@ from core.duty_builder import (
 from core.legality.pcaa_ano012_core import (
     ANO012CoreValidator, CrewMember, Duty, Sector, DutyType, AlertStatus, ValidationResult, RuleAlert,
 )
+from services.alert_summary import summarize_alerts, build_audit_reason, AlertSummary
 
 validator = ANO012CoreValidator()
 
@@ -197,6 +198,11 @@ class AssignmentResult:
     status: str  # "ALLOWED", "REJECTED", or "NEEDS_REVIEW"
     legality_status: str
     alerts: list
+    # Bucketed view of `alerts` for display/audit — see
+    # services/alert_summary.py. `alerts` itself is untouched (full
+    # fidelity, still consumed directly by existing callers/tests);
+    # this is additive.
+    alert_summary: Optional["AlertSummary"] = None
     roster_ids: List[int] = field(default_factory=list)
     duty_id: Optional[str] = None
     downstream_conflicts: List[DownstreamConflict] = field(default_factory=list)
@@ -408,6 +414,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
 
     validation_result, new_duty, crew_member, crew_row, duty_result = _validate_new_duty(
         engine, crew_id, legs, domestic, role_assigned)
+    alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
         log_audit(
@@ -416,13 +423,14 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             affected_flight=flight_ids[0],
             affected_duty=new_duty.duty_id,
             legality_result=validation_result.status.value,
-            warning_or_failure_reason="; ".join(a.message for a in validation_result.alerts if a.status == AlertStatus.ILLEGAL),
+            warning_or_failure_reason=build_audit_reason(alert_summary, frozenset({AlertStatus.ILLEGAL})),
             app_user=app_user,
         )
         return AssignmentResult(
             status="REJECTED",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            alert_summary=alert_summary,
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
@@ -444,15 +452,15 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             affected_flight=flight_ids[0],
             affected_duty=new_duty.duty_id,
             legality_result=validation_result.status.value,
-            warning_or_failure_reason="; ".join(
-                a.message for a in validation_result.alerts
-                if a.status == AlertStatus.NEEDS_MANUAL_REVIEW),
+            warning_or_failure_reason=build_audit_reason(
+                alert_summary, frozenset({AlertStatus.NEEDS_MANUAL_REVIEW})),
             app_user=app_user,
         )
         return AssignmentResult(
             status="NEEDS_REVIEW",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            alert_summary=alert_summary,
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
@@ -497,6 +505,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         status="ALLOWED",
         legality_status=validation_result.status.value,
         alerts=validation_result.alerts,
+        alert_summary=alert_summary,
         roster_ids=roster_ids,
         duty_id=new_duty.duty_id,
         downstream_conflicts=downstream_conflicts,
@@ -546,6 +555,7 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
 
     validation_result, new_duty, crew_member, crew_row, duty_result = _validate_new_duty(
         engine, crew_id, legs, domestic, role_assigned)
+    alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
         log_audit(
@@ -553,13 +563,14 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             affected_crew=crew_id,
             affected_duty=new_duty.duty_id,
             legality_result=validation_result.status.value,
-            warning_or_failure_reason="; ".join(a.message for a in validation_result.alerts if a.status == AlertStatus.ILLEGAL),
+            warning_or_failure_reason=build_audit_reason(alert_summary, frozenset({AlertStatus.ILLEGAL})),
             app_user=app_user,
         )
         return AssignmentResult(
             status="REJECTED",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            alert_summary=alert_summary,
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
@@ -575,15 +586,15 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             affected_crew=crew_id,
             affected_duty=new_duty.duty_id,
             legality_result=validation_result.status.value,
-            warning_or_failure_reason="; ".join(
-                a.message for a in validation_result.alerts
-                if a.status == AlertStatus.NEEDS_MANUAL_REVIEW),
+            warning_or_failure_reason=build_audit_reason(
+                alert_summary, frozenset({AlertStatus.NEEDS_MANUAL_REVIEW})),
             app_user=app_user,
         )
         return AssignmentResult(
             status="NEEDS_REVIEW",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            alert_summary=alert_summary,
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
@@ -651,6 +662,7 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         status="ALLOWED",
         legality_status=validation_result.status.value,
         alerts=validation_result.alerts,
+        alert_summary=alert_summary,
         roster_ids=roster_ids,
         duty_id=new_duty.duty_id,
         downstream_conflicts=downstream_conflicts,
@@ -938,6 +950,8 @@ def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
     for alert in _check_crew_qualifications(crew_row, new_debrief_time.date()):
         validation_result.add_alert(alert)
 
+    alert_summary = summarize_alerts(validation_result, target_duty_id=duty_id)
+
     now_needs_review = validation_result.status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)
     if now_needs_review:
         with engine.begin() as conn:
@@ -955,8 +969,20 @@ def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
             f"debrief_time {old_debrief_time}->{new_debrief_time}, "
             f"fdp_hours {old_fdp_hours}->{new_fdp_hours}"
         ),
+        # Confirmed bug, now fixed (2026-08-01): this used to join
+        # EVERY alert's message unfiltered by status whenever
+        # now_needs_review was true — could log WARNING/LEGAL-tier
+        # alert text into a NEEDS_REVIEW/ILLEGAL audit row, and was
+        # the direct cause of the measured ~150KB audit row against a
+        # 2,215-alert scenario (one line per historical duty, not per
+        # rule). Now filtered to exactly the two statuses that made
+        # this audit-worthy in the first place (matching
+        # now_needs_review's own condition) and summarized by
+        # rule_code via build_audit_reason() — see
+        # services/alert_summary.py.
         warning_or_failure_reason=(
-            "; ".join(a.message for a in validation_result.alerts) if now_needs_review else None
+            build_audit_reason(alert_summary, frozenset({AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW}))
+            if now_needs_review else None
         ),
         app_user=app_user,
     )
@@ -965,7 +991,7 @@ def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
     if crew_row["role"] not in FTL_EXEMPT_ROLES:
         downstream_conflicts = _check_downstream_impact(engine, crew_id, crew_row["base"], crew_member, duty)
 
-    return validation_result, downstream_conflicts
+    return validation_result, downstream_conflicts, alert_summary
 
 
 def update_flight_actual_times_and_revalidate(flight_id: int,
@@ -996,9 +1022,10 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
     have crew assigned.
 
     Returns a list of dicts, one per affected (crew_id, duty_id):
-    {"crew_id", "duty_id", "validation_result", "downstream_conflicts"}
-    — callers (pages) use this to surface NEEDS_REVIEW/ILLEGAL flags
-    and downstream swap alerts, same as the assignment-time UI does.
+    {"crew_id", "duty_id", "validation_result", "downstream_conflicts",
+    "alert_summary"} — callers (pages) use this to surface
+    NEEDS_REVIEW/ILLEGAL flags and downstream swap alerts, same as the
+    assignment-time UI does.
     """
     engine = get_engine()
     updates = {}
@@ -1019,11 +1046,12 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
     for crew_id, duty_id in affected:
         outcome = _recompute_one_duty_after_delay(engine, crew_id, duty_id, app_user=app_user)
         if outcome is not None:
-            validation_result, downstream_conflicts = outcome
+            validation_result, downstream_conflicts, alert_summary = outcome
             results.append({
                 "crew_id": crew_id, "duty_id": duty_id,
                 "validation_result": validation_result,
                 "downstream_conflicts": downstream_conflicts,
+                "alert_summary": alert_summary,
             })
     return results
 

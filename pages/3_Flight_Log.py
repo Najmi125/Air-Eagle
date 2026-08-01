@@ -12,6 +12,7 @@ import datetime as dt
 import streamlit as st
 
 from services import flight_service, assignment_service
+from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Flight Log", page_icon="📘", layout="wide")
 st.title("Flight Log")
@@ -115,8 +116,8 @@ else:
                                 f"⚠️ {outcome['crew_id']}'s duty {outcome['duty_id']} "
                                 f"flagged NEEDS_REVIEW after this delay — {result.status.value}."
                             )
-                            for alert in result.alerts:
-                                st.write(f"- **{alert.rule_code}**: {alert.message}")
+                            for line in format_alert_lines(outcome["alert_summary"]):
+                                st.write(line)
                         if outcome["downstream_conflicts"]:
                             st.error(
                                 f"⚠️ Swap alert — this delay breaks the legality of "

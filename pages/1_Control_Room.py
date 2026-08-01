@@ -18,6 +18,7 @@ import datetime as dt
 import streamlit as st
 
 from services import crew_service, assignment_service
+from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Control Room", page_icon="🛫", layout="wide")
 st.title("Control Room — Ad-hoc / Charter")
@@ -84,8 +85,8 @@ with st.form("control_room_form"):
                         f"REJECTED — {result.legality_status}. "
                         f"Nothing was saved — no flight, no assignment."
                     )
-                    for alert in result.alerts:
-                        st.write(f"- **{alert.rule_code}**: {alert.message}")
+                    for line in format_alert_lines(result.alert_summary):
+                        st.write(line)
                 elif result.status == "NEEDS_REVIEW":
                     st.warning(
                         f"HELD FOR MANUAL REVIEW — {result.legality_status}. "
@@ -94,8 +95,8 @@ with st.form("control_room_form"):
                         f"can't determine automatically — an authorized "
                         f"reviewer needs to make this call."
                     )
-                    for alert in result.alerts:
-                        st.write(f"- **{alert.rule_code}**: {alert.message}")
+                    for line in format_alert_lines(result.alert_summary):
+                        st.write(line)
                     if result.computed_report_time:
                         st.write(
                             f"Computed duty (not saved): report "
@@ -107,8 +108,8 @@ with st.form("control_room_form"):
                     st.success(f"ALLOWED — flight {flight_ids[0]} saved, {crew_id} assigned as {role_choice}")
                     if result.legality_status != "LEGAL":
                         st.warning(f"Status: {result.legality_status}")
-                        for alert in result.alerts:
-                            st.write(f"- **{alert.rule_code}**: {alert.message}")
+                        for line in format_alert_lines(result.alert_summary):
+                            st.write(line)
 
                     if result.downstream_conflicts:
                         st.error(
