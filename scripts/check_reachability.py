@@ -30,7 +30,30 @@ ROOT = Path(__file__).resolve().parent.parent
 WATCHED_DIRS = ["core", "services", "db"]
 ENTRY_POINTS = ["app.py"] + [str(p) for p in (ROOT / "pages").glob("*.py")] if (ROOT / "pages").exists() else ["app.py"]
 
-IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+([\w\.]+)", re.MULTILINE)
+# "from X import a, b, c" and "import X.Y.Z" need different handling.
+# IMPORT_FROM_RE's second group captures the whole import clause,
+# including a parenthesized multi-line form (`(?:[^)]*)` matches
+# newlines too, since it's a negated character class, not "." — no
+# DOTALL needed) as well as the plain single-line form.
+IMPORT_FROM_RE = re.compile(
+    r"^\s*from\s+([\w\.]+)\s+import\s+(\((?:[^)]*)\)|[^\n]+)", re.MULTILINE)
+IMPORT_PLAIN_RE = re.compile(r"^\s*import\s+([\w\.]+)", re.MULTILINE)
+
+
+def _names_from_import_clause(clause: str) -> list[str]:
+    """
+    '(\n    ANO012CoreValidator, CrewMember,\n)' or
+    'crew_service, flight_service as fs' -> ['ANO012CoreValidator',
+    'CrewMember'] / ['crew_service', 'flight_service']. Strips
+    parens, 'as' aliases, and '*' (contributes no usable name).
+    """
+    clause = clause.split("#", 1)[0].replace("(", " ").replace(")", " ")
+    names = []
+    for part in clause.split(","):
+        name = part.strip().split(" as ")[0].strip()
+        if name and name != "*" and re.fullmatch(r"\w+", name):
+            names.append(name)
+    return names
 
 
 def module_name_for(path: Path) -> str:
@@ -87,33 +110,108 @@ def app_reachable_source_files():
 
 
 def find_all_imports():
+    """
+    Every module path this codebase's own import statements could
+    plausibly make "reachable", scanned from app_reachable_source_files().
+
+    "from X import a, b, c" adds BOTH:
+      - X itself (covers `from core.legality.pcaa_ano012_core import
+        CrewMember` — CrewMember is a class defined INSIDE that
+        module, not a submodule; X is already the exact watched
+        module path, and nothing else could prove it reachable)
+      - X.a, X.b, X.c (covers `from services import crew_service` —
+        crew_service IS itself services/crew_service.py, a distinct
+        watched file that importing the bare "services" package does
+        NOT, on its own, prove reachable)
+
+    Confirmed real bug this replaces (2026-08-01): the previous
+    version only ever captured the "X" part of "from X import
+    a, b, c" — discarding a/b/c entirely — and services/assignment_
+    service.py's is_imported check in main() used to treat that bare
+    "X" as a PREFIX match for every file under X (`mod.startswith(imp
+    + ".")`). Every page does `from services import crew_service,
+    ...`, so every single file under services/ — including a brand
+    new, genuinely never-imported one — silently read as "reachable"
+    the moment ANY sibling in that package was named anywhere. core/
+    never hit this only because every existing core/ import already
+    happens to be fully-qualified (`from core.duty_builder import
+    X`), not because the logic was actually correct. Caught by
+    planting a deliberately unreferenced module under services/ and
+    confirming it went unflagged; see
+    tests/test_check_reachability.py for the regression test.
+    """
     imported_modules = set()
     for f in app_reachable_source_files():
         try:
-            text = f.read_text()
-        except Exception:
+            # Explicit UTF-8: Path.read_text() with no encoding
+            # defaults to the OS locale codec, which on Windows is
+            # cp1252 ("charmap") — every page in pages/ contains
+            # UTF-8 characters (em dashes, emoji in st.set_page_config)
+            # that cp1252 can't decode. That silently raised
+            # UnicodeDecodeError, caught below, and skipped ALL FOUR
+            # page files' imports entirely — not just the one file
+            # tripping the fallback logic. This wasn't visible before
+            # because the (now-removed) over-broad prefix match in
+            # main() accidentally covered for it: assignment_service.py
+            # imports `from services import crew_service, ...` itself,
+            # so under the old rule that self-referential bare
+            # "services" token alone was enough to mark
+            # assignment_service.py falsely "reachable," regardless of
+            # whether pages/ was ever actually scanned. Two bugs
+            # canceling out — fixing only the prefix-match bug made
+            # this one visible as a wave of new false positives.
+            text = f.read_text(encoding="utf-8")
+        except Exception as e:
+            # A file this checker can't read is a checker malfunction,
+            # not a normal condition — silently skipping it (the
+            # previous behavior) is exactly how the cp1252-vs-UTF-8
+            # bug above went unnoticed. Loud on purpose: every skip
+            # here means whatever that file imports may now read as
+            # falsely orphaned.
+            print(f"WARNING: could not read {f.relative_to(ROOT)} ({e}) — "
+                  f"its imports were NOT scanned, results may be incomplete.")
             continue
-        for match in IMPORT_RE.findall(text):
+        for base, clause in IMPORT_FROM_RE.findall(text):
+            imported_modules.add(base)
+            for name in _names_from_import_clause(clause):
+                imported_modules.add(f"{base}.{name}")
+        for match in IMPORT_PLAIN_RE.findall(text):
             imported_modules.add(match)
     return imported_modules
+
+
+def find_orphaned(watched: list[Path], imported: set[str]) -> list[Path]:
+    """
+    Pure comparison, no filesystem/ROOT access — takes the two things
+    main() would otherwise compute inline, so this decision can be
+    unit-tested directly against synthetic (watched, imported) pairs
+    without needing a real or fake repo on disk.
+    """
+    orphaned = []
+    for f in watched:
+        mod = module_name_for(f)
+        # Exact match only, both directions — deliberately NO
+        # "mod.startswith(imp + '.')" prefix check. That direction
+        # used to let a bare parent-package capture (see
+        # find_all_imports()'s docstring for exactly how) silently
+        # mark every descendant "reachable" regardless of whether it
+        # was actually named anywhere. "imp.startswith(mod + '.')"
+        # (the other direction) is kept: a more specific import can
+        # still prove a less-specific watched path reachable, e.g. if
+        # __init__.py files were ever added to WATCHED_DIRS in future.
+        is_imported = any(
+            imp == mod or imp.startswith(mod + ".")
+            for imp in imported
+        )
+        if not is_imported:
+            orphaned.append(f)
+    return orphaned
 
 
 def main():
     watched = all_watched_files()
     imported = find_all_imports()
-
-    orphaned = []
-    for f in watched:
-        mod = module_name_for(f)
-        # A file is "reachable" if its dotted module path (or any prefix
-        # of it, e.g. "core.legality" importing "core.legality.pcaa_...")
-        # appears in any import statement anywhere else in the repo.
-        is_imported = any(
-            imp == mod or imp.startswith(mod + ".") or mod.startswith(imp + ".")
-            for imp in imported
-        )
-        if not is_imported:
-            orphaned.append(f)
+    orphaned = find_orphaned(watched, imported)
 
     if not orphaned:
         print("All files under core/, services/, db/ are reachable from somewhere.")

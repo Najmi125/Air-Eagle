@@ -65,7 +65,7 @@ def ensure_tracking_table(engine):
         print("ERROR: 000_migration_tracking.sql is missing. Cannot proceed.")
         sys.exit(1)
     with engine.begin() as conn:
-        conn.execute(text(tracking_file.read_text()))
+        conn.execute(text(tracking_file.read_text(encoding="utf-8")))
 
 
 def get_applied(engine):
@@ -126,7 +126,17 @@ def run(dry_run=False, status_only=False, engine=None):
         if f.name != "000_migration_tracking.sql":
             print(f"Applying {f.name} ...")
             with engine.begin() as conn:
-                conn.execute(text(f.read_text()))
+                # Explicit UTF-8: every migration file's comments use
+                # em dashes, and Path.read_text() with no encoding
+                # defaults to the OS locale codec (cp1252 on Windows),
+                # which silently mis-decodes them into mojibake rather
+                # than raising — harmless here since Postgres line
+                # comments ignore their own content, but the same bug
+                # class as scripts/check_reachability.py's, where the
+                # equivalent silent corruption broke actual logic, not
+                # just comment text. checksum() is unaffected — it
+                # hashes read_bytes(), not read_text().
+                conn.execute(text(f.read_text(encoding="utf-8")))
         with engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO schema_migrations (migration_id, checksum, applied_by) "

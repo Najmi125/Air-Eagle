@@ -257,6 +257,21 @@ age-pairing rule, or find_legal_candidates_for_duty()'s separate
 per-candidate performance problem, explicitly deferred out of this
 branch's scope).
 
+**New, separate piece started 2026-08-01**: the OCC assistant's query
+parser — `services/assistant/query_parser.py`, a deterministic
+(no-LLM) natural-language-to-`ReportRequest` parser, on branch
+`query-parser`. This is a standalone building block: it produces
+parsed parameters (template + crew/dates/route) but nothing executes
+them yet — the seven report functions that would actually run a
+`ReportRequest` against the schema are the next piece, not built here.
+**Deliberately not merged.**
+
+Placing this file also surfaced two real, independent, previously-
+silent bugs in `scripts/check_reachability.py` (both now fixed, on
+the same branch), plus the same encoding class of bug in
+`scripts/run_migrations.py` (also fixed). See the dedicated log entry
+below — this ended up being the larger part of this piece of work.
+
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
 (NEEDS_MANUAL_REVIEW branch in both assignment functions,
@@ -313,6 +328,16 @@ real Postgres 16 before merging — 178/178 (`remove-type-rating-contract-fields
 190/190 (`step5-stale-data-fixes`, on top of that), and 207/207
 (`alert-summarization`, on top of that) — see the 2026-08-01 log
 entries for full detail on each.
+
+**Unmerged, on branch `query-parser`**: 255 total (207 on `main` + 48
+new, all pure logic, no DB — 41 in the new tests/test_query_parser.py,
+7 in the new tests/test_check_reachability.py). Verified locally:
+110/110 non-DB tests passing (110+145 skipped = 255), 6.41s. Not yet
+independently re-verified by the user against real Postgres — though
+none of this branch's additions need a database at all:
+`query_parser.py` takes the crew directory as a plain argument, same
+principle as `core/duty_summary.py`, and `check_reachability.py` is a
+pure filesystem/text-scanning script.
 
 177/177 independently verified against real Postgres 16 (2026-07-31,
 `qualification-gate` branch, commit `45252da`) — this covers the
@@ -632,6 +657,21 @@ against the legality-gate work above.
   there is no third silent category. If a future rule genuinely needs
   its own bucket, that's a deliberate change to summarize_alerts(),
   not something to work around by giving it a fake duty_id.
+- scripts/check_reachability.py — reachability is decided by EXACT
+  module-path match only (`imp == mod` or `imp.startswith(mod + ".")`),
+  never `mod.startswith(imp + ".")`. That direction used to let a bare
+  `from services import crew_service, ...`-style capture silently
+  vouch for every file under `services/`, at any depth, regardless of
+  whether it was actually named anywhere — see the 2026-08-01 log
+  entry for the real bug this was. Don't reintroduce it "to handle
+  package-level imports" — `find_all_imports()`'s `X` + `X.a`/`X.b`/
+  `X.c` candidate expansion already covers every legitimate case that
+  direction was ever needed for. Also: `read_text()` calls in this
+  file and scripts/run_migrations.py must keep `encoding="utf-8"`
+  explicit — every page and every migration file contains real
+  non-ASCII characters (em dashes), and the OS-default codec (cp1252
+  on Windows) silently mis-decodes them without raising, not a
+  hypothetical risk.
 
 ## 2026-07-21: real data arrived — data quality findings, FTL
 ## exemption, schema reconciliation (unpushed as of this snapshot)
@@ -1623,4 +1663,170 @@ alerts in this scenario, not a pure-historical-only breach.
 
 Built on branch `alert-summarization`, off `main` at commit `245a13d`,
 merged into `main` after the verification above.
-Not yet merged.
+
+## 2026-08-01: OCC assistant query parser (no LLM) — plus two real,
+## stacked bugs found in scripts/check_reachability.py while placing
+## it, both fixed on the same branch. NOT MERGED.
+
+**The parser**: `services/assistant/query_parser.py` +
+`tests/test_query_parser.py`, branch `query-parser`, off `main` at
+commit `8441817`. Turns an OCC controller's natural-language question
+into a `ReportRequest` (template name + parameters: crew_ids, role,
+date_from/date_to, origin/destination, flight_no, window_days) —
+nothing executes the request yet; the seven report functions that
+would actually run one against the real schema are the next piece,
+explicitly not built here.
+
+**Why no LLM (decided after measuring a prototype)**: the assistant's
+job is narrow — it returns records that already exist, never a
+recommendation and never a legality determination (that authority
+stays entirely with `core/legality/pcaa_ano012_core.py` via the
+service layer, completely untouched by this work). For ~10 crew, 2
+fixed rotations, and a handful of trained users, "which template,
+which crew, which dates" is a controlled vocabulary, not open-ended
+public input — keyword/pattern matching handles it without a model.
+Buys, all of which matter for a safety-critical system under a
+regulator: zero API cost, zero latency, no crew PII ever leaving the
+operator's infrastructure, works with no network, fully unit-testable
+without mocking a provider, every decision inspectable and
+explainable. Costs: won't generalize to unanticipated phrasings — the
+accepted failure mode is "I didn't understand, here's what I can
+show you" (safe, self-correcting) rather than a confident answer to a
+misread question. Unresolved queries retain their raw text
+(`ReportRequest.unmatched_text`) specifically so the keyword lists
+can grow from real logged usage, not guesswork — the same discipline
+this whole file has followed since Phase 1.
+
+Scoring, not first-match: an earlier prototype used "longest keyword
+list wins," which mis-routed `'show the flight log for July'` to crew
+duty history purely because both templates contain "flight."
+Templates carry weighted positive AND negative keywords, and the
+winner needs a minimum margin over the runner-up — below that margin
+the parser returns unresolved with the candidates, rather than
+guessing. Crew-name resolution deliberately surfaces real ambiguity
+rather than picking one: Air Eagle's actual roster has both "SYED
+FAHIM MAHMOOD" and "TAHIR MAHMOOD RAJA," so a bare "mahmood" query
+genuinely identifies two people — the parser returns both crew_ids as
+a named ambiguity rather than silently guessing one, the same
+principle `services/assignment_service.py`'s own qualification gate
+already applies to crew documents. 41 tests, all pure logic (no DB —
+`query_parser.py` takes the crew directory as a plain argument, same
+principle as `core/duty_summary.py`), genuinely run and passing here
+(0.29s).
+
+**Mojibake found and fixed while placing the pasted files**: both
+source files as received contained "â" in place of what should have
+been em dashes (—), including inside three regex character
+alternations (the ISO/day-range date-separator patterns and the
+airport-route separator) — left as-is, those regexes would silently
+never match a real em-dash-separated input, a dead branch rather than
+a working one. Corrected before writing either file to disk.
+
+**Bug 1 in `scripts/check_reachability.py` — the actual reason this
+became a bigger piece of work than placing two files**: running the
+checker after adding `query_parser.py` showed it as reachable, which
+was wrong — nothing imports it yet. Root cause: `find_all_imports()`
+only ever captured the module path BEFORE `import` in a `from X
+import a, b, c` statement — discarding `a, b, c` entirely — and
+`main()`'s reachability check included `mod.startswith(imp + ".")`,
+treating that bare `"X"` as proof that EVERY file under `X` is
+reachable. Every page in this repo does `from services import
+crew_service, ...`, so the bare token `"services"` was always present
+in the imported set, and `"services.assistant.query_parser".startswith("services.")`
+is trivially true — the file read as reachable not because anything
+imports it, but because something imports its grandparent package.
+`core/` only ever escaped this by luck: every existing `core/` import
+already happens to be fully qualified (`from core.duty_builder import
+X`), never a bare `from core import X`. Confirmed by planting a
+deliberately unreferenced module and observing it go unflagged.
+
+Fixed: `find_all_imports()` now parses `from X import a, b, c` (single
+line AND the multi-line parenthesized form used throughout this
+codebase's own service layer) into exact candidate paths — `X` itself
+(needed for `from core.legality.pcaa_ano012_core import CrewMember`,
+where `CrewMember` is a class inside that module, not a submodule —
+`X` alone is already the exact watched path) AND `X.a`, `X.b`, `X.c`
+(needed for `from services import crew_service`, where `crew_service`
+IS itself a separate watched file that the bare package name does not,
+on its own, prove reachable). `main()`'s `is_imported` check dropped
+the `mod.startswith(imp + ".")` direction entirely — no more "any
+ancestor, at any depth" matching in that direction, full stop, not
+narrowed to direct parent-child as first considered, since the new
+exact-candidate-path expansion already covers every case that
+direction was ever legitimately needed for.
+
+**Bug 2 — independent, and masked by bug 1 until it was removed**:
+after fixing bug 1, `services/assignment_service.py` — genuinely
+imported by every page — started showing as unreachable too. Root
+cause: `find_all_imports()` read files via `Path.read_text()` with no
+explicit encoding, which defaults to the OS locale codec (`cp1252` on
+Windows) — and every file in `pages/` contains UTF-8 characters (em
+dashes, emoji in `st.set_page_config`) that `cp1252` cannot decode.
+That raised `UnicodeDecodeError` on all four page files, caught by a
+bare `except Exception: continue`, and silently skipped their imports
+entirely — not just one file's worth, all of `pages/`. This had
+already been true before bug 1 was ever touched; it was invisible
+because bug 1's over-broad prefix match was accidentally compensating
+for it: `assignment_service.py` itself contains `from services import
+crew_service, flight_service`, so that self-referential bare
+`"services"` token alone was enough to "prove" `assignment_service.py`
+reachable under the old rule, regardless of whether `pages/` had
+actually been scanned at all. Two bugs silently canceling out — fixing
+only the first turned the second into a wave of new false positives.
+
+Confirmed this is the exact same corruption pattern as the mojibake
+found in the pasted parser files above (`—` -> three wrong characters
+under `cp1252`) — not a coincidence, the same root cause surfacing in
+two different places on the same day.
+
+Fixed: `read_text(encoding="utf-8")`, explicit. Also: the bare
+`except Exception: continue` now prints a warning naming the file
+before skipping it — a file this checker can't read is a checker
+malfunction, not a normal condition, and staying silent about it is
+exactly how bug 2 went unnoticed for as long as it did.
+
+**Same bug class checked elsewhere and found**: `scripts/run_migrations.py`
+had two more unencoded `read_text()` calls (applying `000_migration_
+tracking.sql` and each pending migration). Every migration file
+does contain non-ASCII bytes (em dashes in `--` comments) — confirmed
+by direct byte inspection. Practical impact here is more benign than
+`check_reachability.py`'s (Postgres line comments run to end-of-line
+regardless of content, and `checksum()` was never affected — it
+hashes `read_bytes()`, not `read_text()` — so the idempotency/edit-
+detection guarantee was never at risk), but the same silent-corruption
+class, so fixed the same way: explicit `encoding="utf-8"` at both
+call sites. `scripts/import_crew_from_xlsx.py` checked too — no raw
+text-file reads there at all (uses `openpyxl` for the binary `.xlsx`
+format), nothing to fix.
+
+**Test coverage for the reachability-checker fix**: `find_orphaned()`
+extracted out of `main()` as its own pure function (watched list +
+imported set -> orphaned list) specifically so it could be unit-tested
+directly against synthetic fake repos, not scraped from stdout. 7 new
+tests in `tests/test_check_reachability.py`, each building an isolated
+fake repo under `tmp_path` (never the real project tree) and
+monkeypatching `ROOT`: an unreferenced module in a subpackage IS
+flagged (the actual regression case); a genuinely-imported module in
+a subpackage is NOT flagged (the fix must narrow false positives, not
+just add noise); a bare `from services import X` does not mark an
+unrelated sibling reachable (the regression this whole fix exists
+for); a symbol imported from an exact watched module (not a
+submodule) still marks it reachable; the multi-line parenthesized
+`from X import (...)` form is parsed fully, not just its first line;
+a file with real non-ASCII content still has its imports counted (the
+positive case for the encoding fix); and an unreadable file produces
+a warning rather than a silent skip. All 7 genuinely executed and
+passed here (no DB needed).
+
+**Verification status**: 255 total tests on this branch (207 on
+`main` + 48 new — 41 parser, 7 reachability-checker), all pure logic,
+no database needed anywhere in this branch's additions. 110/110 non-DB
+tests passing locally, 6.41s. `check_reachability.py` re-run against
+the real repo after both fixes: exactly `core/duty_summary.py` and
+`services/assistant/query_parser.py` flagged, nothing else — both
+genuinely, currently unwired, which is correct.
+
+**NOT MERGED — explicit, per instruction**. The parser produces
+`ReportRequest` objects but nothing consumes them yet; the seven
+report functions are the next piece. Built on branch `query-parser`,
+off `main` at commit `8441817`.
