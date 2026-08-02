@@ -133,6 +133,27 @@ with st.form("assign_crew_form"):
                                 + (f"legal candidates: {', '.join(conflict.candidates)}"
                                    if conflict.candidates else "**no legal candidates found**")
                             )
+
+                    # Age-pairing (AE-CREW-PAIR-AGE-001) — pairing_pending
+                    # means the other flight-deck seat isn't assigned yet,
+                    # so the rule genuinely can't be evaluated (not an
+                    # error). pairing_constraint only appears when this
+                    # pilot is already 65+: nothing is blocked, but the
+                    # rotation's eventual legality is already constrained
+                    # (or, on an international rotation, already
+                    # impossible) — surfaced here so it isn't a silent
+                    # trap if a second pilot never gets assigned.
+                    if result.pairing_pending:
+                        if result.pairing_constraint:
+                            st.warning(f"⚠️ {result.pairing_constraint}")
+                        else:
+                            st.info(
+                                "Age-pairing rule (AE-CREW-PAIR-AGE-001) not yet "
+                                "evaluable — the other flight-deck seat isn't assigned yet."
+                            )
+                    elif result.paired_crew_id:
+                        st.info(f"Age-pairing rule checked against {result.paired_crew_id} — legal.")
+
                     st.rerun()
 
 

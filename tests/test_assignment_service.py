@@ -39,6 +39,20 @@ def _patch_engine(migrated_db, monkeypatch):
 # swap what these tests are actually verifying. Tests that need to
 # exercise the qualification gate itself override individual fields.
 _FAR_FUTURE_EXPIRY = dt.date(2099, 1, 1)
+# date_of_birth default added 2026-08-02 for the same reason, when
+# Step 7's age-pairing rule (AE-CREW-PAIR-AGE-001) landed: without
+# this, every _add_crew()'d pilot has a NULL DOB, so any test
+# assigning both a CPT and an FO to the same flight via the real
+# assignment API gets AE-CREW-PAIR-AGE-001_DOB_MISSING on the second
+# assignment instead of whatever that test actually meant to exercise
+# — confirmed as the real cause of a genuine test failure against real
+# Postgres (test_delay_recompute_handles_multiple_crew_on_same_flight_
+# independently: the second crew member's assignment was silently held
+# for review instead of written, so the delay recompute only found 1
+# crew member instead of 2). 1980-01-01 is comfortably under 65 for
+# every date used anywhere in this file's flight scenarios. Tests that
+# need to exercise the age-pairing rule itself override date_of_birth
+# explicitly, same pattern as the qualification gate above.
 _QUALIFICATION_DEFAULTS = {
     "license_expiry": _FAR_FUTURE_EXPIRY,
     "medical_expiry": _FAR_FUTURE_EXPIRY,
@@ -48,6 +62,7 @@ _QUALIFICATION_DEFAULTS = {
     "sep_expiry": _FAR_FUTURE_EXPIRY,
     "crm_expiry": _FAR_FUTURE_EXPIRY,
     "dg_expiry": _FAR_FUTURE_EXPIRY,
+    "date_of_birth": dt.date(1980, 1, 1),
 }
 
 
@@ -167,6 +182,203 @@ def _seed_heavy_history_and_assign_far_future(engine, crew_id):
     new_arr = new_dep + dt.timedelta(hours=2)
     flight_id = _add_flight(new_dep, new_arr)
     return assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+
+# ------------------------------------------------------------------
+# Age-pairing rule (AE-CREW-PAIR-AGE-001) — pure math, no DB needed
+# ------------------------------------------------------------------
+
+def test_age_on_boundary_turning_65_today_counts_as_65():
+    """Exactly 65 does not count as below 65 either way (settled
+    wording) — turning 65 ON the reference date already counts."""
+    assert assignment_service._age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 2)) == 65
+
+
+def test_age_on_day_before_65th_birthday_is_still_64():
+    assert assignment_service._age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 1)) == 64
+
+
+def test_age_on_day_after_reference_before_birthday_is_64():
+    assert assignment_service._age_on(dt.date(1961, 8, 3), dt.date(2026, 8, 2)) == 64
+
+
+@pytest.mark.parametrize("age_a, age_b, domestic, expected_illegal", [
+    (65, 70, True, True),    # domestic: both 65+ -> illegal
+    (65, 64, True, False),   # domestic: one under 65 -> legal
+    (60, 60, True, False),   # domestic: both under 65 -> legal
+    (64, 64, False, False),  # international: both under 65 -> legal
+    (65, 40, False, True),   # international: one 65+ -> illegal
+    (70, 70, False, True),   # international: both 65+ -> illegal
+])
+def test_evaluate_pair_age_matches_settled_wording(age_a, age_b, domestic, expected_illegal):
+    assert assignment_service._evaluate_pair_age(age_a, age_b, domestic) == expected_illegal
+
+
+def test_pairing_constraint_message_domestic_says_other_seat_must_be_under_65():
+    message = assignment_service._pairing_constraint_message("CPT-01", 67, domestic=True)
+    assert "CPT-01" in message and "67" in message
+    assert "under 65" in message.lower()
+
+
+def test_pairing_constraint_message_international_says_no_valid_partner_exists():
+    """The real, sharper insight for international: once this pilot is
+    65+, the pair is already illegal by 'illegal if EITHER is 65+'
+    regardless of who's assigned to the other seat — there is no
+    partner age that fixes it, unlike domestic."""
+    message = assignment_service._pairing_constraint_message("CPT-01", 67, domestic=False)
+    assert "no" in message.lower() and "second pilot" in message.lower()
+
+
+# ------------------------------------------------------------------
+# Age-pairing rule (AE-CREW-PAIR-AGE-001) — DB integration
+# ------------------------------------------------------------------
+
+def _dob_for_age(age, reference_date=dt.date(2026, 7, 20)):
+    """A date_of_birth that makes the crew member exactly `age` on
+    reference_date — matches the reference_date used by the flights
+    below (2026-07-20)."""
+    return dt.date(reference_date.year - age, reference_date.month, reference_date.day)
+
+
+def test_first_pilot_alone_is_allowed_with_pairing_pending(_patch_engine):
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(50))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+
+    assert result.status == "ALLOWED"
+    assert result.pairing_pending is True
+    assert result.paired_crew_id is None
+    assert result.pairing_constraint is None  # under 65, nothing to warn about yet
+    assert not any(a.rule_code.startswith("AE-CREW-PAIR-AGE-001") for a in result.alerts)
+
+
+def test_first_pilot_alone_65_plus_gets_pairing_constraint_domestic(_patch_engine):
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(67))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=True)
+
+    result = assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+
+    assert result.status == "ALLOWED"
+    assert result.pairing_pending is True
+    assert result.pairing_constraint is not None
+    assert "under 65" in result.pairing_constraint.lower()
+
+
+def test_first_pilot_alone_65_plus_gets_pairing_constraint_international(_patch_engine):
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(67))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=False)
+
+    result = assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+
+    assert result.status == "ALLOWED"
+    assert result.pairing_pending is True
+    assert "second pilot" in result.pairing_constraint.lower()
+
+
+def test_second_pilot_domestic_both_65_plus_rejected(_patch_engine):
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(70))
+    fo = _add_crew("FO", date_of_birth=_dob_for_age(65))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=True)
+
+    first = assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+    assert first.status == "ALLOWED"
+
+    second = assignment_service.assign_crew_to_duty(fo, [flight_id], "FO")
+
+    assert second.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-PAIR-AGE-001_AGE_LIMIT" for a in second.alerts)
+    # Nothing extra saved for the rejected FO -- only the CPT's roster row exists.
+    assert len(assignment_service.get_roster_for_crew(fo)) == 0
+    assert len(assignment_service.get_roster_for_crew(cpt)) == 1
+
+
+def test_second_pilot_domestic_one_under_65_allowed(_patch_engine):
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(70))
+    fo = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=True)
+
+    assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+    second = assignment_service.assign_crew_to_duty(fo, [flight_id], "FO")
+
+    assert second.status == "ALLOWED"
+    assert second.paired_crew_id == cpt
+    assert not any(a.rule_code.startswith("AE-CREW-PAIR-AGE-001") for a in second.alerts)
+
+
+def test_second_pilot_international_one_65_plus_rejected(_patch_engine):
+    """International is stricter: EITHER pilot 65+ is illegal, even
+    though the same composition would be fine domestically (only one
+    under 65)."""
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(70))
+    fo = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=False)
+
+    assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+    second = assignment_service.assign_crew_to_duty(fo, [flight_id], "FO")
+
+    assert second.status == "REJECTED"
+    assert any(a.rule_code == "AE-CREW-PAIR-AGE-001_AGE_LIMIT" for a in second.alerts)
+
+
+def test_second_pilot_missing_dob_needs_review(_patch_engine):
+    """A complete pair (both seats filled) where the ALREADY-assigned
+    pilot has no recorded date_of_birth cannot be evaluated at all --
+    NEEDS_MANUAL_REVIEW, must not auto-save, matching HANDOVER.md's
+    already-settled wording."""
+    # Explicit override, not reliance on _add_crew()'s own default:
+    # date_of_birth is now defaulted to a real date in
+    # _QUALIFICATION_DEFAULTS (2026-08-02) so every OTHER test in this
+    # file gets a pilot safely under 65 — this is the one test that
+    # needs the NULL case deliberately, so it asks for it by name.
+    cpt = _add_crew("CPT", date_of_birth=None)
+    fo = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+    second = assignment_service.assign_crew_to_duty(fo, [flight_id], "FO")
+
+    assert second.status == "NEEDS_REVIEW"
+    assert any(a.rule_code == "AE-CREW-PAIR-AGE-001_DOB_MISSING" for a in second.alerts)
+    assert len(assignment_service.get_roster_for_crew(fo)) == 0
+
+
+def test_lm_ame_assignment_never_triggers_pairing_check(_patch_engine):
+    """LM/AME are irrelevant to this rule entirely -- assigning one
+    must never set pairing_pending or emit an AE-CREW-PAIR-AGE-001
+    alert, regardless of who else is on the flight deck."""
+    lm = _add_crew("LM", date_of_birth=_dob_for_age(70))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    result = assignment_service.assign_crew_to_duty(lm, [flight_id], "LM")
+
+    assert result.status == "ALLOWED"
+    assert result.pairing_pending is False
+    assert result.paired_crew_id is None
+    assert result.pairing_constraint is None
+
+
+def test_reassigned_pilot_pairing_check_uses_current_not_cancelled_partner(_patch_engine):
+    """Cancel the first FO, assign a new one -- the pairing check must
+    evaluate against whoever is CURRENTLY active on the other seat,
+    not the cancelled row. Confirms the status != 'CANCELLED' filter
+    in _find_paired_pilot() actually excludes it."""
+    engine = _patch_engine
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(70))
+    fo_old = _add_crew("FO", date_of_birth=_dob_for_age(65))  # would be REJECTED if still active
+    fo_new = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=True)
+
+    assignment_service.assign_crew_to_duty(cpt, [flight_id], "CPT")
+    _seed_duty(engine, fo_old, flight_id, "FO",
+               dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), fdp_hours=2.0)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE roster SET status = 'CANCELLED' WHERE crew_id = :cid"), {"cid": fo_old})
+
+    second = assignment_service.assign_crew_to_duty(fo_new, [flight_id], "FO")
+
+    assert second.status == "ALLOWED"
+    assert second.paired_crew_id == cpt
 
 
 # ------------------------------------------------------------------
@@ -481,6 +693,30 @@ def test_warning_only_status_still_allowed_and_written(_patch_engine):
     assert result.legality_status == "LEGAL"
     roster_df = assignment_service.get_roster_for_crew(crew_id)
     assert len(roster_df) == 1
+
+
+def test_roster_crash_before_audit_write_rolls_back_the_roster_insert_too(_patch_engine, monkeypatch):
+    """Step 6 (2026-08-02) regression test, assign_crew_to_duty()'s
+    smaller-scale version of the same gap: no flight to orphan here
+    (the flight already exists), but the roster insert and its
+    ASSIGNMENT_CREATED audit record were 2 separate, independently-
+    committed transactions -- a crash between them left a committed
+    roster row with no audit trail for it, a real gap in a permanent
+    regulatory record. Forces the audit write itself to fail and
+    confirms the roster insert that happened just before it does NOT
+    survive."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    def _failing_log_audit(*args, **kwargs):
+        raise RuntimeError("simulated crash before the audit write")
+
+    monkeypatch.setattr(assignment_service, "log_audit", _failing_log_audit)
+
+    with pytest.raises(RuntimeError):
+        assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+
+    assert len(assignment_service.get_roster_for_crew(crew_id)) == 0
 
 
 # ------------------------------------------------------------------
@@ -965,6 +1201,40 @@ def test_legal_adhoc_assignment_creates_both_flight_and_roster_row(_patch_engine
     roster_df = assignment_service.get_roster_for_crew(crew_id)
     assert len(roster_df) == 1
     assert roster_df.iloc[0]["flight_id"] == flight_ids[0]
+
+
+def test_control_room_crash_before_final_audit_write_rolls_back_everything(_patch_engine, monkeypatch):
+    """Step 6 (2026-08-02) regression test. Before this fix,
+    assign_crew_to_new_flights()'s ALLOWED path was 4 separate,
+    independently-committed transactions: flight insert, FLIGHT_ADDED
+    audit, roster insert, ASSIGNMENT_CREATED audit. A crash between
+    the first and the last left a real, committed, uncrewed flight in
+    Flight Log -- exactly the orphan the legality gate exists to
+    prevent, just relocated to a later failure window. This forces a
+    failure at the LAST possible point (the second log_audit call) --
+    by then, under the old code, the flight and roster row would
+    already be permanently committed. Under the fix (one engine.begin()
+    covering all four writes), everything must roll back together."""
+    crew_id = _add_crew("CPT")
+    flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))]
+
+    real_log_audit = assignment_service.log_audit
+    calls = {"n": 0}
+
+    def _flaky_log_audit(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated crash before the final audit write")
+        return real_log_audit(*args, **kwargs)
+
+    monkeypatch.setattr(assignment_service, "log_audit", _flaky_log_audit)
+
+    with pytest.raises(RuntimeError):
+        assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
+
+    assert len(flight_service.get_all_flights()) == 0
+    assert len(assignment_service.get_roster_for_crew(crew_id)) == 0
+    assert calls["n"] == 2  # confirms the failure actually happened where intended
 
 
 def test_illegal_adhoc_assignment_creates_no_flight_at_all(_patch_engine):

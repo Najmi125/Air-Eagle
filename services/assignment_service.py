@@ -213,6 +213,25 @@ class AssignmentResult:
     computed_report_time: Optional[object] = None
     computed_debrief_time: Optional[object] = None
     computed_fdp_hours: Optional[float] = None
+    # Age-pairing (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02) — CPT/FO
+    # only, populated regardless of status, same reasoning as the
+    # computed_* fields above. A genuine RuleAlert/ILLEGAL result for
+    # this rule already shows up in alerts/alert_summary like any other
+    # check; these three fields exist for the case that ISN'T an
+    # alert — a single pilot assigned with no partner yet, where the
+    # rule can't be evaluated at all. Deliberately NOT a RuleAlert
+    # (see _check_crew_pairing_age()'s docstring for why): the pending
+    # case would otherwise elevate every first-pilot assignment to
+    # WARNING for a condition that isn't actually wrong yet.
+    pairing_pending: bool = False
+    paired_crew_id: Optional[str] = None
+    # Populated only when pairing_pending is True AND this pilot is
+    # already 65+ — the real operational trap: nothing blocks this
+    # assignment, but the rotation's eventual legality is already
+    # constrained (or, for an international rotation, already
+    # impossible) by this pilot's age alone, with no earlier signal
+    # than this field if a second pilot is never assigned at all.
+    pairing_constraint: Optional[str] = None
 
 
 # ------------------------------------------------------------------
@@ -288,7 +307,177 @@ def _crew_member(crew_row: pd.Series) -> CrewMember:
                        home_base=crew_row["base"] or "")
 
 
-def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str):
+# ------------------------------------------------------------------
+# Age-pairing rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02) —
+# confirmed Air Eagle operating policy, NOT an ANO-012 provision (the
+# actual document was checked directly and contains no age-eligibility
+# rule at all), so this lives here in the orchestration layer, same
+# placement reasoning as FTL_EXEMPT_ROLES and _check_crew_qualifications()
+# above — core/legality/pcaa_ano012_core.py stays regulation-only and
+# role/policy-agnostic.
+#
+# Settled wording: domestic requires at least 1 pilot under 65
+# (illegal only if BOTH are 65+); international requires BOTH pilots
+# under 65 (illegal if EITHER is 65+). Exactly 65 counts as NOT under
+# 65, either way. LM/AME are irrelevant — this only ever applies to
+# CPT/FO. Age is calculated on the rotation's first operating date.
+# ------------------------------------------------------------------
+
+@dataclass
+class PairingCheckResult:
+    pending: bool = False
+    paired_crew_id: Optional[str] = None
+    constraint_message: Optional[str] = None
+
+
+def _age_on(dob, reference_date) -> int:
+    """Complete years as of reference_date. Turning 65 ON
+    reference_date already counts as 65, not 64 — "exactly 65 does
+    not count as below 65 either way" (HANDOVER.md, settled wording)."""
+    years = reference_date.year - dob.year
+    if (reference_date.month, reference_date.day) < (dob.month, dob.day):
+        years -= 1
+    return years
+
+
+def _evaluate_pair_age(age_a: int, age_b: int, domestic: bool) -> bool:
+    """Returns True if the pair is ILLEGAL under the settled rule."""
+    if domestic:
+        return age_a >= 65 and age_b >= 65
+    return age_a >= 65 or age_b >= 65
+
+
+def _pairing_constraint_message(crew_id: str, age: int, domestic: bool) -> str:
+    if domestic:
+        return (
+            f"{crew_id} is {age} (65 or older). Domestic rule: illegal only if BOTH "
+            f"pilots are 65 or older. The other seat must be filled by a pilot under "
+            f"65 for this rotation's pairing to be legal."
+        )
+    return (
+        f"{crew_id} is {age} (65 or older). International rule: illegal if EITHER "
+        f"pilot is 65 or older — since this pilot already is, NO second pilot can "
+        f"make this rotation's pairing legal under its current international "
+        f"classification."
+    )
+
+
+def _find_paired_pilot(engine, flight_ids: Optional[List[int]], role_assigned: str,
+                        crew_id: str) -> Optional[dict]:
+    """
+    Looks for another ACTIVE CPT/FO assignment covering the EXACT SAME
+    set of flight_ids as this duty — an exact set match, not just any
+    overlap. Two pilots can each legitimately have a roster row
+    referencing the same single flight_id while actually flying
+    different, unrelated duties (one shared sector between two
+    otherwise-distinct multi-sector rotations); overlap alone would
+    wrongly pair them.
+
+    Returns None (nobody on the other seat yet) whenever flight_ids is
+    empty/None — the Control Room path calls this BEFORE the new
+    flight(s) exist, so nothing could possibly already be assigned to
+    them; there is structurally nothing to find at that point.
+    """
+    if not flight_ids:
+        return None
+
+    other_role = "FO" if role_assigned == "CPT" else "CPT"
+    candidates = pd.read_sql(text("""
+        SELECT r.crew_id, r.duty_id, r.flight_id, c.date_of_birth
+        FROM roster r
+        JOIN crew c ON c.crew_id = r.crew_id
+        WHERE r.role_assigned = :other_role
+          AND r.status != 'CANCELLED'
+          AND r.crew_id != :crew_id
+          AND r.duty_id IN (
+              SELECT DISTINCT duty_id FROM roster
+              WHERE role_assigned = :other_role AND status != 'CANCELLED'
+                AND crew_id != :crew_id AND flight_id = ANY(:flight_ids)
+          )
+    """), engine, params={
+        "other_role": other_role, "crew_id": crew_id, "flight_ids": list(flight_ids),
+    })
+
+    if candidates.empty:
+        return None
+
+    target_set = set(flight_ids)
+    for (candidate_crew_id, duty_id), group in candidates.groupby(["crew_id", "duty_id"]):
+        if set(group["flight_id"]) == target_set:
+            return {"crew_id": candidate_crew_id, "date_of_birth": group.iloc[0]["date_of_birth"]}
+    return None
+
+
+def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[List[int]],
+                             domestic: bool, reference_date) -> tuple:
+    """
+    Returns (alerts, PairingCheckResult). Scoped to CPT/FO only — LM/AME
+    return immediately with no alerts and a default (not-applicable)
+    PairingCheckResult.
+
+    Deliberately does NOT emit a RuleAlert for the "nobody on the other
+    seat yet" case: a WARNING-severity alert would elevate
+    ValidationResult.status from LEGAL to WARNING under
+    ValidationResult.add_alert()'s existing precedence — meaning every
+    first-pilot assignment to any rotation, Control Room or Roster,
+    would show as WARNING for a condition that isn't actually wrong,
+    just not yet decidable. That's a false alarm baked into the common
+    case. Instead, the pending state (and, when relevant, the
+    constraint it creates) rides along on AssignmentResult's own
+    pairing_pending/paired_crew_id/pairing_constraint fields — visible
+    without touching legality status at all.
+    """
+    if crew_row["role"] not in ("CPT", "FO"):
+        return [], PairingCheckResult()
+
+    paired = _find_paired_pilot(engine, flight_ids, crew_row["role"], crew_row["crew_id"])
+
+    if paired is None:
+        constraint = None
+        if pd.notna(crew_row["date_of_birth"]):
+            age = _age_on(crew_row["date_of_birth"], reference_date)
+            if age >= 65:
+                constraint = _pairing_constraint_message(crew_row["crew_id"], age, domestic)
+        return [], PairingCheckResult(pending=True, constraint_message=constraint)
+
+    if pd.isna(crew_row["date_of_birth"]) or pd.isna(paired["date_of_birth"]):
+        alert = RuleAlert(
+            rule_code="AE-CREW-PAIR-AGE-001_DOB_MISSING",
+            status=AlertStatus.NEEDS_MANUAL_REVIEW,
+            severity="YELLOW",
+            message=(
+                f"Cannot evaluate the age-pairing rule for {crew_row['crew_id']} + "
+                f"{paired['crew_id']}: date of birth is missing for at least one pilot."
+            ),
+            calculated_value="DOB missing",
+            required_limit="Both pilots' date_of_birth required",
+        )
+        return [alert], PairingCheckResult(paired_crew_id=paired["crew_id"])
+
+    age_this = _age_on(crew_row["date_of_birth"], reference_date)
+    age_paired = _age_on(paired["date_of_birth"], reference_date)
+
+    if _evaluate_pair_age(age_this, age_paired, domestic):
+        alert = RuleAlert(
+            rule_code="AE-CREW-PAIR-AGE-001_AGE_LIMIT",
+            status=AlertStatus.ILLEGAL,
+            severity="RED",
+            message=(
+                f"Age-pairing rule violated ({'domestic' if domestic else 'international'}): "
+                f"{crew_row['crew_id']} is {age_this}, {paired['crew_id']} is {age_paired}. "
+                + ("Both pilots are 65 or older." if domestic
+                   else "At least one pilot is 65 or older.")
+            ),
+            calculated_value=f"{age_this}/{age_paired}",
+            required_limit="Domestic: >=1 pilot under 65. International: both pilots under 65.",
+        )
+        return [alert], PairingCheckResult(paired_crew_id=paired["crew_id"])
+
+    return [], PairingCheckResult(paired_crew_id=paired["crew_id"])
+
+
+def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str,
+                        flight_ids: Optional[List[int]] = None):
     """
     Shared validation core for both assign_crew_to_duty() (assigning
     to flights that already exist) and assign_crew_to_new_flights()
@@ -307,9 +496,16 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
     person (1 CPT, 1 FO, 1 LM, 1 AME per rotation) — there's no
     legitimate case where these should differ.
 
+    flight_ids is optional and used only for the age-pairing check
+    (see _check_crew_pairing_age()) — it's None for
+    assign_crew_to_new_flights() (Control Room), which calls this
+    BEFORE the flight(s) it's about to create exist, so there is
+    structurally nothing yet for a pairing check to find.
+
     Returns (validation_result, new_duty, crew_member, crew_row,
-    duty_result). Raises ValueError if crew_id doesn't exist or
-    role_assigned doesn't match the crew member's registered role.
+    duty_result, pairing_info). Raises ValueError if crew_id doesn't
+    exist or role_assigned doesn't match the crew member's registered
+    role.
     """
     duty_result = build_duty(legs, domestic=domestic)
 
@@ -367,7 +563,22 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
     for alert in _check_crew_qualifications(crew_row, duty_result.debrief_time.date()):
         validation_result.add_alert(alert)
 
-    return validation_result, new_duty, crew_member, crew_row, duty_result
+    # Age-pairing (AE-CREW-PAIR-AGE-001) — reuses the same duty-level
+    # `domestic` classification already computed above for the D7.1.2
+    # buffer, per HANDOVER.md's own note that this should be "one
+    # boolean, two consumers." reference_date is the rotation's first
+    # operating date — the earliest departure among the duty's own
+    # legs, not today's date and not the debrief date (unlike the
+    # qualification gate, which deliberately checks against the END of
+    # the duty — these two checks intentionally use different
+    # reference dates for different reasons).
+    reference_date = min(l.dep_time for l in legs).date()
+    pairing_alerts, pairing_info = _check_crew_pairing_age(
+        engine, crew_row, flight_ids, domestic, reference_date)
+    for alert in pairing_alerts:
+        validation_result.add_alert(alert)
+
+    return validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info
 
 
 # ------------------------------------------------------------------
@@ -413,8 +624,8 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         for f in flights
     ]
 
-    validation_result, new_duty, crew_member, crew_row, duty_result = _validate_new_duty(
-        engine, crew_id, legs, domestic, role_assigned)
+    validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
+        engine, crew_id, legs, domestic, role_assigned, flight_ids=flight_ids)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -435,6 +646,9 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
+            pairing_pending=pairing_info.pending,
+            paired_crew_id=pairing_info.paired_crew_id,
+            pairing_constraint=pairing_info.constraint_message,
         )
 
     if validation_result.status == AlertStatus.NEEDS_MANUAL_REVIEW:
@@ -461,6 +675,9 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             status="NEEDS_REVIEW",
             legality_status=validation_result.status.value,
             alerts=validation_result.alerts,
+            pairing_pending=pairing_info.pending,
+            paired_crew_id=pairing_info.paired_crew_id,
+            pairing_constraint=pairing_info.constraint_message,
             alert_summary=alert_summary,
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
@@ -468,7 +685,13 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         )
 
     # Only LEGAL or WARNING reach here — passed the immediate gate,
-    # write to roster, one row per sector.
+    # write to roster (one row per sector) and its audit record
+    # together, in one transaction (Step 6, 2026-08-02): previously
+    # these were 2 separate, independently-committed transactions, so
+    # a crash between them left a committed roster row with no audit
+    # trail for it — a real gap in a permanent regulatory record, even
+    # though (unlike assign_crew_to_new_flights()) there's no flight
+    # here to orphan. See audit_service.log_audit()'s conn parameter.
     roster_ids = []
     with engine.begin() as conn:
         for fid in flight_ids:
@@ -486,15 +709,16 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             })
             roster_ids.append(result.scalar())
 
-    log_audit(
-        action_type="ASSIGNMENT_CREATED",
-        affected_crew=crew_id,
-        affected_flight=flight_ids[0],
-        affected_duty=new_duty.duty_id,
-        legality_result=validation_result.status.value,
-        rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
-        app_user=app_user,
-    )
+        log_audit(
+            action_type="ASSIGNMENT_CREATED",
+            affected_crew=crew_id,
+            affected_flight=flight_ids[0],
+            affected_duty=new_duty.duty_id,
+            legality_result=validation_result.status.value,
+            rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
+            app_user=app_user,
+            conn=conn,
+        )
 
     if crew_row["role"] in FTL_EXEMPT_ROLES:
         downstream_conflicts = []
@@ -513,6 +737,9 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         computed_report_time=duty_result.report_time,
         computed_debrief_time=duty_result.debrief_time,
         computed_fdp_hours=duty_result.fdp_hours,
+        pairing_pending=pairing_info.pending,
+        paired_crew_id=pairing_info.paired_crew_id,
+        pairing_constraint=pairing_info.constraint_message,
     )
 
 
@@ -554,8 +781,8 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         for f in flights_data
     ]
 
-    validation_result, new_duty, crew_member, crew_row, duty_result = _validate_new_duty(
-        engine, crew_id, legs, domestic, role_assigned)
+    validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
+        engine, crew_id, legs, domestic, role_assigned, flight_ids=None)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -575,6 +802,9 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
+            pairing_pending=pairing_info.pending,
+            paired_crew_id=pairing_info.paired_crew_id,
+            pairing_constraint=pairing_info.constraint_message,
         ), []
 
     if validation_result.status == AlertStatus.NEEDS_MANUAL_REVIEW:
@@ -599,14 +829,24 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             computed_report_time=duty_result.report_time,
             computed_debrief_time=duty_result.debrief_time,
             computed_fdp_hours=duty_result.fdp_hours,
+            pairing_pending=pairing_info.pending,
+            paired_crew_id=pairing_info.paired_crew_id,
+            pairing_constraint=pairing_info.constraint_message,
         ), []
 
     # Only LEGAL or WARNING reach here — now actually create the
-    # flight(s) and the assignment together. Two separate statements,
-    # but both only run after the
-    # gate already passed, so there's no window where an illegal
-    # assignment could leave a saved flight behind.
+    # flight(s) and the assignment together, ONE transaction covering
+    # both inserts and both audit records. Previously these were 4
+    # separate, independently-committed transactions (flight insert,
+    # FLIGHT_ADDED audit, roster insert, ASSIGNMENT_CREATED audit) — a
+    # crash between the first and third left a real, committed,
+    # uncrewed flight in Flight Log, exactly the orphan the gate above
+    # exists to prevent, just relocated to a later failure window
+    # (Step 6, 2026-08-02). Folding everything into one
+    # `engine.begin()` means all four writes commit together or none
+    # do — see audit_service.log_audit()'s conn parameter.
     flight_ids = []
+    roster_ids = []
     with engine.begin() as conn:
         for f in flights_data:
             fields = {k: v for k, v in f.items() if k in flight_service.UPDATABLE_FIELDS}
@@ -617,16 +857,15 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             ), fields)
             flight_ids.append(result.scalar())
 
-    log_audit(
-        action_type="FLIGHT_ADDED",
-        affected_flight=flight_ids[0],
-        changed_state=str(flights_data),
-        data_source="control_room",
-        app_user=app_user,
-    )
+        log_audit(
+            action_type="FLIGHT_ADDED",
+            affected_flight=flight_ids[0],
+            changed_state=str(flights_data),
+            data_source="control_room",
+            app_user=app_user,
+            conn=conn,
+        )
 
-    roster_ids = []
-    with engine.begin() as conn:
         for fid in flight_ids:
             result = conn.execute(text("""
                 INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
@@ -642,16 +881,17 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             })
             roster_ids.append(result.scalar())
 
-    log_audit(
-        action_type="ASSIGNMENT_CREATED",
-        affected_crew=crew_id,
-        affected_flight=flight_ids[0],
-        affected_duty=new_duty.duty_id,
-        legality_result=validation_result.status.value,
-        rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
-        data_source="control_room",
-        app_user=app_user,
-    )
+        log_audit(
+            action_type="ASSIGNMENT_CREATED",
+            affected_crew=crew_id,
+            affected_flight=flight_ids[0],
+            affected_duty=new_duty.duty_id,
+            legality_result=validation_result.status.value,
+            rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
+            data_source="control_room",
+            app_user=app_user,
+            conn=conn,
+        )
 
     if crew_row["role"] in FTL_EXEMPT_ROLES:
         downstream_conflicts = []
@@ -670,6 +910,9 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         computed_report_time=duty_result.report_time,
         computed_debrief_time=duty_result.debrief_time,
         computed_fdp_hours=duty_result.fdp_hours,
+        pairing_pending=pairing_info.pending,
+        paired_crew_id=pairing_info.paired_crew_id,
+        pairing_constraint=pairing_info.constraint_message,
     ), flight_ids
 
 

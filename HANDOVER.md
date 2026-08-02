@@ -294,21 +294,33 @@ Date/Flight/Route/CPT/FO/occupants/POB/Remarks accordingly, "VAI"
 resolved (it's AME), the age-65 rule's wording confirmed (still not
 built — still blocked on the pair-level architecture question), and
 auth confirmed deliberately parked pending the operator's answer on
-two open questions. See the dedicated 2026-08-02 log entry below for
-full detail. **Verified by the user against real Postgres 16
-(313/313, migration 010 applied cleanly against a database already
-carrying data) and merged into `main`.**
+two open questions. See the dedicated 2026-08-02 log entries below for
+full detail on this and everything since.
 
-**Small follow-up, same day**: `pages/2_Crew_Data.py`'s manual
-"Add crew member" form still offered LM/ENGR as selectable roles even
-after the import script stopped importing either — a real
-inconsistency, flagged by this project's own `Open stubs` section and
-closed immediately rather than left open. `ROLE_OPTIONS` narrowed to
-`["CPT", "FO", "Other"]` on branch `crew-data-role-dropdown-cpt-fo-only`.
-`services/crew_service.py`'s role handling is untouched — this is a
-page-level, Air-Eagle-specific restriction on what the form offers,
-not a platform-wide rule. **Deliberately not merged** — awaiting the
-user's own real-Postgres verification, same as every prior piece.
+**Merge status as of this snapshot (2026-08-02)** — this paragraph,
+not the individual dated log entries below, is the single place to
+check what's actually landed. A dated log entry describes what was
+built and why, and that doesn't go stale; a "MERGED"/"NOT MERGED" note
+buried inside one does, once several branches are in flight from
+different points in history. Keep merge status here only, going
+forward.
+
+- **Merged into `main`**: everything through Step 7 (the age-pairing
+  rule, AE-CREW-PAIR-AGE-001) — 338/338 verified by the user against
+  real Postgres 16, including a real-data empirical check (domestic
+  67+67 rejected, domestic 67+41 allowed, international 67+41 rejected)
+  and reachability unchanged. Step 6 (transactional atomicity,
+  `log_audit()`'s `conn` parameter) verified the same way one piece
+  earlier, including a manual crash simulation confirming the before/
+  after difference directly (orphaned flight + roster row -> full
+  rollback).
+- **Pushed, not yet merged**: `crew-data-role-dropdown-cpt-fo-only`
+  (removes LM/ENGR from `pages/2_Crew_Data.py`'s role dropdown) — this
+  branch predates Step 6/7, had `main` merged into it and its full
+  suite re-verified against them (2026-08-02) rather than merged back
+  on the strength of its old 314-test baseline, and is otherwise
+  unchanged: `ROLE_OPTIONS = ["CPT", "FO", "Other"]`,
+  `services/crew_service.py`'s role handling untouched.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -406,19 +418,36 @@ merged into `main`**: 313/313 passing on branch `operator-crew-scope-
 and-coverage-reshape` (301 on `main` + 12 net new — see the 2026-08-02
 log entry for the exact breakdown), including all 174 tests this
 environment could only trace by hand. Migration 010 confirmed to apply
-cleanly against a database already carrying 000-009 and existing
-flight data, no data loss. LM/AME exclusion confirmed to hold on
-well-formed rows (a test sheet with LM/AME/Loadmaster variants
-imported only CAPT/FO), and `_count_occupants()`'s shorthand parsing
-confirmed correct.
+cleanly against a database already carrying data, no data loss.
+LM/AME exclusion confirmed to hold on well-formed rows, and
+`_count_occupants()`'s shorthand parsing confirmed correct.
 
-**Unmerged, on branch `crew-data-role-dropdown-cpt-fo-only`**: 314
-total (313 on `main` + 1 new — `test_role_dropdown_excludes_lm_and_engr`
-in `tests/test_crew_data_page.py`). Verified locally: 139 passed, 175
-skipped (no `TEST_DATABASE_URL` in this sandbox). `check_reachability.py`:
-unchanged — `services/assistant/reports.py` still the only file
-flagged; `core/duty_summary.py` still doesn't appear, since
-`utilization()` remains its first real caller anywhere in this app.
+**Independently verified by the user against real Postgres 16 and
+merged into `main`**: 318/318 passing on branch `transactional-
+atomicity-control-room-write` (313 on `main`, this branch cut directly
+from `main` rather than from the still-unmerged crew-data-dropdown
+branch, + 5 net new — 1 in `tests/test_assignment_service.py`'s
+Control Room regression test, 1 in its `assign_crew_to_duty()`
+counterpart, 3 in `tests/test_audit_service.py` for `log_audit()`'s new
+`conn` parameter). Also independently confirmed by the user via a
+manual crash simulation on both versions of the code (sabotaging the
+second `log_audit()` call mid-sequence): before the fix, 1 orphaned
+flight + 1 roster row survived; after, full rollback to zero.
+
+**Independently verified by the user against real Postgres 16 and
+merged into `main`**: 338/338 passing on branch
+`age-pairing-rule-ae-crew-pair-age-001` (Step 7 — see the dedicated log
+entry below for full detail), including a real-data empirical check
+(domestic 67+67 rejected, domestic 67+41 allowed, international 67+41
+rejected) and reachability unchanged. One real test-fixture gap found
+and fixed along the way (see that log entry) — not a bug in the rule.
+
+**`crew-data-role-dropdown-cpt-fo-only`**: originally verified at
+314/314 on its own base, predating Step 6/7. Per instruction, not
+merged on the strength of that figure — `main` merged into this
+branch and the full current suite re-verified here (2026-08-02) before
+resuming towards merge. See `Current active task` above for actual
+merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
 - `services/assistant/reports.py` is the only file currently flagged
@@ -427,6 +456,17 @@ flagged; `core/duty_summary.py` still doesn't appear, since
   `run_report()` yet; there's no assistant UI page. `core/duty_summary.py`
   is no longer flagged: `reports.py`'s `utilization()` function is now
   its first real caller anywhere in this app.
+- **`find_legal_candidates_for_duty()` does not check the age-pairing
+  rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02).** This function
+  powers the downstream-swap candidate suggestions shown when an
+  assignment breaks a future duty's legality — it currently only
+  checks FTL/rest and qualification legality for each candidate, not
+  whether swapping them in would create an illegal flight-deck age
+  pairing with whoever's already on the other seat of that future
+  duty. Suggesting a replacement who'd create an illegal pairing is a
+  real gap, deliberately not fixed as part of Step 7 (kept scoped to
+  the direct assignment gate itself) — worth a deliberate decision
+  later, not a silent oversight.
 - `query_parser.py`'s `parse()` never actually populates
   `ReportRequest.status_filter`, even though "cancelled"/"delayed"/
   "diverted" are scoring keywords for the `flight_records` template.
@@ -593,12 +633,18 @@ phase so far:
    (`_recompute_one_duty_after_delay()`) was unfiltered by status
    entirely. `find_legal_candidates_for_duty()`'s own, separate,
    larger per-candidate cost is explicitly deferred, not touched here.
-6. True transactional atomicity for Control Room's flight+assignment
-   write — currently 4 separate `engine.begin()` blocks, not one
-   transaction, so the "no orphan flight on rejection" guarantee
-   (tested and true today) doesn't extend to "no orphan flight if the
-   process crashes mid-sequence."
-7. **Age-pairing rule — now well-specified, still not built.**
+6. ~~True transactional atomicity for Control Room's flight+assignment
+   write~~ DONE (2026-08-02, branch `transactional-atomicity-control-
+   room-write` — see the dedicated log entry below for full detail).
+   The 4 separate `engine.begin()` blocks in `assign_crew_to_new_flights()`'s
+   ALLOWED path are now one transaction; `assign_crew_to_duty()`'s
+   smaller-scale version of the same gap (roster insert + its audit
+   record) is fixed the same way.
+7. ~~Age-pairing rule~~ DONE (2026-08-02, branch
+   `age-pairing-rule-ae-crew-pair-age-001` — see the dedicated log
+   entry below for full detail, including how the architectural
+   blocker described below was actually resolved). Wording as recorded
+   here was confirmed accurate by the operator before this was built:
    CONFIRMED route-dependent, not uniform (updated 2026-07-21, after
    the single-rule version above was recorded): for a rotation's
    flight-deck pair —
@@ -2317,7 +2363,7 @@ on well-formed rows, `_count_occupants()` confirmed correct. Merged
 into `main`.
 
 ## 2026-08-02 (continued): close the LM/ENGR role-dropdown
-## inconsistency in pages/2_Crew_Data.py. NOT MERGED.
+## inconsistency in pages/2_Crew_Data.py
 
 Small, focused follow-up flagged in this file's own `Open stubs` after
 the previous piece: `scripts/import_crew_from_xlsx.py` permanently
@@ -2348,5 +2394,258 @@ referenced LM/ENGR selection, so nothing else needed changing.
 
 **Verification status**: 314 total (313 on `main` + 1 new). `pytest
 tests/`: 139 passed, 175 skipped (no `TEST_DATABASE_URL` in this
-sandbox). `check_reachability.py`: unchanged. **NOT MERGED** —
-awaiting the user's own real-Postgres verification.
+sandbox). `check_reachability.py`: unchanged. See `Current active
+task` near the top of this file for merge status.
+
+## 2026-08-02 (continued): Step 6 — transactional atomicity for
+## Control Room's flight+assignment write, extended to
+## assign_crew_to_duty() too. NOT MERGED.
+
+Plan proposed and approved (with one addition, one extension, and one
+docstring clarification) before implementation. Built on branch
+`transactional-atomicity-control-room-write`, off `main` at the
+`operator-crew-scope-and-coverage-reshape` merge commit.
+
+**The problem, confirmed by reading the code before proposing anything**:
+`assign_crew_to_new_flights()`'s ALLOWED path (Control Room's ad-hoc
+flight-creation-plus-assignment) was FOUR separate, independently-
+committed transactions: `INSERT INTO flights`, `log_audit(FLIGHT_ADDED)`
+(which opens its own transaction internally), `INSERT INTO roster`,
+`log_audit(ASSIGNMENT_CREATED)`. The existing "no orphan flight on
+rejection" guarantee is real and tested — nothing is written at all on
+ILLEGAL/NEEDS_MANUAL_REVIEW — but once the gate passes and writing
+starts, a crash between steps 1 and 3 left a real, committed, uncrewed
+flight sitting in Flight Log: the exact orphan the gate exists to
+prevent, just relocated to a later failure window.
+
+Also confirmed directly: `assign_crew_to_duty()` (the Roster page's
+path, assigning crew to a flight that already exists) doesn't have the
+orphan-FLIGHT version of this problem — only one table is ever written
+there (`roster`) — but it has the same class of gap at smaller scale:
+its own roster insert and its own `ASSIGNMENT_CREATED` audit call were
+two separate transactions, so a crash between them left a committed
+roster row with no audit trail for it. `_check_downstream_impact()`
+was confirmed read-only (only reads and returns candidates for
+display; "alert + suggest, human confirms" is the existing, deliberate
+design, not an auto-write) and correctly stays outside any transaction,
+run after commit so it can see the newly-written duty.
+
+**Fix**: `services/audit_service.log_audit()` gained an optional `conn`
+parameter. When passed an already-open `Connection` (e.g. from
+`with engine.begin() as conn:`), it executes the audit INSERT directly
+on that connection instead of opening its own transaction — folding
+the audit write into the caller's transaction. When `conn` is `None`
+(the default, and every pre-existing call site across the codebase),
+behavior is unchanged. Both `assign_crew_to_new_flights()` and
+`assign_crew_to_duty()` now wrap their entire write sequence — data
+insert(s) plus every `log_audit()` call in that sequence — in one
+`engine.begin()` block, passing `conn=conn` through. Either every write
+in the sequence commits, or none does.
+
+**Explicit behavioral note, added to `log_audit()`'s docstring per
+review feedback**: passing `conn` means the audit record shares the
+CALLER's transaction fate — if the caller's transaction later rolls
+back, the audit record disappears with it, unlike every other call to
+this function (which always commits independently regardless of what
+happens around it). This is the correct behavior here (an audit record
+for a write that never actually happened would be worse than no record
+at all), but it's a genuine difference from the default that needed
+stating explicitly rather than left to be discovered by surprise.
+
+**Included per review feedback**: the `assign_crew_to_duty()` extension
+was originally offered as optional/your-call in the proposed plan;
+approved for inclusion in this same piece rather than split out,
+specifically because leaving it out would mean two write paths with
+different transactional guarantees for no discoverable reason, and a
+committed roster row with a lost audit entry is a real gap in a
+permanent regulatory record.
+
+**Out of scope, unchanged from the plan**: `_recompute_one_duty_after_delay()`
+/ `update_flight_actual_times_and_revalidate()` (Step 5's delay-recompute
+path) and `cancel_flight_and_roster()` (Step 5's cancel cascade) have
+the same write-then-separately-audit pattern. Not touched here — a
+broader audit-atomicity pass across every write path is a separate,
+deliberate piece of work.
+
+**Tests**: 5 new. `tests/test_assignment_service.py` gained the direct
+regression test — monkeypatches `assignment_service.log_audit` so its
+SECOND call (`ASSIGNMENT_CREATED`) raises mid-sequence, calls
+`assign_crew_to_new_flights()` on an otherwise-LEGAL scenario, and
+confirms BOTH `flights` and `roster` are still empty afterward (the
+flight insert and the first audit call genuinely "succeeded" moments
+before the simulated crash, and must not survive the rollback) — plus
+the `assign_crew_to_duty()` counterpart (roster insert must not survive
+a crash at its own audit call). `tests/test_audit_service.py` gained
+three tests for `log_audit()`'s new parameter, added per review
+feedback rather than assumed obvious: `conn=` genuinely writes a
+queryable row on the normal success path (not just "raises no
+exception" — a conn-passing bug that silently never executes on the
+passed connection would only show up as missing audit rows in
+production, so this is the test that would catch exactly that);
+`conn=` shares the caller's rollback (the audit row is confirmed gone
+after a forced rollback); and the no-`conn` default still commits
+independently, unaffected by the new parameter's existence.
+
+**Verification status**: 318 total (313 on `main`, cut directly from
+`main` rather than the still-unmerged `crew-data-role-dropdown-cpt-fo-only`
+branch, + 5 net new). `pytest tests/`: 139 passed, 179 skipped (no
+`TEST_DATABASE_URL` in this sandbox — the new regression tests are
+traced by hand here, not run; the logic was reasoned through directly
+against `engine.begin()`'s standard rollback-on-exception semantics,
+which this fix relies on rather than reimplements). `check_reachability.py`:
+unchanged — `services/assistant/reports.py` still the only file
+flagged. (Merge status: see `Current active task` near the top of this
+file, not this line — this branch has since merged; see there.)
+
+## 2026-08-02 (continued): Step 7 — the age-pairing rule
+## (AE-CREW-PAIR-AGE-001)
+
+Design conversation happened first (plan proposed covering where the
+check runs, how a rotation's complete flight-deck package gets
+identified, and what happens with only one pilot assigned; approved
+with one addition, one extension, and one scope note) before any code
+was written. Built on branch `age-pairing-rule-ae-crew-pair-age-001`,
+off `main` at the Step 6 merge commit.
+
+**The architectural blocker, resolved**: assignment happens one crew
+member at a time, so there's no single call where both pilots on a
+rotation are known simultaneously. Confirmed by reading the code
+before proposing anything: `roster.duty_id` is a fresh random UUID
+generated fresh on every assignment call — there is no existing
+identifier linking two different crew members' roster rows as "the
+same rotation." The only real structural link between a CPT's
+assignment and an FO's assignment to what a human would call the same
+rotation is that they cover the identical SET of `flight_id`s. New
+query helper `_find_paired_pilot()` in `services/assignment_service.py`
+keys off exactly that: it looks for another active (non-cancelled)
+CPT/FO roster assignment whose own `flight_id` set is an EXACT match
+to this duty's — not just any overlap, since two pilots could each
+have a roster row referencing the same single `flight_id` while
+actually flying different, unrelated duties.
+
+Also confirmed: `assign_crew_to_new_flights()` (Control Room) can
+never see an already-paired pilot — it creates the flight in the same
+call, so nothing could already be assigned to a `flight_id` that
+doesn't exist yet. `assign_crew_to_duty()` is the real enforcement
+point (used both for the Roster page's normal flow and for adding a
+second Control-Room pilot to a flight the first call already created).
+Both callers go through the same shared `_validate_new_duty()`, so the
+check is wired in once, not twice — it simply always resolves to
+"nothing to check yet" on the Control Room path, automatically,
+without any special-casing.
+
+**Where the check runs and what happens with only one pilot assigned**:
+`_validate_new_duty()` gained an optional `flight_ids` parameter
+(`assign_crew_to_duty()` passes its real list; `assign_crew_to_new_flights()`
+passes `None`) and now calls new `_check_crew_pairing_age()`, scoped to
+CPT/FO only (LM/AME return immediately, untouched). Three outcomes:
+nobody on the other seat yet -> nothing is blocked, and — the one
+addition to the original plan, approved on review — nothing is silently
+lost either: `AssignmentResult` gained `pairing_pending`,
+`paired_crew_id`, and `pairing_constraint` fields (populated regardless
+of status, same convention `computed_report_time` etc. already
+established there), NOT a `RuleAlert`. A `WARNING`-severity alert would
+have elevated `ValidationResult.status` from `LEGAL` to `WARNING` for
+every single first-pilot assignment to any rotation — a false alarm
+baked into the common case, exactly the kind of thing that teaches
+people to ignore warnings. Paired pilot found but a DOB is missing on
+either side -> `AE-CREW-PAIR-AGE-001_DOB_MISSING`,
+`NEEDS_MANUAL_REVIEW`, matching HANDOVER.md's already-settled wording.
+Paired pilot found, both DOBs known, rule evaluates ILLEGAL ->
+`AE-CREW-PAIR-AGE-001_AGE_LIMIT`, blocking the SECOND pilot's own
+assignment — a real, order-dependent consequence: whichever pilot
+happens to be assigned first is never blocked by this rule at that
+moment, since there's nothing yet to compare against.
+
+**`pairing_constraint` — the actionable addition from review**:
+populated only when `pairing_pending` is true AND the lone assigned
+pilot is already 65+ — the real operational trap the review caught: a
+controller assigns a 67-year-old to an international rotation (or a
+domestic one) and it's accepted, since nothing to compare against
+exists yet; if a second pilot is never assigned, an illegal-by-
+composition rotation would otherwise sit in the roster looking
+completely fine, with one seat legitimately still open. Getting the
+message right required working through the actual arithmetic rather
+than assuming symmetry between the two route classifications: for
+**domestic**, if the lone pilot is already 65+, the pair is legal iff
+the other seat is under 65 — a real, satisfiable constraint, and the
+message says so. For **international**, if the lone pilot is already
+65+, the pair is ALREADY illegal ("illegal if EITHER pilot is 65+")
+**regardless of who fills the other seat** — there is no age that
+fixes it. The message for this case says exactly that (no valid second
+pilot exists), rather than the weaker and factually wrong "find someone
+under 65."
+
+**UI surfacing folded into this piece, not deferred**: both
+`pages/1_Control_Room.py` and `pages/4_Roster.py` already had the
+branching structure for this (the same `if result.status == ...`
+ladder every other check already renders through) — added a small
+block showing `pairing_constraint` as a warning when present, a plain
+info note when pairing is pending with no constraint yet, and a quiet
+confirmation of who the pairing was checked against when it resolved
+legally.
+
+**Explicitly out of scope, per the plan and confirmed on review**:
+`find_legal_candidates_for_duty()` (downstream-swap candidate search)
+does not check age-pairing for a candidate against whoever's on the
+other seat of the future duty being protected — noted in `Open stubs`
+above as a real gap, not a silent oversight. No schema change to make
+`crew.date_of_birth` required for CPT/FO — missing DOB is still caught
+at assignment time via `NEEDS_MANUAL_REVIEW`, consistent with "never
+silently block on missing data, flag it instead."
+
+**Tests**: 20 new. Pure logic (no DB, in
+`tests/test_assignment_service.py`): `_age_on()`'s exact-65-boundary in
+both directions (turning 65 ON the reference date counts as 65, the
+day before is still 64); `_evaluate_pair_age()` across all 6
+domestic/international x age combinations from the settled wording;
+`_pairing_constraint_message()`'s domestic ("other seat must be under
+65") vs international ("no second pilot can fix this") distinction —
+confirmed correct by direct interpreter execution in this sandbox,
+same discipline as prior pieces' boundary tests. DB-integration (9):
+first pilot alone -> `pairing_pending`; first pilot alone at 65+ ->
+`pairing_constraint` populated, domestic and international variants;
+second pilot domestic both 65+ -> `REJECTED`, nothing extra saved;
+second pilot domestic one under 65 -> `ALLOWED`; second pilot
+international one 65+ -> `REJECTED` (stricter than the identical
+domestic composition, which would be `ALLOWED`); missing DOB on the
+already-assigned pilot -> `NEEDS_REVIEW`; LM/AME assignment never
+triggers any of this; reassignment (cancel the first FO, assign a
+new one) re-evaluates against the current pairing, not the cancelled
+row, confirming `_find_paired_pilot()`'s `status != 'CANCELLED'` filter
+actually works.
+
+**Verification status**: 338 total (318 on `main` + 20 new). `pytest
+tests/`: unchanged pass/skip ratio, no new failures — the 9 new DB-
+integration tests are traced by hand here (no `TEST_DATABASE_URL` in
+this sandbox), and the pure-logic tests were additionally confirmed
+correct by direct interpreter execution before being written into the
+test file. `check_reachability.py`: unchanged, no new files —
+everything lives inside the existing `services/assignment_service.py`.
+
+**One real-Postgres test failure found and fixed, not a bug in the
+rule itself**: the user's first verification run found 337/338
+passing — `test_delay_recompute_handles_multiple_crew_on_same_flight_
+independently` failed. Root cause: `_add_crew()`'s `_QUALIFICATION_DEFAULTS`
+sets all 8 expiry fields but never `date_of_birth`, so every pilot
+created by this file's tests has always had a NULL DOB. That test
+assigns both a CPT and an FO to the same flight through the real
+`assign_crew_to_duty()` API — the second assignment correctly hit the
+brand-new `AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW`
+path and was correctly NOT written, so the delay recompute this test
+was actually about found 1 crew member instead of 2. The age-pairing
+rule was doing exactly what it's supposed to; the test fixture was
+underspecified for a check that didn't exist when it was written.
+Fixed by adding `"date_of_birth": dt.date(1980, 1, 1)` to
+`_QUALIFICATION_DEFAULTS` (comfortably under 65 for every scenario in
+this file) and giving `test_second_pilot_missing_dob_needs_review` an
+explicit `date_of_birth=None` override, since that's the one test that
+deliberately needs the NULL case now that it's no longer the ambient
+default. Confirmed no other test in this file references
+`date_of_birth` at all, so nothing else depended on the old default.
+Also independently confirmed by the user directly against real
+Postgres with real crew ages: domestic 67+67 -> second pilot REJECTED;
+domestic 67+41 -> ALLOWED; international 67+41 -> second pilot REJECTED
+(correctly stricter than the identical domestic composition);
+`pairing_pending`/`pairing_constraint` populate correctly on the first
+assignment in all three cases.
