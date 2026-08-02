@@ -305,16 +305,17 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Merged into `main`**: everything through Step 6 (transactional
-  atomicity for Control Room's flight+assignment write, `log_audit()`'s
-  `conn` parameter) — 318/318 verified by the user against real
-  Postgres 16, independently confirmed via a manual crash simulation
-  (before the fix: 1 orphaned flight + 1 roster row survived; after:
-  full rollback).
+- **Merged into `main`**: everything through Step 7 (the age-pairing
+  rule, AE-CREW-PAIR-AGE-001) — 338/338 verified by the user against
+  real Postgres 16, including a real-data empirical check (domestic
+  67+67 rejected, domestic 67+41 allowed, international 67+41 rejected)
+  and reachability unchanged. Step 6 (transactional atomicity,
+  `log_audit()`'s `conn` parameter) verified the same way one piece
+  earlier, including a manual crash simulation confirming the before/
+  after difference directly (orphaned flight + roster row -> full
+  rollback).
 - **Pushed, not yet merged**: `crew-data-role-dropdown-cpt-fo-only`
-  (removes LM/ENGR from `pages/2_Crew_Data.py`'s role dropdown) and
-  `age-pairing-rule-ae-crew-pair-age-001` (Step 7 — see the dedicated
-  log entry below).
+  (removes LM/ENGR from `pages/2_Crew_Data.py`'s role dropdown).
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
