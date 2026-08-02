@@ -295,8 +295,20 @@ resolved (it's AME), the age-65 rule's wording confirmed (still not
 built — still blocked on the pair-level architecture question), and
 auth confirmed deliberately parked pending the operator's answer on
 two open questions. See the dedicated 2026-08-02 log entry below for
-full detail. **Deliberately not merged** — same discipline as every
-prior piece, awaiting the user's own real-Postgres verification.
+full detail. **Verified by the user against real Postgres 16
+(313/313, migration 010 applied cleanly against a database already
+carrying data) and merged into `main`.**
+
+**Small follow-up, same day**: `pages/2_Crew_Data.py`'s manual
+"Add crew member" form still offered LM/ENGR as selectable roles even
+after the import script stopped importing either — a real
+inconsistency, flagged by this project's own `Open stubs` section and
+closed immediately rather than left open. `ROLE_OPTIONS` narrowed to
+`["CPT", "FO", "Other"]` on branch `crew-data-role-dropdown-cpt-fo-only`.
+`services/crew_service.py`'s role handling is untouched — this is a
+page-level, Air-Eagle-specific restriction on what the form offers,
+not a platform-wide rule. **Deliberately not merged** — awaiting the
+user's own real-Postgres verification, same as every prior piece.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -389,14 +401,23 @@ could only trace by hand. Filename format and both plan-approved
 report behaviors (crew_duty_history's notes/duty_id, roster_coverage's
 comma-joined role lists as they stood at the time) confirmed exact.
 
-**Unmerged, on branch `operator-crew-scope-and-coverage-reshape`**:
-313 total (301 on `main` + 12 net new — see the 2026-08-02 log entry
-for the exact breakdown). Verified locally: 139 passed, 174 skipped
-(no `TEST_DATABASE_URL` in this sandbox, same limitation as every
-prior piece). `_count_occupants()`'s "Nx ROLE" parsing was additionally
-confirmed correct by direct interpreter execution. `check_reachability.py`:
-`services/assistant/reports.py` still the only file flagged, unchanged
-by this piece; `core/duty_summary.py` still doesn't appear, since
+**Independently verified by the user against real Postgres 16 and
+merged into `main`**: 313/313 passing on branch `operator-crew-scope-
+and-coverage-reshape` (301 on `main` + 12 net new — see the 2026-08-02
+log entry for the exact breakdown), including all 174 tests this
+environment could only trace by hand. Migration 010 confirmed to apply
+cleanly against a database already carrying 000-009 and existing
+flight data, no data loss. LM/AME exclusion confirmed to hold on
+well-formed rows (a test sheet with LM/AME/Loadmaster variants
+imported only CAPT/FO), and `_count_occupants()`'s shorthand parsing
+confirmed correct.
+
+**Unmerged, on branch `crew-data-role-dropdown-cpt-fo-only`**: 314
+total (313 on `main` + 1 new — `test_role_dropdown_excludes_lm_and_engr`
+in `tests/test_crew_data_page.py`). Verified locally: 139 passed, 175
+skipped (no `TEST_DATABASE_URL` in this sandbox). `check_reachability.py`:
+unchanged — `services/assistant/reports.py` still the only file
+flagged; `core/duty_summary.py` still doesn't appear, since
 `utilization()` remains its first real caller anywhere in this app.
 
 ## Open stubs / known blockers
@@ -429,14 +450,10 @@ by this piece; `core/duty_summary.py` still doesn't appear, since
   that OCC handles this by process. If DG tracking through this
   system ever matters, reintroducing LM/AME as crew records (even
   without FTL applicability) is the fix.
-- `pages/2_Crew_Data.py`'s manual "Add crew member" form still offers
-  LM and ENGR as selectable roles, inconsistent with
-  `scripts/import_crew_from_xlsx.py` now permanently excluding both
-  from bulk import (2026-08-02). Not changed here — the operator's
-  instruction was scoped to the import script — but flagged as a real
-  inconsistency: a controller could still manually create an LM/ENGR
-  crew record through the UI today. Worth a deliberate decision before
-  it matters, not a silent fix.
+- RESOLVED 2026-08-02: `pages/2_Crew_Data.py`'s manual "Add crew
+  member" form no longer offers LM/ENGR as selectable roles — see the
+  dedicated log entry below. `ROLE_OPTIONS` is now `["CPT", "FO",
+  "Other"]`, closing the inconsistency flagged in the previous entry.
 - `services/assistant/regulation_reference.py`'s numbers are boundary-
   tested against the real validator for D9.1.1/D9.1.2/D9.1.3/D9.2.1/
   D9.2.2/D9.2.3/D21.1/D8.2.1 (see `tests/test_assistant_reports.py`).
@@ -2292,5 +2309,44 @@ report tests grew by 1 net, two old tests replaced by two new ones).
 this sandbox — the DB-integration tests here are traced by hand, not
 run, same limitation as every prior piece). `check_reachability.py`:
 `services/assistant/reports.py` still the only file flagged, unchanged
-by this piece. **NOT MERGED** — awaiting the user's own real-Postgres
-verification, same discipline as always.
+by this piece. **RESOLVED 2026-08-02**: independently verified by the
+user against real Postgres 16 — 313/313 passing, migration 010
+confirmed to apply cleanly against a database already carrying
+000-009 and existing flight data, LM/AME exclusion confirmed to hold
+on well-formed rows, `_count_occupants()` confirmed correct. Merged
+into `main`.
+
+## 2026-08-02 (continued): close the LM/ENGR role-dropdown
+## inconsistency in pages/2_Crew_Data.py. NOT MERGED.
+
+Small, focused follow-up flagged in this file's own `Open stubs` after
+the previous piece: `scripts/import_crew_from_xlsx.py` permanently
+excludes LM/AME/ENGR from bulk import, but `pages/2_Crew_Data.py`'s
+manual "Add crew member" form still listed `LM`/`ENGR` in
+`ROLE_OPTIONS` — a controller could still hand-create one of exactly
+the crew records the operator just said Air Eagle doesn't track.
+
+Fixed on branch `crew-data-role-dropdown-cpt-fo-only`, off `main` at
+the merge commit above: `ROLE_OPTIONS` narrowed from `["CPT", "FO",
+"LM", "ENGR", "Other"]` to `["CPT", "FO", "Other"]`. "Other" stays —
+it's the escape hatch for a genuinely unanticipated role the operator
+hasn't described yet, not for LM/AME, which now have a specific,
+deliberate answer. `services/crew_service.py`'s `ROLE_SYNONYMS`/
+`ROLE_PREFIXES`/`_normalize_role()` are untouched, same reasoning as
+the import-script change: this is a page-level, Air-Eagle-specific
+restriction on what this one form offers, not a platform-wide rule —
+FTLguard itself still fully supports LM/ENGR crew records for a future
+client.
+
+**Test**: 1 new, `test_role_dropdown_excludes_lm_and_engr` in
+`tests/test_crew_data_page.py`, asserting the role selectbox's actual
+options via Streamlit's `AppTest` framework (`at.selectbox[0].options
+== ["CPT", "FO", "Other"]`) rather than just checking the module-level
+constant — the same UI-driving discipline this file already uses for
+the rest of `test_crew_data_page.py`. No existing test in that file
+referenced LM/ENGR selection, so nothing else needed changing.
+
+**Verification status**: 314 total (313 on `main` + 1 new). `pytest
+tests/`: 139 passed, 175 skipped (no `TEST_DATABASE_URL` in this
+sandbox). `check_reachability.py`: unchanged. **NOT MERGED** —
+awaiting the user's own real-Postgres verification.

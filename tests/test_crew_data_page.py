@@ -66,6 +66,21 @@ def test_add_crew_via_form_succeeds_and_shows_in_table(page_app):
     assert "Test Captain" in list(df["name"])
 
 
+def test_role_dropdown_excludes_lm_and_engr(page_app):
+    """Air Eagle's crew records are CPT/FO only (2026-08-02 operator
+    decision, same reasoning as scripts/import_crew_from_xlsx.py's
+    EXCLUDED_ROLES) — the manual-add form must not offer LM or ENGR as
+    selectable roles either, closing the inconsistency where imports
+    excluded them but a controller could still hand-create one here.
+    'Other' stays, as the escape hatch for a genuinely unanticipated
+    role, not for LM/AME specifically."""
+    at = page_app.run()
+    options = at.selectbox[0].options
+    assert options == ["CPT", "FO", "Other"]
+    assert "LM" not in options
+    assert "ENGR" not in options
+
+
 def test_add_crew_missing_name_shows_error(page_app):
     at = page_app.run()
 

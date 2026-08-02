@@ -14,7 +14,20 @@ from services import crew_service
 st.set_page_config(page_title="Crew Data", page_icon="👨‍✈️", layout="wide")
 st.title("Crew Data")
 
-ROLE_OPTIONS = ["CPT", "FO", "LM", "ENGR", "Other"]
+# CPT/FO only, per the operator's 2026-08-02 decision: Air Eagle's
+# crew records are CPT and FO — LM/AME are the operator's own
+# operational responsibility and are never tracked as crew here (see
+# scripts/import_crew_from_xlsx.py's EXCLUDED_ROLES and HANDOVER.md).
+# "Other" stays as the escape hatch for a genuinely unanticipated role
+# the operator hasn't described yet — not for LM/AME, which have a
+# specific, deliberate answer, not an open one.
+#
+# services/crew_service.py's role handling (ROLE_SYNONYMS, ROLE_PREFIXES,
+# _normalize_role()) is untouched — this is a page-level (Air-Eagle-
+# specific) restriction on what this form offers, not a platform-wide
+# rule. FTLguard itself still fully supports LM/ENGR crew records for
+# a future client; this form just doesn't invite creating them here.
+ROLE_OPTIONS = ["CPT", "FO", "Other"]
 
 
 # ================= DISPLAY =================
