@@ -295,8 +295,19 @@ resolved (it's AME), the age-65 rule's wording confirmed (still not
 built — still blocked on the pair-level architecture question), and
 auth confirmed deliberately parked pending the operator's answer on
 two open questions. See the dedicated 2026-08-02 log entry below for
-full detail. **Deliberately not merged** — same discipline as every
-prior piece, awaiting the user's own real-Postgres verification.
+full detail. **Verified by the user against real Postgres 16
+(313/313, migration 010 applied cleanly) and merged into `main`.**
+A small same-day follow-up (removing LM/ENGR from `pages/2_Crew_Data.py`'s
+role dropdown, closing the inconsistency this piece's own `Open stubs`
+flagged) is on its own branch, `crew-data-role-dropdown-cpt-fo-only`,
+**not yet merged**.
+
+**New, separate piece started 2026-08-02**: Step 6, transactional
+atomicity for Control Room's flight+assignment write, on branch
+`transactional-atomicity-control-room-write`. See the dedicated log
+entry below for full detail. **Deliberately not merged** — same
+discipline as every prior piece, awaiting the user's own real-Postgres
+verification.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -389,15 +400,29 @@ could only trace by hand. Filename format and both plan-approved
 report behaviors (crew_duty_history's notes/duty_id, roster_coverage's
 comma-joined role lists as they stood at the time) confirmed exact.
 
-**Unmerged, on branch `operator-crew-scope-and-coverage-reshape`**:
-313 total (301 on `main` + 12 net new — see the 2026-08-02 log entry
-for the exact breakdown). Verified locally: 139 passed, 174 skipped
-(no `TEST_DATABASE_URL` in this sandbox, same limitation as every
-prior piece). `_count_occupants()`'s "Nx ROLE" parsing was additionally
-confirmed correct by direct interpreter execution. `check_reachability.py`:
-`services/assistant/reports.py` still the only file flagged, unchanged
-by this piece; `core/duty_summary.py` still doesn't appear, since
-`utilization()` remains its first real caller anywhere in this app.
+**Independently verified by the user against real Postgres 16 and
+merged into `main`**: 313/313 passing on branch `operator-crew-scope-
+and-coverage-reshape` (301 on `main` + 12 net new — see the 2026-08-02
+log entry for the exact breakdown), including all 174 tests this
+environment could only trace by hand. Migration 010 confirmed to apply
+cleanly against a database already carrying data, no data loss.
+LM/AME exclusion confirmed to hold on well-formed rows, and
+`_count_occupants()`'s shorthand parsing confirmed correct.
+
+**Unmerged, on branch `crew-data-role-dropdown-cpt-fo-only`**: 314
+total (313 on `main` + 1 new, `test_role_dropdown_excludes_lm_and_engr`).
+Verified locally: 139 passed, 175 skipped.
+
+**Unmerged, on branch `transactional-atomicity-control-room-write`**:
+318 total (313 on `main`, this branch cut directly from `main` rather
+than from the still-unmerged crew-data-dropdown branch, + 5 net new —
+1 in `tests/test_assignment_service.py`'s Control Room regression
+test, 1 in its `assign_crew_to_duty()` counterpart, 3 in
+`tests/test_audit_service.py` for `log_audit()`'s new `conn` parameter).
+Verified locally: 139 passed, 179 skipped (no `TEST_DATABASE_URL` in
+this sandbox, same limitation as every prior piece). `check_reachability.py`:
+unchanged — `services/assistant/reports.py` still the only file
+flagged.
 
 ## Open stubs / known blockers
 - `services/assistant/reports.py` is the only file currently flagged
@@ -576,11 +601,13 @@ phase so far:
    (`_recompute_one_duty_after_delay()`) was unfiltered by status
    entirely. `find_legal_candidates_for_duty()`'s own, separate,
    larger per-candidate cost is explicitly deferred, not touched here.
-6. True transactional atomicity for Control Room's flight+assignment
-   write — currently 4 separate `engine.begin()` blocks, not one
-   transaction, so the "no orphan flight on rejection" guarantee
-   (tested and true today) doesn't extend to "no orphan flight if the
-   process crashes mid-sequence."
+6. ~~True transactional atomicity for Control Room's flight+assignment
+   write~~ DONE (2026-08-02, branch `transactional-atomicity-control-
+   room-write` — see the dedicated log entry below for full detail).
+   The 4 separate `engine.begin()` blocks in `assign_crew_to_new_flights()`'s
+   ALLOWED path are now one transaction; `assign_crew_to_duty()`'s
+   smaller-scale version of the same gap (roster insert + its audit
+   record) is fixed the same way.
 7. **Age-pairing rule — now well-specified, still not built.**
    CONFIRMED route-dependent, not uniform (updated 2026-07-21, after
    the single-rule version above was recorded): for a rotation's
@@ -2292,5 +2319,111 @@ report tests grew by 1 net, two old tests replaced by two new ones).
 this sandbox — the DB-integration tests here are traced by hand, not
 run, same limitation as every prior piece). `check_reachability.py`:
 `services/assistant/reports.py` still the only file flagged, unchanged
-by this piece. **NOT MERGED** — awaiting the user's own real-Postgres
+by this piece. **RESOLVED 2026-08-02**: independently verified by the
+user against real Postgres 16 — 313/313 passing, migration 010
+confirmed to apply cleanly, LM/AME exclusion confirmed to hold on
+well-formed rows, `_count_occupants()` confirmed correct. Merged into
+`main`. (The small `pages/2_Crew_Data.py` role-dropdown follow-up this
+piece's own `Open stubs` flagged is on its own branch,
+`crew-data-role-dropdown-cpt-fo-only`, not yet merged as of this
+entry.)
+
+## 2026-08-02 (continued): Step 6 — transactional atomicity for
+## Control Room's flight+assignment write, extended to
+## assign_crew_to_duty() too. NOT MERGED.
+
+Plan proposed and approved (with one addition, one extension, and one
+docstring clarification) before implementation. Built on branch
+`transactional-atomicity-control-room-write`, off `main` at the
+`operator-crew-scope-and-coverage-reshape` merge commit.
+
+**The problem, confirmed by reading the code before proposing anything**:
+`assign_crew_to_new_flights()`'s ALLOWED path (Control Room's ad-hoc
+flight-creation-plus-assignment) was FOUR separate, independently-
+committed transactions: `INSERT INTO flights`, `log_audit(FLIGHT_ADDED)`
+(which opens its own transaction internally), `INSERT INTO roster`,
+`log_audit(ASSIGNMENT_CREATED)`. The existing "no orphan flight on
+rejection" guarantee is real and tested — nothing is written at all on
+ILLEGAL/NEEDS_MANUAL_REVIEW — but once the gate passes and writing
+starts, a crash between steps 1 and 3 left a real, committed, uncrewed
+flight sitting in Flight Log: the exact orphan the gate exists to
+prevent, just relocated to a later failure window.
+
+Also confirmed directly: `assign_crew_to_duty()` (the Roster page's
+path, assigning crew to a flight that already exists) doesn't have the
+orphan-FLIGHT version of this problem — only one table is ever written
+there (`roster`) — but it has the same class of gap at smaller scale:
+its own roster insert and its own `ASSIGNMENT_CREATED` audit call were
+two separate transactions, so a crash between them left a committed
+roster row with no audit trail for it. `_check_downstream_impact()`
+was confirmed read-only (only reads and returns candidates for
+display; "alert + suggest, human confirms" is the existing, deliberate
+design, not an auto-write) and correctly stays outside any transaction,
+run after commit so it can see the newly-written duty.
+
+**Fix**: `services/audit_service.log_audit()` gained an optional `conn`
+parameter. When passed an already-open `Connection` (e.g. from
+`with engine.begin() as conn:`), it executes the audit INSERT directly
+on that connection instead of opening its own transaction — folding
+the audit write into the caller's transaction. When `conn` is `None`
+(the default, and every pre-existing call site across the codebase),
+behavior is unchanged. Both `assign_crew_to_new_flights()` and
+`assign_crew_to_duty()` now wrap their entire write sequence — data
+insert(s) plus every `log_audit()` call in that sequence — in one
+`engine.begin()` block, passing `conn=conn` through. Either every write
+in the sequence commits, or none does.
+
+**Explicit behavioral note, added to `log_audit()`'s docstring per
+review feedback**: passing `conn` means the audit record shares the
+CALLER's transaction fate — if the caller's transaction later rolls
+back, the audit record disappears with it, unlike every other call to
+this function (which always commits independently regardless of what
+happens around it). This is the correct behavior here (an audit record
+for a write that never actually happened would be worse than no record
+at all), but it's a genuine difference from the default that needed
+stating explicitly rather than left to be discovered by surprise.
+
+**Included per review feedback**: the `assign_crew_to_duty()` extension
+was originally offered as optional/your-call in the proposed plan;
+approved for inclusion in this same piece rather than split out,
+specifically because leaving it out would mean two write paths with
+different transactional guarantees for no discoverable reason, and a
+committed roster row with a lost audit entry is a real gap in a
+permanent regulatory record.
+
+**Out of scope, unchanged from the plan**: `_recompute_one_duty_after_delay()`
+/ `update_flight_actual_times_and_revalidate()` (Step 5's delay-recompute
+path) and `cancel_flight_and_roster()` (Step 5's cancel cascade) have
+the same write-then-separately-audit pattern. Not touched here — a
+broader audit-atomicity pass across every write path is a separate,
+deliberate piece of work.
+
+**Tests**: 5 new. `tests/test_assignment_service.py` gained the direct
+regression test — monkeypatches `assignment_service.log_audit` so its
+SECOND call (`ASSIGNMENT_CREATED`) raises mid-sequence, calls
+`assign_crew_to_new_flights()` on an otherwise-LEGAL scenario, and
+confirms BOTH `flights` and `roster` are still empty afterward (the
+flight insert and the first audit call genuinely "succeeded" moments
+before the simulated crash, and must not survive the rollback) — plus
+the `assign_crew_to_duty()` counterpart (roster insert must not survive
+a crash at its own audit call). `tests/test_audit_service.py` gained
+three tests for `log_audit()`'s new parameter, added per review
+feedback rather than assumed obvious: `conn=` genuinely writes a
+queryable row on the normal success path (not just "raises no
+exception" — a conn-passing bug that silently never executes on the
+passed connection would only show up as missing audit rows in
+production, so this is the test that would catch exactly that);
+`conn=` shares the caller's rollback (the audit row is confirmed gone
+after a forced rollback); and the no-`conn` default still commits
+independently, unaffected by the new parameter's existence.
+
+**Verification status**: 318 total (313 on `main`, cut directly from
+`main` rather than the still-unmerged `crew-data-role-dropdown-cpt-fo-only`
+branch, + 5 net new). `pytest tests/`: 139 passed, 179 skipped (no
+`TEST_DATABASE_URL` in this sandbox — the new regression tests are
+traced by hand here, not run; the logic was reasoned through directly
+against `engine.begin()`'s standard rollback-on-exception semantics,
+which this fix relies on rather than reimplements). `check_reachability.py`:
+unchanged — `services/assistant/reports.py` still the only file
+flagged. **NOT MERGED** — awaiting the user's own real-Postgres
 verification, same discipline as always.
