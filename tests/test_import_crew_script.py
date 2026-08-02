@@ -182,6 +182,47 @@ def test_missing_name_or_role_is_skipped(tmp_path):
     assert len(results["skipped_empty"]) == 1
 
 
+@pytest.mark.parametrize("role_text", ["LM", "lm", "Loadmaster", "LOAD MASTER", "Load Master"])
+def test_loadmaster_role_is_never_imported_even_when_clean(tmp_path, role_text):
+    """Air Eagle's crew records are CPT/FO only (2026-08-02 operator
+    decision) — a Loadmaster row must be skipped even when every
+    other field is perfectly well-formed. This is the direct
+    regression test for 'permanently irrelevant rather than blocking':
+    the real 2026-07-21 Loadmaster section happens to be misaligned
+    today, but this must hold independently of that, so a future
+    correctly-filled-in Loadmaster row still never imports."""
+    path = _build_workbook([_clean_row(Role=role_text)], tmp_path)
+    results = read_rows(path)
+    assert results["imported"] == []
+    assert results["skipped_misaligned"] == []
+    assert len(results["skipped_operator_managed_role"]) == 1
+
+
+@pytest.mark.parametrize("role_text", ["ENGR", "engr", "AME", "ame", "Engineer"])
+def test_engineer_ame_role_is_never_imported_even_when_clean(tmp_path, role_text):
+    """Same operator decision, same reasoning, for AME/engineer —
+    Air Eagle's crew records are CPT/FO only; AME is the operator's
+    own responsibility, tracked nowhere in this system as a crew
+    record."""
+    path = _build_workbook([_clean_row(Role=role_text)], tmp_path)
+    results = read_rows(path)
+    assert results["imported"] == []
+    assert len(results["skipped_operator_managed_role"]) == 1
+
+
+def test_loadmaster_exclusion_checked_before_misalignment(tmp_path):
+    """A Loadmaster row that IS also misaligned (the real, current
+    state of the 2026-07-21 workbook's Loadmaster section) must still
+    land in skipped_operator_managed_role, not skipped_misaligned —
+    the role check runs first, so the reported reason is the real,
+    permanent one, not a data-quality issue that sounds fixable."""
+    path = _build_workbook([_clean_row(Role="LM", Base=dt.datetime(2027, 4, 1))], tmp_path)
+    results = read_rows(path)
+    assert results["imported"] == []
+    assert results["skipped_misaligned"] == []
+    assert len(results["skipped_operator_managed_role"]) == 1
+
+
 def test_multiple_rows_mixed_outcomes(tmp_path):
     """Sanity check that one bad row doesn't affect processing of the
     others in the same file."""

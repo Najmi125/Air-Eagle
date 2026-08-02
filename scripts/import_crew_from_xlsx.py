@@ -6,9 +6,23 @@ collection template into the crew table, via crew_service.add_crew()
 — never raw SQL, same rule as everywhere else in this repo.
 
 This is NOT a one-off script for the 2026-07-21 data drop — it's
-meant to be reused for every future batch (corrected loadmasters,
-additional pilots, etc.), so it does real validation rather than
-blindly trusting the spreadsheet:
+meant to be reused for every future batch (additional pilots, etc.),
+so it does real validation rather than blindly trusting the
+spreadsheet:
+
+  - Skips any row whose Role is Loadmaster or AME/Engineer, always,
+    regardless of how clean that row's other fields are. Operator
+    decision (2026-08-02): Air Eagle's crew records are CPT and FO
+    only — LM/AME are the operator's own operational responsibility,
+    tracked nowhere in this system except as free text on the flight
+    itself (services/flight_service.py's other_occupants_operating/
+    other_occupants_non_operating columns, migrations/010). This is
+    what makes the still-misaligned Loadmaster section of the
+    2026-07-21 workbook (see below) permanently irrelevant rather
+    than something that just needs redoing — even a perfectly
+    realigned LM/AME row will never import, on purpose. See
+    HANDOVER.md for the full reasoning and the accepted DG-tracking
+    consequence.
 
   - Flags any row where a text field (Role/DOB/Nationality/Base/
     Ph No/Email/License No) actually contains a datetime value
@@ -67,6 +81,15 @@ HEADER_MAP = {
 # 2026-08-01). Any workbook still carrying these columns will simply
 # have them ignored (HEADER_MAP.get() returns None for unmapped
 # headers, see read_rows() below), not misfiled elsewhere.
+
+# Role text (any case/spacing) that is never imported as a crew
+# record for Air Eagle — see the module docstring. Checked directly
+# against the raw sheet value, independent of HEADER_MAP/crew_service's
+# own normalization, and independent of whether the row is otherwise
+# misaligned: this must hold even for a row that isn't misaligned at
+# all, which crew_service.ROLE_SYNONYMS alone would not guarantee
+# (that dict maps "AME" -> "ENGR", it doesn't exclude either).
+EXCLUDED_ROLES = {"LM", "LOADMASTER", "LOAD MASTER", "ENGR", "AME", "ENGINEER"}
 
 TEXT_FIELDS = {"role", "nationality", "base", "phone", "email", "license_no"}
 DATE_FIELDS = {
@@ -145,7 +168,10 @@ def read_rows(path):
     ws = wb["Crew Data"]
     headers = [ws.cell(row=2, column=c).value for c in range(1, ws.max_column + 1)]
 
-    results = {"imported": [], "skipped_misaligned": [], "skipped_suspect_date": [], "skipped_empty": []}
+    results = {
+        "imported": [], "skipped_misaligned": [], "skipped_suspect_date": [],
+        "skipped_empty": [], "skipped_operator_managed_role": [],
+    }
 
     for row_num in range(3, ws.max_row + 1):
         raw = {headers[c - 1]: ws.cell(row=row_num, column=c).value for c in range(1, len(headers) + 1)}
@@ -155,6 +181,17 @@ def read_rows(path):
             continue
 
         row_name = raw.get("Name")
+
+        # Checked first, against the RAW sheet value, before any
+        # misalignment/suspect-date handling below — a row must never
+        # import just because it happens to be well-formed. This is
+        # the check that makes the Loadmaster section permanently
+        # irrelevant rather than merely "still needs fixing."
+        raw_role = str(raw.get("Role") or "").strip().upper()
+        if raw_role in EXCLUDED_ROLES:
+            results["skipped_operator_managed_role"].append((row_num, row_name, raw_role))
+            continue
+
         record = {}
         misaligned = False
         suspect = False
@@ -209,6 +246,10 @@ def main():
     results = read_rows(args.path)
 
     print(f"Rows ready to import: {len(results['imported'])}")
+    print(f"Rows skipped (LM/AME — operator-managed, never imported as crew): "
+          f"{len(results['skipped_operator_managed_role'])}")
+    for row_num, name, raw_role in results["skipped_operator_managed_role"]:
+        print(f"  row {row_num}: {name} (Role: {raw_role})")
     print(f"Rows skipped (misaligned columns): {len(results['skipped_misaligned'])}")
     for row_num, name in results["skipped_misaligned"]:
         print(f"  row {row_num}: {name}")

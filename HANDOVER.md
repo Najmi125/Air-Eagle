@@ -282,9 +282,21 @@ purpose `Dataset`/CSV/XLSX/Markdown export, reused by every future
 data-bearing page's export button, not assistant-only) and
 `services/assistant/regulation_reference.py` (curated ANO-012 section
 summaries backing the `regulation` template). See the dedicated log
-entry below for full detail. **Deliberately not merged** — same
-discipline as every prior piece, awaiting the user's own real-Postgres
-verification.
+entry below for full detail. **Verified by the user against real
+Postgres 16 (301/301) and merged into `main`.**
+
+**New, separate piece started 2026-08-02**: five operator decisions
+implemented together on branch `operator-crew-scope-and-coverage-
+reshape` — Air Eagle's crew records narrowed to CPT/FO only (LM/AME
+are the operator's own responsibility, tracked nowhere in this system
+except as free text per flight), `roster_coverage()` reshaped to
+Date/Flight/Route/CPT/FO/occupants/POB/Remarks accordingly, "VAI"
+resolved (it's AME), the age-65 rule's wording confirmed (still not
+built — still blocked on the pair-level architecture question), and
+auth confirmed deliberately parked pending the operator's answer on
+two open questions. See the dedicated 2026-08-02 log entry below for
+full detail. **Deliberately not merged** — same discipline as every
+prior piece, awaiting the user's own real-Postgres verification.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -365,24 +377,27 @@ by the user against real Postgres 16: 178/178 passing, migration 008
 confirmed to drop both columns cleanly against a database already
 carrying crew data, no data loss.
 
-**Unmerged, on branch `assistant-report-functions`**: 301 total (255
-already on `main` as of the `query-parser` merge this branch was cut
-from, + 46 genuinely new — 18 in the new tests/test_reporting_export.py,
-28 in the new tests/test_assistant_reports.py; `flight_service.get_all_flights()`
-and `assignment_service.search_roster()` were extended in place, not
-duplicated, so neither adds a test file of its own). Verified locally: 128 passed,
-173 skipped (no `TEST_DATABASE_URL` in this sandbox, same limitation as
-every prior piece). The 18 pure-logic export tests and 8 pure-logic
-regulation-boundary tests among the 28 in test_assistant_reports.py
-were additionally confirmed correct by direct interpreter execution,
-bypassing the DB-gated pytest fixture that would otherwise skip them
-here too — see the dedicated log entry below. The remaining 20 DB-
-integration tests (one/two per report function, against real seeded
-crew/flights/roster/audit_log rows) are traced by hand, not run — flag
-this explicitly when verifying. `check_reachability.py`: exactly
-`services/assistant/reports.py` flagged (correctly — not wired into
-any page yet); `core/duty_summary.py` no longer appears, since
-`utilization()` is now its first real caller anywhere in this app.
+**Independently verified by the user against real Postgres 16 and
+merged into `main`**: 301/301 passing on branch `assistant-report-
+functions` (255 already on `main` as of the `query-parser` merge this
+branch was cut from, + 46 genuinely new — 18 in
+tests/test_reporting_export.py, 28 in tests/test_assistant_reports.py;
+`flight_service.get_all_flights()` and `assignment_service.search_roster()`
+were extended in place, not duplicated, so neither adds a test file of
+its own) — including all 20 DB-integration tests this environment
+could only trace by hand. Filename format and both plan-approved
+report behaviors (crew_duty_history's notes/duty_id, roster_coverage's
+comma-joined role lists as they stood at the time) confirmed exact.
+
+**Unmerged, on branch `operator-crew-scope-and-coverage-reshape`**:
+313 total (301 on `main` + 12 net new — see the 2026-08-02 log entry
+for the exact breakdown). Verified locally: 139 passed, 174 skipped
+(no `TEST_DATABASE_URL` in this sandbox, same limitation as every
+prior piece). `_count_occupants()`'s "Nx ROLE" parsing was additionally
+confirmed correct by direct interpreter execution. `check_reachability.py`:
+`services/assistant/reports.py` still the only file flagged, unchanged
+by this piece; `core/duty_summary.py` still doesn't appear, since
+`utilization()` remains its first real caller anywhere in this app.
 
 ## Open stubs / known blockers
 - `services/assistant/reports.py` is the only file currently flagged
@@ -401,14 +416,27 @@ any page yet); `core/duty_summary.py` no longer appears, since
   through to `flight_service.get_all_flights()`, so this fixes itself
   the moment the parser starts setting it — a small, separate parser
   enhancement, not touched as part of the report functions themselves.
-- `roster_coverage`'s required-crew-count-per-role is UNCONFIRMED and
-  currently assumed to be "at least 1" (a role is `UNCOVERED` only
-  when its crew_id list is empty, never when it holds more than one).
-  Real Air Eagle flight data shows at least one rotation with 2
-  engineers assigned ("Eng: 2x VAI") — deliberately NOT flagged as an
-  anomaly. If the operator ever confirms an exact required count per
-  role (e.g. "always exactly 1 CPT, never 2"), tighten this into a
-  real over/under-staffing check rather than presence/absence only.
+- RESOLVED 2026-08-02: `roster_coverage`'s earlier "required-crew-
+  count-per-role is unconfirmed" open question no longer applies —
+  see the dedicated log entry below. Coverage is now CPT/FO only;
+  LM/AME are never crew records for Air Eagle at all, so there's no
+  role-count question left to resolve for them.
+- **DG certification for LM/AME is untrackable, accepted deliberately
+  (ASSUMPTION, needs airline validation)** — see the 2026-08-02 log
+  entry below. `flights.cargo_dg` and `crew.dg_expiry` both exist, but
+  free-text occupant names can't be checked against either once
+  neither role has a crew record. The operator's stated position is
+  that OCC handles this by process. If DG tracking through this
+  system ever matters, reintroducing LM/AME as crew records (even
+  without FTL applicability) is the fix.
+- `pages/2_Crew_Data.py`'s manual "Add crew member" form still offers
+  LM and ENGR as selectable roles, inconsistent with
+  `scripts/import_crew_from_xlsx.py` now permanently excluding both
+  from bulk import (2026-08-02). Not changed here — the operator's
+  instruction was scoped to the import script — but flagged as a real
+  inconsistency: a controller could still manually create an LM/ENGR
+  crew record through the UI today. Worth a deliberate decision before
+  it matters, not a silent fix.
 - `services/assistant/regulation_reference.py`'s numbers are boundary-
   tested against the real validator for D9.1.1/D9.1.2/D9.1.3/D9.2.1/
   D9.2.2/D9.2.3/D21.1/D8.2.1 (see `tests/test_assistant_reports.py`).
@@ -455,11 +483,18 @@ any page yet); `core/duty_summary.py` no longer appears, since
   line-maintenance AME) — flagged on the crew data template,
   still pending with the rest of the operator data.
 - Auth (require_login/require_permission) is NOT wired anywhere yet
-  — none of the four pages have any access control right now. Needs
-  a real decision on when to build this — not urgent while only
-  synthetic test data exists, genuinely urgent before any real
-  operator data goes in permanently. This gap has now persisted
-  across 6 phases; worth deciding deliberately rather than by default
+  — none of the four pages have any access control right now. A plan
+  was proposed 2026-08-02 (self-contained `users` table + password
+  hashing, recommended over Supabase Auth or a static secrets-file
+  list since nothing else in this repo uses an external SDK; a
+  role-granularity question and a session-persistence question were
+  sent to the operator for a decision). **Deliberately parked, not an
+  oversight**: the operator hasn't answered either question yet, and
+  building ahead of that answer risks the same rework this project's
+  own discipline has repeatedly avoided elsewhere. Not urgent while
+  only synthetic test data exists, genuinely urgent before any real
+  operator data goes in permanently. This gap has now persisted across
+  6+ phases; still worth deciding deliberately rather than by default
   much longer.
 - Supabase: DATABASE_URL is saved locally (2026-07-19) but
   dependencies (`pip install -r requirements.txt`) hadn't been
@@ -827,20 +862,27 @@ Findings and fixes, in the order they happened:
   directly collide with this exact data (mixed domestic/international
   within one duty; no geographic continuity check) and need fixing
   before this data can actually be used correctly.
-- **"Eng: 2x VAI" in the real flight examples — meaning not yet
-  confirmed.** Don't assume what VAI means; ask before building
-  anything around it.
-- **Age-65 rule flagged as IMPORTANT by the user, NOT yet
-  implemented.** "At least 01 crew member below 65 yrs... applicable
-  to EPE." Checked the actual ANO-012 document (OCR'd the scanned
-  PDF, searched for "age"/"65"/"60" across all 32 pages) — confirmed
-  this document (titled "FATIGUE MANAGEMENT — FLIGHT AND CABIN CREW")
-  contains NO age-eligibility provision at all; this is a licensing
-  restriction, not an FTL/fatigue one, and lives in a different PCAA
-  order this repo doesn't have. User is getting the exact wording
-  from the licensing ANO before this gets built — do NOT implement
-  from general ICAO knowledge in the meantime, the exact rule
-  (simple 65 cutoff vs. a 60-65 sub-band rule) is still unconfirmed.
+- **RESOLVED 2026-08-02: "VAI" is dropped entirely.** The operator
+  confirmed it should be read as AME — not a separate term, not a
+  meaning this system needs to track. The open question this bullet
+  used to record no longer applies; see the 2026-08-02 log entry for
+  where "Eng: 2x VAI" actually came from (a real flight example) and
+  why it no longer appears anywhere in this codebase after
+  `roster_coverage()`'s reshape.
+- **Age-65 rule wording CONFIRMED 2026-08-02, still NOT implemented.**
+  "At least 01 crew member below 65 yrs... applicable to EPE." Checked
+  the actual ANO-012 document (OCR'd the scanned PDF, searched for
+  "age"/"65"/"60" across all 32 pages) — confirmed this document
+  (titled "FATIGUE MANAGEMENT — FLIGHT AND CABIN CREW") contains NO
+  age-eligibility provision at all; this is a licensing restriction,
+  not an FTL/fatigue one, and lives in a different PCAA order this
+  repo doesn't have. The operator has now confirmed the exact wording
+  matches what's already recorded in "Next safest step" item 7 below
+  (domestic: illegal only if BOTH pilots are 65+; international:
+  illegal if EITHER pilot is 65+) — the regulatory wording is settled.
+  Still NOT built: still blocked on the pair-level architecture
+  question (assignment happens one crew member at a time today; this
+  rule needs to see both pilots on a rotation together).
 
 ## 2026-07-21: external code review — verified, mostly correct, two
 ## findings now urgent given the route data above
@@ -2082,8 +2124,173 @@ template running end-to-end without error against an empty database.
 passed" above for the exact breakdown. `pytest tests/`: 128 passed, 173
 skipped (no `TEST_DATABASE_URL` here). `check_reachability.py`:
 `services/assistant/reports.py` flagged (correct — not wired into a
-page yet); `core/duty_summary.py` no longer flagged. **NOT MERGED —
-explicit**, same discipline as every prior piece: the 20 DB-integration
-tests and every report function's actual behavior against real
-crew/flight/roster/audit_log data still need the user's own real-
-Postgres verification before this merges.
+page yet); `core/duty_summary.py` no longer flagged. **RESOLVED
+2026-08-02**: independently verified by the user against real
+Postgres 16 — 301/301 passing, including all 20 DB-integration tests
+this environment could only trace by hand — plus a direct check that
+the filename format and both plan-approved report behaviors
+(`crew_duty_history`'s notes/`duty_id`, `roster_coverage`'s
+comma-joined role lists) matched spec. Merged into `main`.
+
+## 2026-08-02: Air Eagle's crew records narrowed to CPT/FO only —
+## LM/AME become the operator's own responsibility, tracked nowhere
+## in this system except as free text per flight. `roster_coverage()`
+## reshaped to match. Plus: "VAI" resolved, age-rule wording settled,
+## auth confirmed deliberately parked. NOT MERGED.
+
+Five operator decisions came back in one batch; implemented together
+on branch `operator-crew-scope-and-coverage-reshape`, off `main` at
+the `assistant-report-functions` merge commit.
+
+**1. Air Eagle's crew records are CPT and FO only — a real reversal of
+the 2026-07-21 position.** That earlier finding ("Engr is AME... No
+FTL applicable... same on LM") treated LM/AME as FTL-EXEMPT CREW
+RECORDS — real rows in the `crew` table, just exempt from FDP/rest
+math via `FTL_EXEMPT_ROLES`. The operator's 2026-08-02 decision goes
+further: LM and AME are not crew records **at all**, for Air Eagle
+specifically. They fly on real rotations, but FTLguard doesn't track
+them as crew — that's the operator's own operational responsibility.
+This directly explains why the 2026-07-21 Loadmaster spreadsheet
+section (rows 16-19, misaligned — dates ended up in Base/Email/
+License No, never imported) was never worth fixing: even a perfectly
+realigned Loadmaster row was always going to hit this exclusion.
+
+**Explicitly NOT touched, per the operator's own instruction**: the
+FTL-exemption machinery itself — `FTL_EXEMPT_ROLES = {"LM", "ENGR"}`,
+the exemption branches in `_validate_new_duty()`/
+`_check_downstream_impact()`/`find_legal_candidates_for_duty()`, and
+their ~7 dedicated tests all stay exactly as built. This is FTLguard's
+CORE-vs-AIRLINE-CONFIG split working as designed: a future scheduled-
+carrier client may roster loadmasters/engineers who ARE FTL-exempt
+crew records on that platform. Air Eagle simply chooses not to create
+those records at all — a data/import decision, not a code branch.
+There is no `if airline == "AirEagle"` anywhere in this change, and
+there shouldn't be one.
+
+Concretely: `scripts/import_crew_from_xlsx.py` gained `EXCLUDED_ROLES
+= {"LM", "LOADMASTER", "LOAD MASTER", "ENGR", "AME", "ENGINEER"}`,
+checked against the RAW sheet value for every row, before the
+misalignment/suspect-date logic even runs — so a row is excluded for
+being LM/AME independent of whether it's otherwise clean, not as a
+side effect of the existing "text field holds a date" check. Neither
+`crew_service.py`'s `ROLE_SYNONYMS`/`ROLE_PREFIXES` nor
+`assignment_service.py`'s `FTL_EXEMPT_ROLES`/`QUALIFICATION_EXPIRY_FIELDS`
+were touched — existing LM/ENGR crew data (synthetic test fixtures,
+or any real row already imported) stays completely valid; this is
+about what gets imported going forward, exactly the same principle
+already established for the type_rating_expiry/contract_expiry
+removal (migrations/008).
+
+**Known, accepted consequence — flagged as an explicit ASSUMPTION,
+not a silent gap**: DG certification for whoever is actually handling
+dangerous goods aboard (a loadmaster, an AME) is now untrackable
+through this system for Air Eagle. `flights.cargo_dg` flags a flight
+as carrying DG; `crew.dg_expiry` exists as a qualification field — but
+neither LM nor AME has a crew record anymore, and a free-text occupant
+name can't be cross-referenced against either column. On a cargo
+airline, someone handling DG with lapsed certification is a real
+regulatory exposure, separate from FTL (which they were already
+exempt from). Accepted deliberately on the operator's stated position
+that OCC handles this by process, not by this system — same reasoning
+already used for the type_rating_expiry/contract_expiry removal. If DG
+tracking through this system ever matters, reintroducing LM/AME as
+crew records (even with no FTL applicability at all) is the fix, not
+a workaround bolted onto the free-text fields below.
+
+**2. `roster_coverage()` reshaped — supersedes the CPT/FO/LM/ENGR
+comma-joined design from the previous piece entirely.** New columns,
+exactly as specified: Date | Flight | Route | CPT | FO | Other
+occupants — operating | Other occupants — non-operating | POB |
+Remarks.
+
+- Coverage is CPT/FO only, matching item 1 above — a cockpit column
+  shows `UNCOVERED` only when that seat has no assigned crew_id.
+  Neither occupant column can ever produce `UNCOVERED`; they're
+  informational, not a coverage check.
+- "Operating" = aboard and performing a function (a loadmaster working
+  the load, an AME on maintenance duty); "non-operating" = aboard but
+  not working, reason (if any) goes in Remarks. Both are plain OCC-
+  entered free text — two new nullable columns on `flights`
+  (`other_occupants_operating`, `other_occupants_non_operating`,
+  migrations/010), not a structured occupants table, not a category
+  list. `roster_coverage()` does not parse, classify, or cross-
+  reference these against `crew` at all — "the system doesn't classify
+  why someone is aboard" is the operator's own stated position, and
+  the code takes that literally: it displays whatever text is there.
+- POB is the one place free text gets interpreted, and only to count
+  heads: 2 cockpit crew (or however many of the 2 seats are actually
+  filled — not hardcoded to 2, since an `UNCOVERED` seat must not
+  silently count as a person) plus every name in both occupant
+  columns. OCC's own real shorthand for "more than one person in a
+  single free-text entry" — confirmed twice now, first as "Eng: 2x
+  VAI" in the 2026-07-21 real data, now again as the operator's own
+  "2x AME" example — is recognized by a small `Nx ROLE` prefix pattern
+  (`_count_occupants()`), so "Abdulghani (LM), 2x AME" correctly counts
+  as 3 people, not 2 comma-separated segments.
+- No UI page writes to the two new `flights` columns yet —
+  `flight_service.py`'s `UPDATABLE_FIELDS` accepts them (so
+  `add_flight()`/`update_flight()` CAN set them), and `roster_coverage()`
+  reads them, but nothing in `pages/3_Flight_Log.py`'s form collects
+  them today. Flagged in `Open stubs`, not silently left half-built:
+  OCC has nowhere to actually enter this data through the UI yet.
+
+**3. "VAI" resolved — the operator confirmed it's just AME**, not a
+separate term needing its own investigation. The open question this
+used to be (`services/assistant/reports.py`'s notes referenced "Eng:
+2x VAI" from real 2026-07-21 flight data with unconfirmed meaning) no
+longer applies — item 2's reshape removes every reference to it from
+the codebase (the old comma-joined ENGR column and its notes entry are
+gone entirely), and the open question is removed from `Open stubs`
+above.
+
+**4. Age-65 rule wording CONFIRMED, still NOT built.** The operator
+confirmed the exact regulatory wording already recorded in "Next
+safest step" item 7 is correct: domestic requires at least 1 pilot
+under 65 (illegal only if BOTH are 65+); international requires BOTH
+pilots under 65 (illegal if EITHER is 65+). Still blocked on the same
+architecture question as before — assignment happens one crew member
+at a time today, and this rule needs to see both pilots on a rotation
+together before it can evaluate anything. Not part of this piece's
+scope; recorded here only to mark the wording itself as settled, not
+open for re-litigation.
+
+**5. Auth stays parked — a deliberate deferral, recorded as such, not
+an oversight.** A plan was proposed 2026-08-02 covering roles, where
+the checks would go (`require_login()`/`require_permission()` at the
+top of `app.py` and all four pages), how it would interact with
+`app_user` in the audit trail (currently always `None` at every page
+call site — the plan would thread the authenticated username through
+instead, with no service-layer signature changes needed, since every
+write function already accepts `app_user: Optional[str] = None`), and
+what would happen to the existing 4 page-level `AppTest`-based test
+files (each would need its shared `page_app` fixture to pre-seed
+`session_state` with an authenticated test user, consolidated into one
+place rather than duplicated 4 times). Two genuine architectural
+questions — permission granularity (single tier vs. a CONTROLLER/ADMIN
+split) and whether login needs to survive a hard browser refresh —
+were sent to the operator and have not come back yet. Not implemented
+pending that answer; see `Open stubs` above.
+
+**Tests**: 25 new/changed — 6 in `tests/test_import_crew_script.py`
+(parametrized across LM/AME spelling variants: `LM`, `Loadmaster`,
+`Load Master`, `ENGR`, `AME`, `Engineer`, case-insensitive; plus the
+direct regression test that a Loadmaster row which is ALSO misaligned
+still reports as excluded-for-being-LM, not misaligned — the reason
+reported must be the real, permanent one); 3 changed in
+`tests/test_assistant_reports.py` (`roster_coverage`'s new column
+shape, `UNCOVERED` triggering only on a missing cockpit seat and never
+on occupant columns, POB counting including the "2x AME" shorthand,
+cancelled-flight exclusion retained unchanged). `_count_occupants()`'s
+"Nx ROLE" parsing was additionally confirmed correct by direct
+interpreter execution in this sandbox (`"Abdulghani (LM), 2x AME"` ->
+3), same discipline as the boundary tests in the previous piece.
+
+**Verification status**: 313 total (301 already on `main`, + 12 net
+new — the import-script file grew from 12 to 23 tests, +11; the
+report tests grew by 1 net, two old tests replaced by two new ones).
+`pytest tests/`: 139 passed, 174 skipped (no `TEST_DATABASE_URL` in
+this sandbox — the DB-integration tests here are traced by hand, not
+run, same limitation as every prior piece). `check_reachability.py`:
+`services/assistant/reports.py` still the only file flagged, unchanged
+by this piece. **NOT MERGED** — awaiting the user's own real-Postgres
+verification, same discipline as always.

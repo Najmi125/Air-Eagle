@@ -271,23 +271,26 @@ def test_utilization_peak_window_added_only_when_window_days_set(_patch_engine):
 # roster_coverage
 # ------------------------------------------------------------------
 
-def test_roster_coverage_flags_uncovered_roles_and_allows_multiple_per_role(_patch_engine):
+def test_roster_coverage_shows_cockpit_crew_and_free_text_occupants(_patch_engine):
+    """Air Eagle's crew records are CPT/FO only (2026-08-02 operator
+    decision) — LM/AME are never crew rows, so they only ever show up
+    as the free text OCC typed into flights.other_occupants_operating/
+    non_operating. POB must count real heads, including the "Nx ROLE"
+    shorthand for more than one person in a single free-text entry."""
     engine = _patch_engine
     cpt = _add_crew("CPT")
     fo = _add_crew("FO")
-    engr_1 = _add_crew("ENGR")
-    engr_2 = _add_crew("ENGR")
-    flight_id = _add_flight(dt.datetime(2026, 7, 5, 5, 0), dt.datetime(2026, 7, 5, 8, 0))
-
+    flight_id = _add_flight(
+        dt.datetime(2026, 7, 5, 5, 0), dt.datetime(2026, 7, 5, 8, 0),
+        origin="KHI", destination="LHE", flight_no="EPE 786",
+        other_occupants_operating="Abdulghani (LM), 2x AME",
+        other_occupants_non_operating="Client rep",
+        remarks="VIP aboard",
+    )
     _seed_duty(engine, cpt, flight_id, "CPT",
                dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
     _seed_duty(engine, fo, flight_id, "FO",
                dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
-    _seed_duty(engine, engr_1, flight_id, "ENGR",
-               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
-    _seed_duty(engine, engr_2, flight_id, "ENGR",
-               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
-    # LM deliberately left unassigned.
 
     request = _resolved_request(
         "roster_coverage", date_from=dt.date(2026, 7, 1), date_to=dt.date(2026, 7, 31),
@@ -295,12 +298,43 @@ def test_roster_coverage_flags_uncovered_roles_and_allows_multiple_per_role(_pat
     ds = reports.roster_coverage(request)
     assert len(ds.rows) == 1
     row = dict(zip(ds.headers, ds.rows[0]))
+
+    assert row["Date"] == dt.date(2026, 7, 5)
+    assert row["Flight"] == "EPE 786"
+    assert row["Route"] == "KHI-LHE"
     assert row["CPT"] == cpt
     assert row["FO"] == fo
-    assert set(row["ENGR"].split(", ")) == {engr_1, engr_2}
-    assert row["LM"] == ""
-    assert row["uncovered_roles"] == "LM"
-    assert ds.notes and "Eng: 2x VAI" in ds.notes[0]
+    assert row["Other occupants — operating"] == "Abdulghani (LM), 2x AME"
+    assert row["Other occupants — non-operating"] == "Client rep"
+    assert row["Remarks"] == "VIP aboard"
+    # 2 cockpit crew + Abdulghani (1) + 2x AME (2) + Client rep (1) = 6
+    assert row["POB"] == 6
+    assert ds.notes
+    assert not any("uncovered cockpit seat" in note for note in ds.notes)
+
+
+def test_roster_coverage_marks_uncovered_only_for_missing_cockpit_seat(_patch_engine):
+    """Occupant columns must never trigger UNCOVERED — only an unfilled
+    CPT or FO seat does."""
+    engine = _patch_engine
+    cpt = _add_crew("CPT")
+    flight_id = _add_flight(
+        dt.datetime(2026, 7, 5, 5, 0), dt.datetime(2026, 7, 5, 8, 0),
+        other_occupants_operating="2x AME",
+    )
+    _seed_duty(engine, cpt, flight_id, "CPT",
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
+    # FO deliberately left unassigned.
+
+    request = _resolved_request(
+        "roster_coverage", date_from=dt.date(2026, 7, 1), date_to=dt.date(2026, 7, 31),
+    )
+    ds = reports.roster_coverage(request)
+    row = dict(zip(ds.headers, ds.rows[0]))
+    assert row["CPT"] == cpt
+    assert row["FO"] == "UNCOVERED"
+    assert row["POB"] == 3  # 1 cockpit crew (CPT only) + 2x AME
+    assert any("uncovered cockpit seat" in note for note in ds.notes)
 
 
 def test_roster_coverage_excludes_cancelled_flights(_patch_engine):

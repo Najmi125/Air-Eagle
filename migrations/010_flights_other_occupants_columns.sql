@@ -1,0 +1,35 @@
+-- ============================================================
+-- 010_flights_other_occupants_columns.sql
+--
+-- Operator decision (2026-08-02): Air Eagle's crew records are CPT
+-- and FO only. Loadmasters and AME/engineers are the operator's own
+-- operational responsibility and are never imported as crew rows
+-- (scripts/import_crew_from_xlsx.py skips both roles going forward —
+-- see that file's changes in this same piece of work). They still
+-- fly on real rotations, so OCC needs somewhere to record who else
+-- was aboard a given flight and what they were doing there — these
+-- two free-text columns are that place.
+--
+-- Deliberately two plain TEXT columns, not a structured occupants
+-- table: "the system doesn't classify why someone is aboard" (the
+-- operator's own words) — OCC types names in as free text (e.g.
+-- "Abdulghani (LM), 2x AME"), split into "operating" (aboard and
+-- performing a function — a loadmaster working the load, an AME on
+-- maintenance duty) vs "non-operating" (aboard but not working; the
+-- reason, if any, goes in the existing flights.remarks column, not
+-- here). No category list, no per-person row, no foreign key to
+-- crew — there is deliberately nothing in this table's own data to
+-- cross-reference these names against.
+--
+-- Known, accepted consequence (see HANDOVER.md): DG certification
+-- for whoever is handling dangerous goods aboard is untrackable
+-- through this system now — flights.cargo_dg flags the flight,
+-- crew.dg_expiry exists for anyone who IS a crew record, but a
+-- free-text name in either column below can't be checked against
+-- either. Accepted deliberately on the operator's stated position
+-- that OCC handles this by process, not by this system. Flagged as
+-- an explicit ASSUMPTION requiring airline validation.
+-- ============================================================
+
+ALTER TABLE flights ADD COLUMN IF NOT EXISTS other_occupants_operating TEXT;
+ALTER TABLE flights ADD COLUMN IF NOT EXISTS other_occupants_non_operating TEXT;
