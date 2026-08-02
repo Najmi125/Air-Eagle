@@ -315,7 +315,12 @@ forward.
   after difference directly (orphaned flight + roster row -> full
   rollback).
 - **Pushed, not yet merged**: `crew-data-role-dropdown-cpt-fo-only`
-  (removes LM/ENGR from `pages/2_Crew_Data.py`'s role dropdown).
+  (removes LM/ENGR from `pages/2_Crew_Data.py`'s role dropdown) — this
+  branch predates Step 6/7, had `main` merged into it and its full
+  suite re-verified against them (2026-08-02) rather than merged back
+  on the strength of its old 314-test baseline, and is otherwise
+  unchanged: `ROLE_OPTIONS = ["CPT", "FO", "Other"]`,
+  `services/crew_service.py`'s role handling untouched.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -417,10 +422,6 @@ cleanly against a database already carrying data, no data loss.
 LM/AME exclusion confirmed to hold on well-formed rows, and
 `_count_occupants()`'s shorthand parsing confirmed correct.
 
-**Unmerged, on branch `crew-data-role-dropdown-cpt-fo-only`**: 314
-total (313 on `main` + 1 new, `test_role_dropdown_excludes_lm_and_engr`).
-Verified locally: 139 passed, 175 skipped.
-
 **Independently verified by the user against real Postgres 16 and
 merged into `main`**: 318/318 passing on branch `transactional-
 atomicity-control-room-write` (313 on `main`, this branch cut directly
@@ -433,10 +434,20 @@ manual crash simulation on both versions of the code (sabotaging the
 second `log_audit()` call mid-sequence): before the fix, 1 orphaned
 flight + 1 roster row survived; after, full rollback to zero.
 
-**Pushed, on branch `age-pairing-rule-ae-crew-pair-age-001`** (Step 7
-— see the dedicated log entry below for full detail and exact test
-count). See `Current active task` above for merge status going
-forward, rather than repeating it here.
+**Independently verified by the user against real Postgres 16 and
+merged into `main`**: 338/338 passing on branch
+`age-pairing-rule-ae-crew-pair-age-001` (Step 7 — see the dedicated log
+entry below for full detail), including a real-data empirical check
+(domestic 67+67 rejected, domestic 67+41 allowed, international 67+41
+rejected) and reachability unchanged. One real test-fixture gap found
+and fixed along the way (see that log entry) — not a bug in the rule.
+
+**`crew-data-role-dropdown-cpt-fo-only`**: originally verified at
+314/314 on its own base, predating Step 6/7. Per instruction, not
+merged on the strength of that figure — `main` merged into this
+branch and the full current suite re-verified here (2026-08-02) before
+resuming towards merge. See `Current active task` above for actual
+merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
 - `services/assistant/reports.py` is the only file currently flagged
@@ -479,14 +490,10 @@ forward, rather than repeating it here.
   that OCC handles this by process. If DG tracking through this
   system ever matters, reintroducing LM/AME as crew records (even
   without FTL applicability) is the fix.
-- `pages/2_Crew_Data.py`'s manual "Add crew member" form still offers
-  LM and ENGR as selectable roles, inconsistent with
-  `scripts/import_crew_from_xlsx.py` now permanently excluding both
-  from bulk import (2026-08-02). Not changed here — the operator's
-  instruction was scoped to the import script — but flagged as a real
-  inconsistency: a controller could still manually create an LM/ENGR
-  crew record through the UI today. Worth a deliberate decision before
-  it matters, not a silent fix.
+- RESOLVED 2026-08-02: `pages/2_Crew_Data.py`'s manual "Add crew
+  member" form no longer offers LM/ENGR as selectable roles — see the
+  dedicated log entry below. `ROLE_OPTIONS` is now `["CPT", "FO",
+  "Other"]`, closing the inconsistency flagged in the previous entry.
 - `services/assistant/regulation_reference.py`'s numbers are boundary-
   tested against the real validator for D9.1.1/D9.1.2/D9.1.3/D9.2.1/
   D9.2.2/D9.2.3/D21.1/D8.2.1 (see `tests/test_assistant_reports.py`).
@@ -2350,12 +2357,56 @@ run, same limitation as every prior piece). `check_reachability.py`:
 `services/assistant/reports.py` still the only file flagged, unchanged
 by this piece. **RESOLVED 2026-08-02**: independently verified by the
 user against real Postgres 16 — 313/313 passing, migration 010
-confirmed to apply cleanly, LM/AME exclusion confirmed to hold on
-well-formed rows, `_count_occupants()` confirmed correct. Merged into
-`main`. (The small `pages/2_Crew_Data.py` role-dropdown follow-up this
-piece's own `Open stubs` flagged is on its own branch,
-`crew-data-role-dropdown-cpt-fo-only`, not yet merged as of this
-entry.)
+confirmed to apply cleanly against a database already carrying
+000-009 and existing flight data, LM/AME exclusion confirmed to hold
+on well-formed rows, `_count_occupants()` confirmed correct. Merged
+into `main`.
+
+## 2026-08-02 (continued): close the LM/ENGR role-dropdown
+## inconsistency in pages/2_Crew_Data.py
+
+Small, focused follow-up flagged in this file's own `Open stubs` after
+the previous piece: `scripts/import_crew_from_xlsx.py` permanently
+excludes LM/AME/ENGR from bulk import, but `pages/2_Crew_Data.py`'s
+manual "Add crew member" form still listed `LM`/`ENGR` in
+`ROLE_OPTIONS` — a controller could still hand-create one of exactly
+the crew records the operator just said Air Eagle doesn't track.
+
+Fixed on branch `crew-data-role-dropdown-cpt-fo-only`, off `main` at
+the merge commit above: `ROLE_OPTIONS` narrowed from `["CPT", "FO",
+"LM", "ENGR", "Other"]` to `["CPT", "FO", "Other"]`. "Other" stays —
+it's the escape hatch for a genuinely unanticipated role the operator
+hasn't described yet, not for LM/AME, which now have a specific,
+deliberate answer. `services/crew_service.py`'s `ROLE_SYNONYMS`/
+`ROLE_PREFIXES`/`_normalize_role()` are untouched, same reasoning as
+the import-script change: this is a page-level, Air-Eagle-specific
+restriction on what this one form offers, not a platform-wide rule —
+FTLguard itself still fully supports LM/ENGR crew records for a future
+client.
+
+**Test**: 1 new, `test_role_dropdown_excludes_lm_and_engr` in
+`tests/test_crew_data_page.py`, asserting the role selectbox's actual
+options via Streamlit's `AppTest` framework (`at.selectbox[0].options
+== ["CPT", "FO", "Other"]`) rather than just checking the module-level
+constant — the same UI-driving discipline this file already uses for
+the rest of `test_crew_data_page.py`. No existing test in that file
+referenced LM/ENGR selection, so nothing else needed changing.
+
+**Verification status**: 314 total on this branch's own original base
+(313 on `main` + 1 new), 139 passed / 175 skipped locally at the time.
+
+**Re-verified 2026-08-02 after merging `main`, per instruction — not
+merged on the strength of the original 314 figure**: this branch
+predated Step 6 (transactional atomicity) and Step 7 (age-pairing
+rule), neither of which it had ever run against. `main` merged into
+this branch (one conflict, in this file's own overlapping narrative
+sections — resolved by combining both, not discarding either); full
+suite re-collected and re-run here: 339 total (338 from `main` + this
+branch's own 1), 139 passed / 200 skipped locally (no
+`TEST_DATABASE_URL` in this sandbox, same limitation as always).
+`check_reachability.py`: unchanged — `services/assistant/reports.py`
+still the only file flagged. See `Current active task` near the top
+of this file for merge status.
 
 ## 2026-08-02 (continued): Step 6 — transactional atomicity for
 ## Control Room's flight+assignment write, extended to
