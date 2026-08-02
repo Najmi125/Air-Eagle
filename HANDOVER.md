@@ -2581,3 +2581,30 @@ this sandbox), and the pure-logic tests were additionally confirmed
 correct by direct interpreter execution before being written into the
 test file. `check_reachability.py`: unchanged, no new files —
 everything lives inside the existing `services/assignment_service.py`.
+
+**One real-Postgres test failure found and fixed, not a bug in the
+rule itself**: the user's first verification run found 337/338
+passing — `test_delay_recompute_handles_multiple_crew_on_same_flight_
+independently` failed. Root cause: `_add_crew()`'s `_QUALIFICATION_DEFAULTS`
+sets all 8 expiry fields but never `date_of_birth`, so every pilot
+created by this file's tests has always had a NULL DOB. That test
+assigns both a CPT and an FO to the same flight through the real
+`assign_crew_to_duty()` API — the second assignment correctly hit the
+brand-new `AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW`
+path and was correctly NOT written, so the delay recompute this test
+was actually about found 1 crew member instead of 2. The age-pairing
+rule was doing exactly what it's supposed to; the test fixture was
+underspecified for a check that didn't exist when it was written.
+Fixed by adding `"date_of_birth": dt.date(1980, 1, 1)` to
+`_QUALIFICATION_DEFAULTS` (comfortably under 65 for every scenario in
+this file) and giving `test_second_pilot_missing_dob_needs_review` an
+explicit `date_of_birth=None` override, since that's the one test that
+deliberately needs the NULL case now that it's no longer the ambient
+default. Confirmed no other test in this file references
+`date_of_birth` at all, so nothing else depended on the old default.
+Also independently confirmed by the user directly against real
+Postgres with real crew ages: domestic 67+67 -> second pilot REJECTED;
+domestic 67+41 -> ALLOWED; international 67+41 -> second pilot REJECTED
+(correctly stricter than the identical domestic composition);
+`pairing_pending`/`pairing_constraint` populate correctly on the first
+assignment in all three cases.

@@ -39,6 +39,20 @@ def _patch_engine(migrated_db, monkeypatch):
 # swap what these tests are actually verifying. Tests that need to
 # exercise the qualification gate itself override individual fields.
 _FAR_FUTURE_EXPIRY = dt.date(2099, 1, 1)
+# date_of_birth default added 2026-08-02 for the same reason, when
+# Step 7's age-pairing rule (AE-CREW-PAIR-AGE-001) landed: without
+# this, every _add_crew()'d pilot has a NULL DOB, so any test
+# assigning both a CPT and an FO to the same flight via the real
+# assignment API gets AE-CREW-PAIR-AGE-001_DOB_MISSING on the second
+# assignment instead of whatever that test actually meant to exercise
+# — confirmed as the real cause of a genuine test failure against real
+# Postgres (test_delay_recompute_handles_multiple_crew_on_same_flight_
+# independently: the second crew member's assignment was silently held
+# for review instead of written, so the delay recompute only found 1
+# crew member instead of 2). 1980-01-01 is comfortably under 65 for
+# every date used anywhere in this file's flight scenarios. Tests that
+# need to exercise the age-pairing rule itself override date_of_birth
+# explicitly, same pattern as the qualification gate above.
 _QUALIFICATION_DEFAULTS = {
     "license_expiry": _FAR_FUTURE_EXPIRY,
     "medical_expiry": _FAR_FUTURE_EXPIRY,
@@ -48,6 +62,7 @@ _QUALIFICATION_DEFAULTS = {
     "sep_expiry": _FAR_FUTURE_EXPIRY,
     "crm_expiry": _FAR_FUTURE_EXPIRY,
     "dg_expiry": _FAR_FUTURE_EXPIRY,
+    "date_of_birth": dt.date(1980, 1, 1),
 }
 
 
@@ -311,7 +326,12 @@ def test_second_pilot_missing_dob_needs_review(_patch_engine):
     pilot has no recorded date_of_birth cannot be evaluated at all --
     NEEDS_MANUAL_REVIEW, must not auto-save, matching HANDOVER.md's
     already-settled wording."""
-    cpt = _add_crew("CPT")  # no date_of_birth override -> NULL
+    # Explicit override, not reliance on _add_crew()'s own default:
+    # date_of_birth is now defaulted to a real date in
+    # _QUALIFICATION_DEFAULTS (2026-08-02) so every OTHER test in this
+    # file gets a pilot safely under 65 — this is the one test that
+    # needs the NULL case deliberately, so it asks for it by name.
+    cpt = _add_crew("CPT", date_of_birth=None)
     fo = _add_crew("FO", date_of_birth=_dob_for_age(40))
     flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
 
