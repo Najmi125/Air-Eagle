@@ -468,7 +468,13 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         )
 
     # Only LEGAL or WARNING reach here — passed the immediate gate,
-    # write to roster, one row per sector.
+    # write to roster (one row per sector) and its audit record
+    # together, in one transaction (Step 6, 2026-08-02): previously
+    # these were 2 separate, independently-committed transactions, so
+    # a crash between them left a committed roster row with no audit
+    # trail for it — a real gap in a permanent regulatory record, even
+    # though (unlike assign_crew_to_new_flights()) there's no flight
+    # here to orphan. See audit_service.log_audit()'s conn parameter.
     roster_ids = []
     with engine.begin() as conn:
         for fid in flight_ids:
@@ -486,15 +492,16 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             })
             roster_ids.append(result.scalar())
 
-    log_audit(
-        action_type="ASSIGNMENT_CREATED",
-        affected_crew=crew_id,
-        affected_flight=flight_ids[0],
-        affected_duty=new_duty.duty_id,
-        legality_result=validation_result.status.value,
-        rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
-        app_user=app_user,
-    )
+        log_audit(
+            action_type="ASSIGNMENT_CREATED",
+            affected_crew=crew_id,
+            affected_flight=flight_ids[0],
+            affected_duty=new_duty.duty_id,
+            legality_result=validation_result.status.value,
+            rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
+            app_user=app_user,
+            conn=conn,
+        )
 
     if crew_row["role"] in FTL_EXEMPT_ROLES:
         downstream_conflicts = []
@@ -602,11 +609,18 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
         ), []
 
     # Only LEGAL or WARNING reach here — now actually create the
-    # flight(s) and the assignment together. Two separate statements,
-    # but both only run after the
-    # gate already passed, so there's no window where an illegal
-    # assignment could leave a saved flight behind.
+    # flight(s) and the assignment together, ONE transaction covering
+    # both inserts and both audit records. Previously these were 4
+    # separate, independently-committed transactions (flight insert,
+    # FLIGHT_ADDED audit, roster insert, ASSIGNMENT_CREATED audit) — a
+    # crash between the first and third left a real, committed,
+    # uncrewed flight in Flight Log, exactly the orphan the gate above
+    # exists to prevent, just relocated to a later failure window
+    # (Step 6, 2026-08-02). Folding everything into one
+    # `engine.begin()` means all four writes commit together or none
+    # do — see audit_service.log_audit()'s conn parameter.
     flight_ids = []
+    roster_ids = []
     with engine.begin() as conn:
         for f in flights_data:
             fields = {k: v for k, v in f.items() if k in flight_service.UPDATABLE_FIELDS}
@@ -617,16 +631,15 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             ), fields)
             flight_ids.append(result.scalar())
 
-    log_audit(
-        action_type="FLIGHT_ADDED",
-        affected_flight=flight_ids[0],
-        changed_state=str(flights_data),
-        data_source="control_room",
-        app_user=app_user,
-    )
+        log_audit(
+            action_type="FLIGHT_ADDED",
+            affected_flight=flight_ids[0],
+            changed_state=str(flights_data),
+            data_source="control_room",
+            app_user=app_user,
+            conn=conn,
+        )
 
-    roster_ids = []
-    with engine.begin() as conn:
         for fid in flight_ids:
             result = conn.execute(text("""
                 INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
@@ -642,16 +655,17 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
             })
             roster_ids.append(result.scalar())
 
-    log_audit(
-        action_type="ASSIGNMENT_CREATED",
-        affected_crew=crew_id,
-        affected_flight=flight_ids[0],
-        affected_duty=new_duty.duty_id,
-        legality_result=validation_result.status.value,
-        rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
-        data_source="control_room",
-        app_user=app_user,
-    )
+        log_audit(
+            action_type="ASSIGNMENT_CREATED",
+            affected_crew=crew_id,
+            affected_flight=flight_ids[0],
+            affected_duty=new_duty.duty_id,
+            legality_result=validation_result.status.value,
+            rule_applied=f"ANO-012-FSXX D8.2.1 ({'domestic' if domestic else 'international'} buffer)",
+            data_source="control_room",
+            app_user=app_user,
+            conn=conn,
+        )
 
     if crew_row["role"] in FTL_EXEMPT_ROLES:
         downstream_conflicts = []

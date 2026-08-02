@@ -483,6 +483,30 @@ def test_warning_only_status_still_allowed_and_written(_patch_engine):
     assert len(roster_df) == 1
 
 
+def test_roster_crash_before_audit_write_rolls_back_the_roster_insert_too(_patch_engine, monkeypatch):
+    """Step 6 (2026-08-02) regression test, assign_crew_to_duty()'s
+    smaller-scale version of the same gap: no flight to orphan here
+    (the flight already exists), but the roster insert and its
+    ASSIGNMENT_CREATED audit record were 2 separate, independently-
+    committed transactions -- a crash between them left a committed
+    roster row with no audit trail for it, a real gap in a permanent
+    regulatory record. Forces the audit write itself to fail and
+    confirms the roster insert that happened just before it does NOT
+    survive."""
+    crew_id = _add_crew("CPT")
+    f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    def _failing_log_audit(*args, **kwargs):
+        raise RuntimeError("simulated crash before the audit write")
+
+    monkeypatch.setattr(assignment_service, "log_audit", _failing_log_audit)
+
+    with pytest.raises(RuntimeError):
+        assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
+
+    assert len(assignment_service.get_roster_for_crew(crew_id)) == 0
+
+
 # ------------------------------------------------------------------
 # Downstream impact detection — the actual "catch" from the spec
 # ------------------------------------------------------------------
@@ -965,6 +989,40 @@ def test_legal_adhoc_assignment_creates_both_flight_and_roster_row(_patch_engine
     roster_df = assignment_service.get_roster_for_crew(crew_id)
     assert len(roster_df) == 1
     assert roster_df.iloc[0]["flight_id"] == flight_ids[0]
+
+
+def test_control_room_crash_before_final_audit_write_rolls_back_everything(_patch_engine, monkeypatch):
+    """Step 6 (2026-08-02) regression test. Before this fix,
+    assign_crew_to_new_flights()'s ALLOWED path was 4 separate,
+    independently-committed transactions: flight insert, FLIGHT_ADDED
+    audit, roster insert, ASSIGNMENT_CREATED audit. A crash between
+    the first and the last left a real, committed, uncrewed flight in
+    Flight Log -- exactly the orphan the legality gate exists to
+    prevent, just relocated to a later failure window. This forces a
+    failure at the LAST possible point (the second log_audit call) --
+    by then, under the old code, the flight and roster row would
+    already be permanently committed. Under the fix (one engine.begin()
+    covering all four writes), everything must roll back together."""
+    crew_id = _add_crew("CPT")
+    flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))]
+
+    real_log_audit = assignment_service.log_audit
+    calls = {"n": 0}
+
+    def _flaky_log_audit(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated crash before the final audit write")
+        return real_log_audit(*args, **kwargs)
+
+    monkeypatch.setattr(assignment_service, "log_audit", _flaky_log_audit)
+
+    with pytest.raises(RuntimeError):
+        assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
+
+    assert len(flight_service.get_all_flights()) == 0
+    assert len(assignment_service.get_roster_for_crew(crew_id)) == 0
+    assert calls["n"] == 2  # confirms the failure actually happened where intended
 
 
 def test_illegal_adhoc_assignment_creates_no_flight_at_all(_patch_engine):

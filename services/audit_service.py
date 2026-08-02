@@ -13,6 +13,7 @@ import datetime as dt
 from typing import List, Optional
 import pandas as pd
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 from db.db import get_engine
 
@@ -52,6 +53,7 @@ def log_audit(
     transaction_id: Optional[str] = None,
     linked_disruption_event: Optional[str] = None,
     data_source: Optional[str] = None,
+    conn: Optional[Connection] = None,
 ) -> None:
     """
     Write one audit record. Append-only — this function never
@@ -60,43 +62,72 @@ def log_audit(
     action_type is the only required field beyond what SQL itself
     requires, since every audit record needs to say what happened
     even if every other detail is unknown at the point of logging.
+
+    conn: an already-open SQLAlchemy Connection inside an active
+    transaction (e.g. from `with engine.begin() as conn:`). Pass this
+    when the audit record must be atomic with other writes in the same
+    transaction — see assignment_service.py's assign_crew_to_new_flights()/
+    assign_crew_to_duty(), where a crash between the data write and the
+    audit write would otherwise leave a committed write with no audit
+    trail for it (or, worse, a committed flight with no crew assigned).
+
+    This is a genuine behavioral difference from the default, not just
+    a plumbing detail: when conn is passed, this audit record shares
+    the CALLER's transaction fate. If the caller's transaction later
+    rolls back for any reason, this audit record disappears with it,
+    exactly as if it were never written. That's the correct behavior
+    here — an audit record describing a write that never actually
+    happened would be worse than no record at all — but it means a
+    conn-passed call is NOT a guaranteed, independent audit entry the
+    way every other call to this function is. When conn is None (the
+    default, and every pre-existing call site), behavior is unchanged:
+    this function opens and commits its own independent transaction,
+    so the audit record is written regardless of what the caller does
+    afterward.
     """
+    params = {
+        "transaction_id": transaction_id,
+        "app_user": app_user,
+        "airline_code": airline_code,
+        "action_type": action_type,
+        "original_state": original_state,
+        "changed_state": changed_state,
+        "reason": reason,
+        "rule_applied": rule_applied,
+        "legality_result": legality_result,
+        "warning_or_failure_reason": warning_or_failure_reason,
+        "override_reason": override_reason,
+        "approver": approver,
+        "affected_crew": affected_crew,
+        "affected_flight": affected_flight,
+        "affected_duty": affected_duty,
+        "affected_aircraft": affected_aircraft,
+        "linked_disruption_event": linked_disruption_event,
+        "data_source": data_source,
+    }
+    statement = text("""
+        INSERT INTO audit_log (
+            transaction_id, app_user, airline_code, action_type,
+            original_state, changed_state, reason, rule_applied,
+            legality_result, warning_or_failure_reason, override_reason,
+            approver, affected_crew, affected_flight, affected_duty,
+            affected_aircraft, linked_disruption_event, data_source
+        ) VALUES (
+            :transaction_id, :app_user, :airline_code, :action_type,
+            :original_state, :changed_state, :reason, :rule_applied,
+            :legality_result, :warning_or_failure_reason, :override_reason,
+            :approver, :affected_crew, :affected_flight, :affected_duty,
+            :affected_aircraft, :linked_disruption_event, :data_source
+        )
+    """)
+
+    if conn is not None:
+        conn.execute(statement, params)
+        return
+
     engine = get_engine()
     with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO audit_log (
-                transaction_id, app_user, airline_code, action_type,
-                original_state, changed_state, reason, rule_applied,
-                legality_result, warning_or_failure_reason, override_reason,
-                approver, affected_crew, affected_flight, affected_duty,
-                affected_aircraft, linked_disruption_event, data_source
-            ) VALUES (
-                :transaction_id, :app_user, :airline_code, :action_type,
-                :original_state, :changed_state, :reason, :rule_applied,
-                :legality_result, :warning_or_failure_reason, :override_reason,
-                :approver, :affected_crew, :affected_flight, :affected_duty,
-                :affected_aircraft, :linked_disruption_event, :data_source
-            )
-        """), {
-            "transaction_id": transaction_id,
-            "app_user": app_user,
-            "airline_code": airline_code,
-            "action_type": action_type,
-            "original_state": original_state,
-            "changed_state": changed_state,
-            "reason": reason,
-            "rule_applied": rule_applied,
-            "legality_result": legality_result,
-            "warning_or_failure_reason": warning_or_failure_reason,
-            "override_reason": override_reason,
-            "approver": approver,
-            "affected_crew": affected_crew,
-            "affected_flight": affected_flight,
-            "affected_duty": affected_duty,
-            "affected_aircraft": affected_aircraft,
-            "linked_disruption_event": linked_disruption_event,
-            "data_source": data_source,
-        })
+        conn.execute(statement, params)
 
 
 def get_audit_log(date_from=None, date_to=None,
