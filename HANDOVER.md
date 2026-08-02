@@ -305,22 +305,22 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Merged into `main`**: everything through Step 7 (the age-pairing
-  rule, AE-CREW-PAIR-AGE-001) — 338/338 verified by the user against
-  real Postgres 16, including a real-data empirical check (domestic
-  67+67 rejected, domestic 67+41 allowed, international 67+41 rejected)
-  and reachability unchanged. Step 6 (transactional atomicity,
+- **Merged into `main` — no outstanding branches as of this
+  snapshot.** Through Step 7 (the age-pairing rule,
+  AE-CREW-PAIR-AGE-001) — 338/338 verified by the user against real
+  Postgres 16, including a real-data empirical check (domestic 67+67
+  rejected, domestic 67+41 allowed, international 67+41 rejected) and
+  reachability unchanged. Step 6 (transactional atomicity,
   `log_audit()`'s `conn` parameter) verified the same way one piece
   earlier, including a manual crash simulation confirming the before/
   after difference directly (orphaned flight + roster row -> full
-  rollback).
-- **Pushed, not yet merged**: `crew-data-role-dropdown-cpt-fo-only`
-  (removes LM/ENGR from `pages/2_Crew_Data.py`'s role dropdown) — this
-  branch predates Step 6/7, had `main` merged into it and its full
-  suite re-verified against them (2026-08-02) rather than merged back
-  on the strength of its old 314-test baseline, and is otherwise
-  unchanged: `ROLE_OPTIONS = ["CPT", "FO", "Other"]`,
-  `services/crew_service.py`'s role handling untouched.
+  rollback). Last to land: `crew-data-role-dropdown-cpt-fo-only`
+  (`ROLE_OPTIONS = ["CPT", "FO", "Other"]` on `pages/2_Crew_Data.py`,
+  `services/crew_service.py`'s role handling untouched) — this branch
+  predated Step 6/7, had `main` merged into it and its full 339-test
+  suite re-verified against them before merging back, rather than on
+  the strength of its original 314-test baseline. 339/339 verified by
+  the user against real Postgres 16.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
