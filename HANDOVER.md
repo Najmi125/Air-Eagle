@@ -2392,10 +2392,21 @@ constant — the same UI-driving discipline this file already uses for
 the rest of `test_crew_data_page.py`. No existing test in that file
 referenced LM/ENGR selection, so nothing else needed changing.
 
-**Verification status**: 314 total (313 on `main` + 1 new). `pytest
-tests/`: 139 passed, 175 skipped (no `TEST_DATABASE_URL` in this
-sandbox). `check_reachability.py`: unchanged. See `Current active
-task` near the top of this file for merge status.
+**Verification status**: 314 total on this branch's own original base
+(313 on `main` + 1 new), 139 passed / 175 skipped locally at the time.
+
+**Re-verified 2026-08-02 after merging `main`, per instruction — not
+merged on the strength of the original 314 figure**: this branch
+predated Step 6 (transactional atomicity) and Step 7 (age-pairing
+rule), neither of which it had ever run against. `main` merged into
+this branch (one conflict, in this file's own overlapping narrative
+sections — resolved by combining both, not discarding either); full
+suite re-collected and re-run here: 339 total (338 from `main` + this
+branch's own 1), 139 passed / 200 skipped locally (no
+`TEST_DATABASE_URL` in this sandbox, same limitation as always).
+`check_reachability.py`: unchanged — `services/assistant/reports.py`
+still the only file flagged. See `Current active task` near the top
+of this file for merge status.
 
 ## 2026-08-02 (continued): Step 6 — transactional atomicity for
 ## Control Room's flight+assignment write, extended to
