@@ -26,6 +26,11 @@ UPDATABLE_FIELDS = {
     "dep_time_planned", "arr_time_planned",
     "dep_time_actual", "arr_time_actual",
     "status", "cargo_dg", "remarks", "domestic",
+    # Free-text occupant fields (migrations/010) — LM and AME/ENGR are
+    # not crew records for Air Eagle (2026-08-02 operator decision, see
+    # HANDOVER.md), so anyone aboard beyond the two cockpit seats is
+    # recorded here as plain text, not a structured roster row.
+    "other_occupants_operating", "other_occupants_non_operating",
 }
 
 

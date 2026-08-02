@@ -38,6 +38,8 @@ parser starts setting it.
 """
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from core.duty_summary import (
@@ -69,14 +71,39 @@ UTILIZATION_BASE_HEADERS = (
     "crew_id", "crew_name", "unique_duties", "total_fdp_hours", "disrupted_duties",
 )
 
-# CPT/FO/LM/ENGR are the 4 roles confirmed present on real Air Eagle
-# rotations. "Other Crew" from the crew data template is deliberately
-# deferred for v1 — see roster_coverage()'s docstring.
-REQUIRED_COVERAGE_ROLES = ("CPT", "FO", "LM", "ENGR")
+# Air Eagle's crew records are CPT/FO only (2026-08-02 operator
+# decision — see HANDOVER.md and scripts/import_crew_from_xlsx.py).
+# Cockpit coverage is the only thing this report checks structurally;
+# everyone else aboard is free text (see ROSTER_COVERAGE_HEADERS).
+COCKPIT_COVERAGE_ROLES = ("CPT", "FO")
 
-ROSTER_COVERAGE_BASE_HEADERS = (
-    "flight_id", "flight_no", "origin", "destination", "dep_time_planned",
+ROSTER_COVERAGE_HEADERS = (
+    "Date", "Flight", "Route", "CPT", "FO",
+    "Other occupants — operating", "Other occupants — non-operating",
+    "POB", "Remarks",
 )
+
+# OCC's real-world shorthand for a free-text occupant entry that
+# represents more than one person on its own (e.g. "2x AME") —
+# confirmed against real data twice now (an earlier "Eng: 2x VAI"
+# example, and the operator's own "2x AME" example given alongside
+# this reshape). POB needs to count heads, not comma-separated
+# segments, so this prefix is recognized without turning the field
+# into a structured category list — it's still just free text.
+_OCCUPANT_COUNT_PREFIX_RE = re.compile(r"^\s*(\d+)\s*x\b", re.IGNORECASE)
+
+
+def _count_occupants(free_text) -> int:
+    if not free_text:
+        return 0
+    total = 0
+    for segment in str(free_text).split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        match = _OCCUPANT_COUNT_PREFIX_RE.match(segment)
+        total += int(match.group(1)) if match else 1
+    return total
 
 AUDIT_COMPLIANCE_HEADERS = (
     "timestamp", "action_type", "affected_crew", "affected_flight",
@@ -228,15 +255,20 @@ def utilization(request: query_parser.ReportRequest) -> Dataset:
 
 
 def roster_coverage(request: query_parser.ReportRequest) -> Dataset:
-    """One row per (non-cancelled) flight in range, with each of the 4
-    confirmed-required roles shown as a comma-joined list of assigned
-    crew_ids — a role can legitimately hold more than one person (real
-    Air Eagle data shows a flight with 2 engineers assigned). A role
-    is UNCOVERED only when its list is empty; this does NOT check for
-    a specific required count per role, because that count isn't
-    confirmed for this operator (see the notes entry below and
-    HANDOVER.md). "Other Crew" from the crew data template is
-    deferred for v1 — not one of the 4 roles this covers."""
+    """One row per (non-cancelled) flight in range. Coverage is CPT/FO
+    only — Air Eagle's crew records are CPT/FO only (2026-08-02
+    operator decision) — a cockpit column shows UNCOVERED only when
+    that seat has no assigned crew_id; occupant columns never trigger
+    it, they're informational, not a coverage check.
+
+    "Other occupants — operating"/"— non-operating" are plain OCC-
+    entered free text pulled straight from flights.other_occupants_
+    operating/other_occupants_non_operating (migrations/010) — this
+    function does not classify, parse names, or cross-reference them
+    against crew at all; "the system doesn't classify why someone is
+    aboard" is the operator's own stated position. POB is the one
+    place free text gets interpreted at all, and only to count heads
+    (see _count_occupants()'s "Nx ROLE" shorthand)."""
     flights = flight_service.get_all_flights(
         date_from=request.date_from, date_to=request.date_to,
     )
@@ -247,36 +279,49 @@ def roster_coverage(request: query_parser.ReportRequest) -> Dataset:
         if request.destination:
             flights = flights[flights["destination"] == request.destination]
 
-    headers = ROSTER_COVERAGE_BASE_HEADERS + REQUIRED_COVERAGE_ROLES + ("uncovered_roles",)
     rows = []
+    any_uncovered = False
     for _, flight in flights.iterrows():
         roster = assignment_service.get_roster_for_flight(flight["flight_id"])
-        row = [
-            flight["flight_id"], flight["flight_no"], flight["origin"],
-            flight["destination"], flight["dep_time_planned"],
-        ]
-        uncovered = []
-        for role in REQUIRED_COVERAGE_ROLES:
-            assigned = sorted(roster.loc[roster["role_assigned"] == role, "crew_id"].tolist())
-            row.append(", ".join(assigned))
-            if not assigned:
-                uncovered.append(role)
-        row.append(", ".join(uncovered))
-        rows.append(row)
+
+        cpt_ids = sorted(roster.loc[roster["role_assigned"] == "CPT", "crew_id"].tolist())
+        fo_ids = sorted(roster.loc[roster["role_assigned"] == "FO", "crew_id"].tolist())
+        cpt_cell = ", ".join(cpt_ids) if cpt_ids else "UNCOVERED"
+        fo_cell = ", ".join(fo_ids) if fo_ids else "UNCOVERED"
+        if not cpt_ids or not fo_ids:
+            any_uncovered = True
+
+        operating = flight.get("other_occupants_operating") or ""
+        non_operating = flight.get("other_occupants_non_operating") or ""
+        pob = len(cpt_ids) + len(fo_ids) + _count_occupants(operating) + _count_occupants(non_operating)
+
+        dep = flight["dep_time_planned"]
+        date_value = dep.date() if hasattr(dep, "date") else dep
+
+        rows.append([
+            date_value, flight["flight_no"],
+            f'{flight["origin"]}-{flight["destination"]}',
+            cpt_cell, fo_cell, operating, non_operating, pob,
+            flight.get("remarks") or "",
+        ])
 
     notes = []
     if rows:
         notes.append(
-            "A role column is UNCOVERED only when zero crew are assigned to "
-            "it on that flight — this does not check for a specific "
-            "required count. The required count per role is unconfirmed for "
-            "this operator: real data shows at least one flight with 2 "
-            "engineers assigned ('Eng: 2x VAI'), so a role showing more "
-            "than one crew_id is expected, not an error. See HANDOVER.md."
+            "CPT/FO show UNCOVERED only when that cockpit seat has no "
+            "assigned crew_id — the two occupant columns are OCC-entered "
+            "free text (who else is aboard and what they're doing there) "
+            "and never trigger UNCOVERED themselves. POB counts the two "
+            "cockpit seats plus every name in both occupant columns, "
+            "including OCC's own 'Nx ROLE' shorthand for more than one "
+            "person in a single entry (e.g. '2x AME' counts as 2)."
         )
+    if any_uncovered:
+        notes.append("At least one flight in this range has an uncovered cockpit seat.")
+
     return Dataset.build(
         name="RosterCoverage", title="Roster Coverage",
-        headers=headers, rows=rows, notes=notes,
+        headers=ROSTER_COVERAGE_HEADERS, rows=rows, notes=notes,
     )
 
 
