@@ -539,31 +539,55 @@ merge status, rather than repeating it here.
 - "Engr" role definition unconfirmed (flight-deck FE vs
   line-maintenance AME) — flagged on the crew data template,
   still pending with the rest of the operator data.
-- Auth (require_login/require_permission) is NOT wired anywhere yet
-  — none of the four pages have any access control right now. A plan
-  was proposed 2026-08-02 (self-contained `users` table + password
-  hashing, recommended over Supabase Auth or a static secrets-file
-  list since nothing else in this repo uses an external SDK; a
-  role-granularity question and a session-persistence question were
-  sent to the operator for a decision). **Deliberately parked, not an
-  oversight**: the operator hasn't answered either question yet, and
-  building ahead of that answer risks the same rework this project's
-  own discipline has repeatedly avoided elsewhere. Not urgent while
-  only synthetic test data exists, genuinely urgent before any real
-  operator data goes in permanently. This gap has now persisted across
-  6+ phases; still worth deciding deliberately rather than by default
-  much longer.
-- Supabase: DATABASE_URL is saved locally (2026-07-19) but
-  dependencies (`pip install -r requirements.txt`) hadn't been
-  installed in that venv as of the last update, so migrations were
-  not yet confirmed applied against the real Supabase DB. Explicitly
-  deferred by the user ("tackle Supabase later"). The GitHub-
+- **Auth — spec now SETTLED (2026-08-04), still NOT built.** Three
+  accounts, all full access, no permission tiers — the app is not
+  publicly reachable, so a CONTROLLER/ADMIN split isn't buying
+  anything real right now. Session-level login is acceptable (re-login
+  on a hard refresh is fine for three OCC staff) — no cookie-
+  persistence mechanism needed. This resolves the two open questions
+  the 2026-08-02 plan had been waiting on; see that entry for the
+  fuller design (self-contained `users` table + password hashing,
+  `require_login()` at the top of each page).
+  **The important half of this isn't restriction, it's attribution**:
+  `audit_log.app_user` is `NULL` on every row today, because no page
+  passes it through — the audit trail currently records WHAT happened
+  and WHEN, but never WHO. For a PCAA-regulated operator, that's a
+  real deficiency in what's supposed to be the permanent regulatory
+  record, not a cosmetic gap. When this gets built, every service
+  write must carry the logged-in user's identity through to
+  `log_audit()` — no service-layer signature changes needed, every
+  write function already accepts `app_user: Optional[str] = None`,
+  it's just never populated by any page today.
+  **Trigger to actually build this — shared with the Supabase item
+  below**: the moment any real crew or flight data enters the
+  production Supabase database. Not before.
+- **Supabase stays on the free tier — deliberate, not an oversight,
+  same trigger as auth above.** No automated backups, and the project
+  pauses after 7 days of inactivity — both accepted as long as the
+  database holds nothing real. DATABASE_URL is saved locally
+  (2026-07-19) but migrations were not yet confirmed applied against
+  the real Supabase DB as of that check — re-verify before assuming
+  that's settled, since migrations have been added since. The GitHub-
   integration collision risk (Supabase's native migration deploy
-  expects a supabase/migrations/ folder we don't use) was explained
-  but not yet confirmed resolved one way or the other. Check status
-  before assuming this is settled — two new migrations (005, 006)
-  have been added since this was last touched, so there's more to
-  apply than there was when it was set aside.
+  expects a `supabase/migrations/` folder this repo doesn't use) was
+  explained but not yet confirmed resolved one way or the other.
+  **Backup research findings, recorded now so they don't need
+  rediscovering later**: Supabase's own docs recommend free-tier
+  projects export via the `supabase db dump` CLI command and keep an
+  off-site copy — a single binary, not a full Postgres install.
+  Point-in-time recovery (PITR) was considered and ruled out: ~$100/mo
+  for 7-day retention is roughly 4x the Pro plan itself, disproportionate
+  for this operation's scale, and it REPLACES daily backups rather than
+  supplementing them. Deleting a Supabase project permanently destroys
+  its backups too, including whatever's in S3 — which is why an
+  independent off-site dump stays worth keeping even after upgrading.
+  Restoring from any backup takes the project offline for the duration
+  of the restore.
+  **The actual trigger, all three land together**: the moment real
+  crew/flight data enters production — Pro plan (~$25/mo, daily
+  backups, 7-day retention), auth, and backups all land in the same
+  move. Not auth without backups, not backups without auth — real data
+  existing at all is what makes both suddenly matter, together.
 
 ## Next safest step
 NOT Phase 7. Still explicitly paused per the external review's core
@@ -2660,3 +2684,54 @@ domestic 67+41 -> ALLOWED; international 67+41 -> second pilot REJECTED
 (correctly stricter than the identical domestic composition);
 `pairing_pending`/`pairing_constraint` populate correctly on the first
 assignment in all three cases.
+
+## 2026-08-04: two deferred decisions recorded — auth spec settled,
+## Supabase free-tier deferral confirmed. No code, record only.
+
+Both were actually settled in discussion but never written down here,
+and nearly got lost across the two-day gap since the last entry —
+recorded now specifically so that doesn't happen again. See the
+updated `Open stubs` bullets above for the living, check-this-first
+version of both; this entry is the narrative record of how they got
+decided.
+
+**1. Auth.** The two questions the 2026-08-02 plan had been blocked on
+are answered: three accounts, all full access, no permission tiers —
+the app isn't publicly reachable, so tiering doesn't buy anything real
+yet. Session-level login (re-login on a hard refresh) is fine for
+three OCC staff; no cookie-persistence mechanism needed. Still not
+built. The part of this worth taking seriously isn't the login screen
+itself — it's that `audit_log.app_user` is `NULL` on literally every
+row in this system today, because no page has ever passed a real user
+identity through to `log_audit()`. The audit trail records what
+happened and when, never who, on a PCAA-regulated operator's permanent
+regulatory record. When auth gets built, threading the logged-in
+user's identity into every `app_user` parameter (already present on
+every write function's signature, just never populated) is the actual
+point, not a side effect of adding a login screen.
+
+**2. Supabase free tier.** Deliberately staying on it: no automated
+backups, and the project auto-pauses after 7 days idle. Both accepted
+because the database currently holds nothing real. Backup research
+done and worth keeping on record rather than redoing:
+- Supabase's own documentation recommends free-tier projects export
+  via the `supabase db dump` CLI command and keep the result
+  off-site — one binary, no full Postgres install needed.
+- Point-in-time recovery (PITR) was priced and ruled out: ~$100/mo for
+  7-day retention, about 4x the Pro plan itself — disproportionate for
+  this operation's actual scale — and it REPLACES daily backups rather
+  than adding to them.
+- Deleting a Supabase project destroys its backups permanently,
+  including anything already in S3 — the reason an independent
+  off-site `db dump` is worth keeping even after upgrading to Pro, not
+  just as a free-tier workaround.
+- Restoring from any backup, at any tier, takes the project offline
+  for the duration of the restore — worth knowing before it's an
+  emergency, not during one.
+
+**Both share one trigger, and it's the same trigger**: the moment any
+real crew or flight data enters the production Supabase database. At
+that point all three — the Pro plan upgrade (~$25/mo, daily backups,
+7-day retention), auth, and backups — land together, not piecemeal.
+Real data existing at all is what makes every one of these matter;
+none of them is worth doing in isolation before that.
