@@ -321,6 +321,13 @@ forward.
   suite re-verified against them before merging back, rather than on
   the strength of its original 314-test baseline. 339/339 verified by
   the user against real Postgres 16.
+- **Pushed, not yet merged (2026-08-04)**: `rotation-templates-phase7-groundwork`
+  — Phase 7 groundwork, the recurring-schedule-template layer (see the
+  dedicated log entry below). Introduces this repo's first database
+  trigger, first `EXCLUDE` constraint, and first extension
+  (`btree_gist`) — needs real-Postgres verification with extra
+  attention for exactly that reason, including confirming `btree_gist`
+  is actually available on Supabase specifically, not just locally.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -450,12 +457,18 @@ resuming towards merge. See `Current active task` above for actual
 merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
-- `services/assistant/reports.py` is the only file currently flagged
-  by `scripts/check_reachability.py` (as of the `assistant-report-
-  functions` branch, 2026-08-01). Correctly so — nothing calls
-  `run_report()` yet; there's no assistant UI page. `core/duty_summary.py`
-  is no longer flagged: `reports.py`'s `utilization()` function is now
-  its first real caller anywhere in this app.
+- `scripts/check_reachability.py` currently flags two files:
+  `services/assistant/reports.py` (as of the `assistant-report-
+  functions` branch, 2026-08-01 — nothing calls `run_report()` yet,
+  there's no assistant UI page) and `services/rotation_template_service.py`
+  (as of `rotation-templates-phase7-groundwork`, 2026-08-04 — nothing
+  calls it either, there's no template-management UI, and the generator
+  that will eventually be its real caller isn't built). Both correctly
+  so — built ahead of being wired into a page, same reason in both
+  cases. `core/duty_summary.py` and `core/rotation_expansion.py` are
+  NOT flagged: `reports.py`'s `utilization()` and
+  `rotation_template_service.py`'s `expand_and_persist()` are each
+  other's first real caller.
 - **`find_legal_candidates_for_duty()` does not check the age-pairing
   rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02).** This function
   powers the downstream-swap candidate suggestions shown when an
@@ -709,7 +722,16 @@ phase so far:
    NEEDS_MANUAL_REVIEW at assignment time (leaning toward the latter,
    consistent with "never silently block on missing data, flag it
    instead" — but not yet decided).
-8. THEN revisit Phase 7.
+8. THEN revisit Phase 7. **Groundwork started 2026-08-04** — see the
+   dedicated log entry below: recurring schedule templates (the
+   template layer only — `rotation_templates`/`rotation_template_legs`/
+   `rotation_instances`/`rotation_instance_legs`, migrations/011) so
+   the generator has DECLARED rotation membership to work from instead
+   of inferring it from Flight Log. The generator itself, and the
+   draft->OCC-review->publish approval workflow, are still not built.
+   Also: the 2026-07-19 OR-Tools CP-SAT decision is REVERSED — see
+   that entry too. Do not resume Phase 7 assuming CP-SAT is still the
+   plan.
 
 Lower-priority findings, not yet sequenced: airport timezones not
 passed to the validator (every sector defaults to UTC+5 regardless
@@ -2735,3 +2757,233 @@ that point all three — the Pro plan upgrade (~$25/mo, daily backups,
 7-day retention), auth, and backups — land together, not piecemeal.
 Real data existing at all is what makes every one of these matter;
 none of them is worth doing in isolation before that.
+
+## 2026-08-04: OR-Tools CP-SAT decision REVERSED — a direct assignment
+## loop instead. Record only, no code (the generator itself isn't
+## built either way).
+
+The 2026-07-19 entry above adopted Google OR-Tools CP-SAT for the
+28-day roster generator's assignment optimization. That decision
+predates knowing Air Eagle's actual scale. Measured: 36 rotations per
+28 days, FO load 9 duties each across 4 FOs, CPT load 6 each across 6
+CPTs. Comfortably within a direct assignment loop's reach: walk
+rotations in date order, pick the eligible candidate with fewest
+duties assigned so far (the fairness rule — see below), check legality
+through the existing `core/legality/pcaa_ano012_core.py` validator via
+the existing `assign_crew_to_duty()` gate, move to the next candidate
+on ILLEGAL, mark the rotation UNCOVERED if none work (an already-
+established, named state — see the 2026-07-21 requirements-doc entry).
+
+Reasons beyond simplicity, both concrete: (1) CP-SAT would require
+re-expressing FTL rules in solver-constraint form — a second, parallel
+rule representation, precisely the "two sources of truth" failure this
+entire rebuild exists to prevent. `core/legality/pcaa_ano012_core.py`
+is supposed to be the ONE FTL engine; a generator with its own solver-
+encoded copy of D9/D21/D8.2.1 would be exactly the kind of drift this
+project's own hard-lessons catalogue already warns about. (2) A direct
+loop can explain a rejection the same way an interactive assignment
+already does today — a real `RuleAlert` message like "needs 21.5h
+rest, only 13.25h available" — reusing infrastructure that already
+exists. A solver's INFEASIBLE result explains nothing without separate,
+additional work to reconstruct a reason.
+
+**Not implemented here** — the generator itself (however the direct
+loop turns out to be shaped in detail) is still not built, same as
+before this reversal. This entry exists so a future session doesn't
+resume Phase 7 assuming CP-SAT is still the plan; see the 2026-07-19
+entry above for what it originally said, left as-is rather than
+rewritten, per this file's own discipline: a dated entry records what
+was true and decided at the time, corrections get their own entry, not
+a silent rewrite of history.
+
+## 2026-08-04 (continued): Phase 7 groundwork — recurring schedule
+## templates (the template layer only). NOT MERGED.
+
+Plan proposed first (schema, expansion, coexistence with Control Room,
+mid-window template changes), reviewed against real Postgres 16 by the
+user before implementation (the `EXCLUDE` constraint specifically —
+see below), approved with three corrections, then built. Branch
+`rotation-templates-phase7-groundwork`, off `main` at the age-pairing-
+rule/crew-data-dropdown merge point.
+
+**Why templates, not Flight Log inference — confirmed by reading the
+code, not assumed**: `services/assignment_service.py`'s
+`_validate_new_duty()` generates `roster.duty_id` as a fresh
+`uuid.uuid4()` at ASSIGNMENT time — nothing in `flights` declares which
+rows belong to one rotation today. A generator inferring rotation
+membership from aircraft/timing/continuity would be guessing, and a
+wrong guess here produces a silently wrong FDP — already this
+project's most-repeated bug class (`migrations/003_roster_table.sql`'s
+own header warns about exactly this). Templates make rotation
+membership declared data instead of an inference.
+
+**Grounding, independently re-derived against the real engine, not
+trusted from the numbers as given**: both real rotations' report/
+debrief/FDP/rest numbers were hand-recomputed against
+`core/duty_builder.py`'s actual constants
+(`DOMESTIC_PRE/POST_FLIGHT_MINUTES` 45/15,
+`INTERNATIONAL_PRE/POST_FLIGHT_MINUTES` 60/30) and confirmed exact —
+EPE 786/787 (domestic): report 1815Z, debrief 0000Z, FDP 5.75h, D21
+rest 12h (floor wins); EPE 802/804/805 (international): report 0045Z,
+debrief 1130Z, FDP 10.75h, D21 rest 21.5h (scales above the floor).
+Confirmed independently again through `core/rotation_expansion.py`'s
+actual `expand_template()` output fed through the real, unchanged
+`build_duty()`/`required_rest_minutes()` — see
+`tests/test_rotation_expansion.py`. This confirms `core/duty_builder.py`
+needed ZERO changes: expansion's only job is producing `FlightLeg`-
+shaped data that flows through the existing, already-tested engine
+unchanged. Also confirms neither rotation's own LEGS cross a UTC
+calendar day — only the domestic duty's DEBRIEF crosses midnight, a
+buffer-addition side effect, not a leg-level date rollover — and
+`_check_crew_qualifications()` already checks against
+`duty_result.debrief_time.date()`, not report date, so that midnight
+crossing was already handled correctly with no change needed there
+either.
+
+**Already-agreed requirement this piece implements the first half
+of**: the 2026-07-21 requirements-doc entry already records "rostering
+workflow (draft -> OCC review -> publish, crew sees only published, no
+silent reshuffle on regeneration, explicit UNCOVERED state)" as
+confirmed. This is the "draft" half. Review/publish and the generator
+itself are later pieces, explicitly out of scope here. Also noted: that
+same requirements-doc entry's "1 CPT, 1 FO, 1 LM, 1 AME" crew package
+predates the 2026-08-02 CPT/FO-only decision — templates plan for
+CPT+FO only; LM/AME are free text at Flight Log time
+(`flights.other_occupants_operating`/`_non_operating`, migrations/010),
+never templated.
+
+**Schema** (migrations/011_rotation_templates.sql — this repo's first
+use of a database trigger, an `EXCLUDE` constraint, and a Postgres
+extension): `rotation_templates` (rotation identity, `days_of_week`,
+`effective_from`/`effective_until`, `version`, `superseded_by`),
+`rotation_template_legs` (ordered legs as TIME-of-day + `day_offset`,
+no calendar date — a template has none of its own), `rotation_instances`
+(the draft layer, one row per calendar occurrence, `status` DRAFT/
+APPROVED/REJECTED), `rotation_instance_legs` (real computed datetimes).
+`flights` gains one nullable `rotation_instance_id` column for future
+traceability — NULL for every Control Room ad-hoc flight, unset by
+anything in this piece; promotion (DRAFT -> real `flights` rows via
+the existing `flight_service.add_flight()`) is a later piece.
+
+**The overlap gap caught on review, closed with two layers, not one**:
+the original plan's `effective_until` was nullable-open-ended with no
+mechanism actually preventing two versions of the same rotation from
+both being effective on the same date — `superseded_by` recorded the
+relationship but didn't bound it. Closed with (1) `create_new_version()`
+atomically closing the prior open version's `effective_until` to the
+day BEFORE the new version's `effective_from` (not the same day — see
+below), and (2) the actual guarantee, a `daterange` `EXCLUDE` constraint
+(`btree_gist`) on `rotation_code`, treating a NULL `effective_until` as
+infinity, making an overlap impossible even if the service-layer path
+is bypassed entirely. **Verified against real Postgres 16 by the user
+before implementation**: `btree_gist` available, the constraint creates
+cleanly, an open-ended v1 + a later v2 is correctly rejected, and the
+`create_new_version()` ordering (close-then-insert) succeeds. The
+'`[]`' inclusive bound means a v1 ending 2026-08-31 and a v2 starting
+the SAME day (2026-08-31, not 2026-09-01) is also rejected — a single
+day cannot belong to two versions — confirming `create_new_version()`
+must close to the day before the new `effective_from`, exactly as
+built; both the adjacent-accepted and same-day-rejected cases are
+directly tested (`test_adjacent_non_overlapping_versions_are_accepted`,
+`test_same_day_boundary_is_rejected_not_accepted`).
+
+**Immutability, also two layers, refined during implementation beyond
+what was reviewed**: `rotation_template_legs` is a hard block on every
+UPDATE/DELETE via trigger — legs never have a legitimate reason to
+change after insert. `rotation_templates` needed a narrower rule
+discovered while implementing, not the original blanket-immutable
+design: `create_new_version()`'s own job is legitimately updating the
+prior version's `effective_until` (NULL -> a date) and `superseded_by`
+— a blanket "reject every UPDATE" trigger would have blocked the one
+operation the whole overlap-prevention mechanism depends on.
+`guard_rotation_templates_mutation()` allows exactly that one
+transition (and rejects re-editing an already-closed `effective_until`
+a second time) while still rejecting every other column change and
+every DELETE — tested directly
+(`test_rotation_templates_arbitrary_update_is_rejected`,
+`test_rotation_templates_cannot_reopen_or_re_close_effective_until`).
+Both triggers enforce this even against direct SQL, not just through
+`rotation_template_service.py` — "by convention" was explicitly
+rejected as insufficient on review, this project's own history with
+`ensure_basic_crew_table()` cited as the reason not to repeat it.
+
+**Why drafts are persisted, not computed on demand**: `status`
+(DRAFT/APPROVED/REJECTED) and immutability-anchoring (an approved
+instance must permanently reference the exact template version that
+produced it, even after that version is later superseded) both need
+something durable to attach to — a value that only exists in memory
+during a computation can't be approved, rejected, or referenced by a
+later `flights.rotation_instance_id`. Idempotent re-expansion also
+needs persisted state to check against — an on-demand recomputation
+has no memory of what a prior run already offered.
+
+**Coexistence with Control Room**: two independent origins, one
+convergence point (`flights`, still owned exclusively by
+`flight_service.py` — Ownership Table unchanged). Ad-hoc flights:
+`rotation_instance_id = NULL`. Template-approved flights (once
+promotion exists, a later piece): `rotation_instance_id` set, traceable
+to the exact version and date that produced them. Nothing in this
+piece writes to `flights` at all.
+
+**Mid-window template change vs. already-published assignments**:
+structurally impossible for a version change to reach a published
+roster, not just discouraged by convention — roster rows reference
+real `flights` rows, which only ever get created from an already-fixed
+`rotation_instance` at approval time (a later piece). A new template
+version can only affect `rotation_instances` that don't exist yet;
+anything already approved is permanently anchored to the version that
+produced it, by the data model itself, confirmed directly
+(`test_expand_and_persist_after_new_version_only_adds_forward_never_touches_existing`
+manually marks an instance APPROVED, creates a new version, re-expands,
+and asserts that instance is byte-for-byte untouched).
+
+**Fairness, recorded for the later generator, not built here**: even
+duty counts within each role only, not balancing international vs.
+domestic exposure.
+
+**Explicitly out of scope**: the generator itself; the approval/publish
+workflow (DRAFT -> APPROVED, promoting legs into real `flights`, crew
+notification); any UI for managing templates or reviewing drafts;
+WhatsApp notification and Excel-export-for-rosters (already flagged
+elsewhere as separately not-yet-built).
+
+**Tests**: 26 new. Pure logic (`tests/test_rotation_expansion.py`, 10,
+genuinely run here and passing): both real rotations' exact hand-
+verified numbers re-derived through the actual engine; `days_of_week`
+filtering; leg ordering independent of input order; `day_offset`
+rolling a date forward (neither real rotation needs this, confirmed
+the schema's claim to support it anyway); a leg crossing midnight
+within one `day_offset` correctly rejected (the deliberate scope
+limit); empty-input and `date_from > date_to` validation; a window
+with no matching weekday producing an empty list, not an error.
+DB-integration (`tests/test_rotation_template_service.py`, 16, traced
+by hand — no `TEST_DATABASE_URL` in this sandbox): `create_template()`/
+`create_new_version()` correctness; the `EXCLUDE` constraint's overlap
+rejection, adjacent-acceptance, and same-day-boundary-rejection cases
+described above; a different `rotation_code` never conflicting; both
+immutability triggers on both tables, including the narrow legitimate-
+transition case; `expand_and_persist()`'s idempotency and its forward-
+only behavior across a version boundary.
+
+**Verification status**: 365 total (339 on `main` + 26 new). `pytest
+tests/`: 149 passed, 216 skipped locally (no `TEST_DATABASE_URL` in
+this sandbox) — the 10 pure-logic tests genuinely pass here (confirmed,
+including hand-verification against `core/duty_builder.py`'s real
+constants); the 16 DB-integration tests are traced by hand, not run —
+flag this explicitly, and flag the migration itself for extra scrutiny
+beyond the usual verification pass: this is the first trigger, first
+`EXCLUDE` constraint, and first extension (`btree_gist`) anywhere in
+this schema. `btree_gist` and the `EXCLUDE` constraint were confirmed
+working against real Postgres 16 by the user BEFORE this was built,
+but `btree_gist`'s availability on Supabase specifically (not just
+local Postgres) is not yet confirmed — check before assuming the
+migration will apply there unchanged. `check_reachability.py`: **run, not assumed** —
+`core/rotation_expansion.py` is correctly NOT flagged (imported by
+`services/rotation_template_service.py`, a real cross-module import),
+but `services/rotation_template_service.py` itself IS newly flagged:
+`check_reachability.py` only counts imports from `pages/`/other
+`services/`/`core/` files, not from tests, and nothing in `pages/`
+calls this service yet (correct — there's no template-management UI,
+same as `services/assistant/reports.py`'s own unwired state). Two
+files flagged now, both correctly so, both for the same reason: built
+ahead of being wired into a page.
