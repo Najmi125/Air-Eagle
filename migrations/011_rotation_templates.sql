@@ -58,20 +58,34 @@ CREATE TABLE IF NOT EXISTS rotation_templates (
     -- two versions of the same rotation_code may have overlapping
     -- effective date ranges. A NULL effective_until is treated as
     -- infinity, so creating v2 while v1 is still open-ended is
-    -- rejected unless v1's effective_until is closed first — which is
-    -- exactly what rotation_template_service.create_new_version()
-    -- does, in the same transaction as inserting v2. This is the real
-    -- guarantee; the service-layer ordering is just the convenient
-    -- path to satisfy it. '[]' is an INCLUSIVE bound on both ends —
-    -- v1 ending 2026-08-31 and v2 starting 2026-08-31 also collide (a
-    -- single day cannot belong to two versions), which is why
-    -- create_new_version() sets effective_until to the day BEFORE the
-    -- new version's effective_from, not the same day.
+    -- rejected unless v1's effective_until is closed within the same
+    -- transaction. '[]' is an INCLUSIVE bound on both ends — v1 ending
+    -- 2026-08-31 and v2 starting 2026-08-31 also collide (a single day
+    -- cannot belong to two versions), which is why
+    -- rotation_template_service.create_new_version() closes the prior
+    -- version's effective_until to the day BEFORE the new version's
+    -- effective_from, not the same day.
+    --
+    -- DEFERRABLE INITIALLY DEFERRED, deliberately: create_new_version()
+    -- has a genuine circular dependency — the new version's row must
+    -- exist before superseded_by can reference its id, but the OLD
+    -- version's effective_until must already be closed before the NEW
+    -- version's INSERT for a plain (non-deferred) constraint to accept
+    -- it, since two open-ended ranges for the same rotation_code always
+    -- overlap. Deferring the check to COMMIT lets both statements
+    -- happen in either order inside one transaction — the constraint
+    -- only has to be satisfied by the time the transaction actually
+    -- commits, not after every individual statement. The guarantee
+    -- itself is unaffected: a transaction that commits with a genuine
+    -- overlap still fails, only the TIMING of the check moves from
+    -- per-statement to per-transaction. This is the standard Postgres
+    -- pattern for exactly this "two rows must be updated together to
+    -- stay valid" shape — confirmed against real Postgres 16.
     CONSTRAINT excl_rotation_templates_no_overlap
         EXCLUDE USING gist (
             rotation_code WITH =,
             daterange(effective_from, COALESCE(effective_until, 'infinity'::date), '[]') WITH &&
-        )
+        ) DEFERRABLE INITIALLY DEFERRED
 );
 
 CREATE INDEX IF NOT EXISTS idx_rotation_templates_rotation_code ON rotation_templates(rotation_code);

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DatabaseError, IntegrityError
 
 import services.rotation_template_service as rts
 
@@ -165,9 +165,15 @@ def test_different_rotation_codes_never_conflict(_patch_engine):
 # ------------------------------------------------------------------
 
 def test_rotation_template_legs_update_is_rejected(_patch_engine):
+    """The trigger raises a PL/pgSQL RAISE EXCEPTION, which SQLAlchemy
+    surfaces as InternalError, not IntegrityError -- DatabaseError is
+    the common parent of both, used here rather than pinning to
+    InternalError specifically. This is distinct from the EXCLUDE-
+    constraint tests above, which raise a real constraint violation
+    (IntegrityError) and are asserted as such."""
     engine = _patch_engine
     template_id = _create_domestic_template()
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DatabaseError):
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE rotation_template_legs SET origin = 'XXX'
@@ -178,7 +184,7 @@ def test_rotation_template_legs_update_is_rejected(_patch_engine):
 def test_rotation_template_legs_delete_is_rejected(_patch_engine):
     engine = _patch_engine
     template_id = _create_domestic_template()
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DatabaseError):
         with engine.begin() as conn:
             conn.execute(text("""
                 DELETE FROM rotation_template_legs WHERE template_id = :template_id
@@ -188,7 +194,7 @@ def test_rotation_template_legs_delete_is_rejected(_patch_engine):
 def test_rotation_templates_delete_is_rejected(_patch_engine):
     engine = _patch_engine
     template_id = _create_domestic_template()
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DatabaseError):
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM rotation_templates WHERE id = :id"), {"id": template_id})
 
@@ -200,7 +206,7 @@ def test_rotation_templates_arbitrary_update_is_rejected(_patch_engine):
     days_of_week typo instead of creating a new version."""
     engine = _patch_engine
     template_id = _create_domestic_template()
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DatabaseError):
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE rotation_templates SET days_of_week = ARRAY[1,2,3,4,5,6]::smallint[]
@@ -218,7 +224,7 @@ def test_rotation_templates_cannot_reopen_or_re_close_effective_until(_patch_eng
         rotation_code="EPE-786-787", days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
         effective_from=dt.date(2026, 9, 1),
     )
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DatabaseError):
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE rotation_templates SET effective_until = '2026-12-31' WHERE id = :id

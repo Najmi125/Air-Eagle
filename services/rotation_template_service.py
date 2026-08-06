@@ -127,18 +127,30 @@ def create_new_version(
 ) -> int:
     """
     Creates the next version of an existing rotation, in one
-    transaction: closes the current open (effective_until IS NULL)
-    version's effective_until to the day BEFORE the new version's
-    effective_from (not the same day — the EXCLUDE constraint's '[]'
-    inclusive bounds mean a single day cannot belong to two versions),
-    records superseded_by, then inserts the new version.
+    transaction: inserts the new version first (its id is needed for
+    the old version's superseded_by), then closes the current open
+    (effective_until IS NULL) version's effective_until to the day
+    BEFORE the new version's effective_from — not the same day, since
+    the EXCLUDE constraint's '[]' inclusive bounds mean a single day
+    cannot belong to two versions.
 
-    The database EXCLUDE constraint (migrations/011) is the actual
-    guarantee against overlap; this ordering is what makes the normal
-    path succeed without ever hitting it. Raises ValueError if no open
-    version exists for rotation_code, or if effective_from does not
-    leave at least one day for the closing effective_until (i.e.
-    effective_from <= the current version's own effective_from).
+    This order is a genuine circular dependency, not an arbitrary
+    choice: superseded_by can't be set until the new row exists, but a
+    NON-deferred overlap constraint would reject the new row's INSERT
+    outright, since the old version is still open-ended at that exact
+    moment. migrations/011's EXCLUDE constraint is declared DEFERRABLE
+    INITIALLY DEFERRED specifically so this works: the overlap check
+    only runs at COMMIT, by which point both statements below have
+    already brought the two rows to a jointly non-overlapping state.
+    Confirmed against real Postgres 16: this insert-then-close order
+    succeeds, and a genuine overlap (e.g. a v3 inserted while v2 is
+    left open) still correctly fails at COMMIT — the guarantee itself
+    doesn't move, only the timing of when it's checked.
+
+    Raises ValueError if no open version exists for rotation_code, or
+    if effective_from does not leave at least one day for the closing
+    effective_until (i.e. effective_from <= the current version's own
+    effective_from).
     """
     if not legs:
         raise ValueError("legs must not be empty")

@@ -2987,3 +2987,66 @@ calls this service yet (correct — there's no template-management UI,
 same as `services/assistant/reports.py`'s own unwired state). Two
 files flagged now, both correctly so, both for the same reason: built
 ahead of being wired into a page.
+
+**Two real-Postgres verification failures found and fixed (7 of 365):
+one a genuine bug, one a test asserting the wrong exception class.**
+
+**Bug (2 failures) — `create_new_version()`'s circular dependency,
+unresolved by the original (non-deferred) `EXCLUDE` constraint.** The
+new version's row must exist before the old version's `superseded_by`
+can reference its id — so the code always inserted the new version
+first. But at that exact INSERT, the old version was still
+open-ended, and a plain `EXCLUDE` constraint checks on every
+statement: two open-ended ranges for the same `rotation_code`
+necessarily overlap at that instant, so the constraint correctly (by
+its own non-deferred rules) rejected the INSERT with an
+`ExclusionViolation`. The reverse order doesn't resolve it either —
+`superseded_by` can't reference a row that doesn't exist yet. This is
+a genuine circular dependency, not a simple ordering mistake; the
+original docstring claimed the code closed the old version before
+inserting the new one, which was simply wrong about what the code
+actually did.
+
+Fixed by declaring the constraint `DEFERRABLE INITIALLY DEFERRED`
+(migrations/011) — the overlap check now runs once at COMMIT rather
+than after every statement, so both the INSERT and the UPDATE can
+happen in either order inside one transaction; only the final,
+post-transaction state has to satisfy the constraint. The guarantee
+itself doesn't move, only the timing of when it's checked — a genuine
+overlap left at COMMIT (e.g. a v3 inserted while v2 is still open)
+still fails. Verified directly against real Postgres 16, both
+directions: the insert-then-close order now succeeds, and a real
+overlap is still rejected at COMMIT. This is confirmed as the standard
+Postgres pattern for exactly this "two rows must move together to
+stay valid" shape, not a workaround specific to this schema.
+
+**Wrong exception class (5 failures) — test-only, no code change.** A
+PL/pgSQL `RAISE EXCEPTION` inside a trigger surfaces through SQLAlchemy
+as `InternalError`, not `IntegrityError` — the five trigger tests
+(`rotation_template_legs`'s update/delete block, `rotation_templates`'s
+delete/arbitrary-update/re-close block) had asserted
+`pytest.raises(IntegrityError)`, matching this file's two genuine
+constraint-violation tests by habit rather than checking what a
+trigger-raised exception actually surfaces as. The triggers themselves
+were confirmed correct — right message, right rejection — this was
+purely a wrong assertion. Fixed to `pytest.raises(DatabaseError)`, the
+common SQLAlchemy parent of both `IntegrityError` and `InternalError`,
+so the assertion doesn't need to know which of the two a given
+Postgres error surfaces as. The two `EXCLUDE`-constraint tests (real
+constraint violations, genuinely raising `IntegrityError`) were left
+unchanged — confirmed correct as originally written, not swept up in
+the same fix.
+
+**Re-verification status**: not yet re-run against real Postgres by
+the user as of this fix — pushed for that next. Locally: 365 total
+unchanged (no tests added or removed, only the exception class
+assertion changed in 5 and the migration/docstring in the `create_new_
+version()` fix), 149 passed / 216 skipped (same DB-integration
+limitation as always).
+
+**Still open, unresolved by this fix**: `btree_gist`'s availability on
+Supabase specifically remains unconfirmed. Worth checking before this
+migration is the thing that discovers it isn't available there —
+confirmed working on real Postgres 16 (unmanaged), but Supabase is
+managed Postgres and extension availability on managed platforms isn't
+guaranteed to match a self-hosted instance.
