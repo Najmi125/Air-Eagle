@@ -15,6 +15,7 @@ import datetime as dt
 from typing import Optional
 import pandas as pd
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 from db.db import get_engine
 from services.audit_service import log_audit
@@ -31,16 +32,38 @@ UPDATABLE_FIELDS = {
     # HANDOVER.md), so anyone aboard beyond the two cockpit seats is
     # recorded here as plain text, not a structured roster row.
     "other_occupants_operating", "other_occupants_non_operating",
+    # Traceback to the rotation_instance that produced this flight via
+    # approval (services/rotation_template_service.py's
+    # approve_instance(), migrations/011/012) — NULL for every Control
+    # Room ad-hoc flight, set only at promotion time.
+    "rotation_instance_id",
 }
 
 
-def add_flight(flight_data: dict, app_user: Optional[str] = None) -> int:
+def add_flight(flight_data: dict, app_user: Optional[str] = None,
+               conn: Optional[Connection] = None) -> int:
     """
     Insert a new flight. Returns the generated flight_id.
 
     Validates arr_time_planned > dep_time_planned at the service
     layer too (not just relying on the DB CHECK constraint) so the
     caller gets a clean ValueError instead of a raw SQL error.
+
+    conn: an already-open SQLAlchemy Connection inside an active
+    transaction (e.g. from `with engine.begin() as conn:`). Pass this
+    when the insert must be atomic with other writes in the same
+    transaction — see services/rotation_template_service.py's
+    approve_instance(), which promotes every leg of a rotation into a
+    real flight together, all-or-nothing. Same contract as
+    audit_service.log_audit()'s own conn parameter (Step 6,
+    2026-08-02): when passed, both the INSERT and the FLIGHT_ADDED
+    audit record below join the caller's transaction and share its
+    fate — if the caller later rolls back, neither survives. When
+    conn is None (the default, and every pre-existing call site —
+    Control Room's ad-hoc path still bypasses this function entirely
+    with its own raw INSERT, unrelated to this parameter), behavior
+    is unchanged: this function opens and commits its own independent
+    transaction, same as always.
     """
     missing = [f for f in REQUIRED_FIELDS if not flight_data.get(f) and flight_data.get(f) is not False]
     if missing:
@@ -53,13 +76,24 @@ def add_flight(flight_data: dict, app_user: Optional[str] = None) -> int:
 
     columns = ", ".join(fields.keys())
     placeholders = ", ".join(f":{k}" for k in fields.keys())
+    insert_stmt = text(
+        f"INSERT INTO flights ({columns}) VALUES ({placeholders}) RETURNING flight_id"
+    )
+
+    if conn is not None:
+        flight_id = conn.execute(insert_stmt, fields).scalar()
+        log_audit(
+            action_type="FLIGHT_ADDED",
+            affected_flight=flight_id,
+            changed_state=str(fields),
+            app_user=app_user,
+            conn=conn,
+        )
+        return flight_id
 
     engine = get_engine()
-    with engine.begin() as conn:
-        result = conn.execute(text(
-            f"INSERT INTO flights ({columns}) VALUES ({placeholders}) RETURNING flight_id"
-        ), fields)
-        flight_id = result.scalar()
+    with engine.begin() as own_conn:
+        flight_id = own_conn.execute(insert_stmt, fields).scalar()
 
     log_audit(
         action_type="FLIGHT_ADDED",

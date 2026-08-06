@@ -98,6 +98,46 @@ def test_add_flight_writes_audit_record(_patch_engine):
 
 
 # ------------------------------------------------------------------
+# add_flight's conn parameter (2026-08-04, Phase 7 approval workflow)
+# -- same contract as audit_service.log_audit()'s own conn parameter
+# (Step 6, 2026-08-02), same three things need proving: it writes on
+# the normal success path, it shares the caller's rollback, and the
+# default (no conn) path is unaffected.
+# ------------------------------------------------------------------
+
+def test_add_flight_with_conn_writes_on_success_path(_patch_engine):
+    engine = _patch_engine
+    with engine.begin() as conn:
+        flight_id = flight_service.add_flight(_valid_flight(), app_user="tester", conn=conn)
+
+    flight = flight_service.get_flight(flight_id)
+    assert flight is not None
+    assert flight["origin"] == "KHI"
+
+    audit = _audit_rows(engine, "FLIGHT_ADDED")
+    assert len(audit) == 1
+    assert audit.iloc[0]["affected_flight"] == flight_id
+
+
+def test_add_flight_with_conn_shares_callers_rollback(_patch_engine):
+    engine = _patch_engine
+    try:
+        with engine.begin() as conn:
+            flight_service.add_flight(_valid_flight(), conn=conn)
+            raise RuntimeError("simulated failure after the insert, before commit")
+    except RuntimeError:
+        pass
+
+    assert len(flight_service.get_all_flights()) == 0
+    assert _audit_rows(engine, "FLIGHT_ADDED").empty
+
+
+def test_add_flight_without_conn_still_commits_independently(_patch_engine):
+    flight_id = flight_service.add_flight(_valid_flight())
+    assert flight_service.get_flight(flight_id) is not None
+
+
+# ------------------------------------------------------------------
 # update_flight
 # ------------------------------------------------------------------
 
