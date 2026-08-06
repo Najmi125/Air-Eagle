@@ -306,28 +306,24 @@ different points in history. Keep merge status here only, going
 forward.
 
 - **Merged into `main` — no outstanding branches as of this
-  snapshot.** Through Step 7 (the age-pairing rule,
-  AE-CREW-PAIR-AGE-001) — 338/338 verified by the user against real
-  Postgres 16, including a real-data empirical check (domestic 67+67
-  rejected, domestic 67+41 allowed, international 67+41 rejected) and
-  reachability unchanged. Step 6 (transactional atomicity,
-  `log_audit()`'s `conn` parameter) verified the same way one piece
-  earlier, including a manual crash simulation confirming the before/
-  after difference directly (orphaned flight + roster row -> full
-  rollback). Last to land: `crew-data-role-dropdown-cpt-fo-only`
-  (`ROLE_OPTIONS = ["CPT", "FO", "Other"]` on `pages/2_Crew_Data.py`,
-  `services/crew_service.py`'s role handling untouched) — this branch
-  predated Step 6/7, had `main` merged into it and its full 339-test
-  suite re-verified against them before merging back, rather than on
-  the strength of its original 314-test baseline. 339/339 verified by
-  the user against real Postgres 16.
-- **Pushed, not yet merged (2026-08-04)**: `rotation-templates-phase7-groundwork`
-  — Phase 7 groundwork, the recurring-schedule-template layer (see the
-  dedicated log entry below). Introduces this repo's first database
-  trigger, first `EXCLUDE` constraint, and first extension
-  (`btree_gist`) — needs real-Postgres verification with extra
-  attention for exactly that reason, including confirming `btree_gist`
-  is actually available on Supabase specifically, not just locally.
+  snapshot (2026-08-04).** Most recent: `rotation-templates-phase7-
+  groundwork` (Phase 7 groundwork, the recurring-schedule-template
+  layer — see the dedicated log entries below) — 365/365 verified by
+  the user against real Postgres 16, including two real fixes found on
+  that first verification pass (`create_new_version()`'s `DEFERRABLE`
+  constraint ordering, 5 tests asserting the wrong exception class)
+  and `btree_gist` confirmed available on Supabase specifically
+  (default_version 1.7), the last open risk on this piece. Before
+  that: Step 7 (the age-pairing rule, AE-CREW-PAIR-AGE-001) — 338/338
+  verified against real Postgres 16, including a real-data empirical
+  check (domestic 67+67 rejected, domestic 67+41 allowed, international
+  67+41 rejected). Step 6 (transactional atomicity, `log_audit()`'s
+  `conn` parameter) verified the same way one piece earlier, including
+  a manual crash simulation confirming the before/after difference
+  directly (orphaned flight + roster row -> full rollback).
+  `crew-data-role-dropdown-cpt-fo-only` (`ROLE_OPTIONS = ["CPT", "FO",
+  "Other"]` on `pages/2_Crew_Data.py`) landed the same way, re-verified
+  against Step 6/7 before merging rather than on its original baseline.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
