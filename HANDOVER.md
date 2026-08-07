@@ -305,22 +305,22 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Merged into `main` through `rotation-templates-phase7-groundwork`
-  (2026-08-04)** — the recurring-schedule-template layer, 365/365
-  verified against real Postgres 16, including two real fixes found on
-  that first verification pass (`create_new_version()`'s `DEFERRABLE`
-  constraint ordering, 5 tests asserting the wrong exception class)
-  and `btree_gist` confirmed available on Supabase (default_version
-  1.7). Before that: Step 7 (age-pairing, AE-CREW-PAIR-AGE-001) and
-  Step 6 (transactional atomicity) — see prior entries below for full
-  detail on each.
-- **Pushed, not yet merged (2026-08-04)**:
-  `rotation-instance-approval-workflow` — DRAFT -> APPROVED promotion,
-  the piece that makes a template actually produce operational flights
-  (see the dedicated log entry below). Adds this repo's second
-  database-level uniqueness guarantee beyond migrations/011's `EXCLUDE`
-  constraint — a partial unique index (migrations/012) closing a real
-  gap found on review of this piece's own plan.
+- **Merged into `main` — no outstanding branches as of this snapshot
+  (2026-08-04).** Most recent: `rotation-instance-approval-workflow` —
+  DRAFT -> APPROVED promotion, the piece that makes a template actually
+  produce operational flights (see the dedicated log entry below).
+  382/382 verified against real Postgres 16, including a real fix found
+  on that first pass (a per-file test fixture omitting `audit_service`,
+  closed by consolidating all five service modules' `get_engine()`
+  patching into one shared `tests/conftest.py` fixture — the second
+  time a fixture gap masked real behavior, so the class was closed, not
+  just the instance). Adds this repo's second database-level uniqueness
+  guarantee beyond migrations/011's `EXCLUDE` constraint — a partial
+  unique index (migrations/012) against double-promotion. Before that:
+  `rotation-templates-phase7-groundwork` (the recurring-schedule-
+  template layer, 365/365, `btree_gist` confirmed available on Supabase),
+  Step 7 (age-pairing, AE-CREW-PAIR-AGE-001), and Step 6 (transactional
+  atomicity) — see prior entries below for full detail on each.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
