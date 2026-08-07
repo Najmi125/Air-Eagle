@@ -15,13 +15,11 @@ import services.audit_service as audit_service
 
 
 @pytest.fixture(autouse=True)
-def _patch_engine(migrated_db, monkeypatch):
-    """crew_service and audit_service both call get_engine() internally
-    (imported into each module's own namespace) — patch both so every
-    test in this file transparently uses the real, migrated test DB."""
-    monkeypatch.setattr(crew_service, "get_engine", lambda: migrated_db)
-    monkeypatch.setattr(audit_service, "get_engine", lambda: migrated_db)
-    return migrated_db
+def _patch_engine(_patch_all_service_engines):
+    """Thin per-file wrapper — the actual patching logic lives once in
+    conftest.py's _patch_all_service_engines, so no module here can be
+    forgotten (see that fixture's docstring for why this matters)."""
+    return _patch_all_service_engines
 
 
 def _audit_rows(engine, action_type=None):

@@ -3177,3 +3177,40 @@ and `services/assistant/reports.py` remain the only two flagged files;
 change either file's own reachability status (`flight_service.py` was
 already reachable from `pages/`). See `Current active task` near the
 top of this file for merge status, not this line.
+
+**One real-Postgres failure found and fixed (381/382): a test-fixture
+gap, not a logic bug.** `test_expand_approve_then_assign_crew_
+reproduces_hand_verified_numbers` failed with `RuntimeError: DATABASE_URL
+not set`. Cause: this file's own `_patch_engine` fixture patched
+`rts`/`flight_service`/`assignment_service`/`crew_service` but omitted
+`audit_service` — invisible in every OTHER test here, since they all
+reach `log_audit()` through a `conn` parameter that's already joined to
+an already-patched connection. This one test calls
+`crew_service.add_crew()` directly, whose own `log_audit()` call has no
+`conn` and falls through to `get_engine()` — never patched, hence the
+real `DATABASE_URL` lookup failing.
+
+**Fixed at the root, not just the symptom**: this is the SECOND time a
+per-file fixture gap has masked something (the first was Step 7's
+`_QUALIFICATION_DEFAULTS` missing `date_of_birth`, a different kind of
+gap but the same shape — one file's own copy of a list, and forgetting
+an entry). `tests/conftest.py` gained
+`_patch_all_service_engines(migrated_db, monkeypatch)`, patching
+`get_engine()` on all five service modules that have one
+(`assignment_service`, `audit_service`, `crew_service`,
+`flight_service`, `rotation_template_service`) in one place. Every test
+file that previously hand-maintained its own subset
+(`test_assignment_service.py`, `test_assistant_reports.py`,
+`test_crew_service.py`, `test_flight_service.py`,
+`test_rotation_template_service.py`) now has a 3-line `_patch_engine`
+wrapper requesting this shared fixture instead — same fixture name in
+every file (no test function signature needed to change anywhere), but
+the actual module list now lives exactly once. This class of gap is now
+structurally impossible, not just fixed for this one occurrence.
+
+**Verification status after the fix**: 382/382 confirmed by the user
+against real Postgres 16 — migration 012 applies cleanly, the
+`flight_no NOT NULL` + partial unique index landed as specified, and
+the end-to-end grounding test now passes, confirming a template-sourced
+flight is genuinely indistinguishable from a manually-entered one to
+`assign_crew_to_duty()`.

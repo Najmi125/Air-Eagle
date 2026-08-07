@@ -36,12 +36,17 @@ DOMESTIC_DAYS = [1, 2, 3, 4, 5]
 
 
 @pytest.fixture(autouse=True)
-def _patch_engine(migrated_db, monkeypatch):
-    monkeypatch.setattr(rts, "get_engine", lambda: migrated_db)
-    monkeypatch.setattr(flight_service, "get_engine", lambda: migrated_db)
-    monkeypatch.setattr(assignment_service, "get_engine", lambda: migrated_db)
-    monkeypatch.setattr(crew_service, "get_engine", lambda: migrated_db)
-    return migrated_db
+def _patch_engine(_patch_all_service_engines):
+    """Thin per-file wrapper — the actual patching logic lives once in
+    conftest.py's _patch_all_service_engines, so no module here can be
+    forgotten. This is the exact fixture that was missing
+    audit_service (2026-08-04), causing
+    test_expand_approve_then_assign_crew_reproduces_hand_verified_numbers
+    to fail with a real-Postgres RuntimeError: crew_service.add_crew()'s
+    own log_audit() call has no conn parameter, so it fell through to
+    an unpatched get_engine(). Fixed by moving the patching to one
+    shared place instead of a per-file list to remember."""
+    return _patch_all_service_engines
 
 
 def _create_domestic_template(effective_from=dt.date(2026, 1, 1), effective_until=None):

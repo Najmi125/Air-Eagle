@@ -54,3 +54,40 @@ def migrated_db(db_engine):
     from scripts import run_migrations as rm
     rm.run(engine=db_engine)
     return db_engine
+
+
+@pytest.fixture
+def _patch_all_service_engines(migrated_db, monkeypatch):
+    """
+    Patches get_engine() on every service module that has one, so any
+    test needing the real migrated test DB can request this single
+    fixture instead of a per-file, easy-to-under-scope copy.
+
+    This exists because omitting a module here is a real, already-
+    happened failure mode, not a hypothetical: test_rotation_template_
+    service.py's own local _patch_engine fixture patched rts/
+    flight_service/assignment_service/crew_service but omitted
+    audit_service — invisible in every test that reached log_audit()
+    through a conn= parameter (joining an already-patched connection),
+    and only surfaced as a real failure (RuntimeError: DATABASE_URL not
+    set) in the one test that called crew_service.add_crew(), whose
+    own log_audit() call has no conn and fell through to the
+    unpatched get_engine() (2026-08-04). A single shared fixture here
+    makes that whole class of gap structurally impossible instead of
+    something each new test file has to remember to get right.
+
+    Each test file keeps its own local `_patch_engine` name (a thin,
+    3-line wrapper requesting this fixture) so no existing test
+    function signature needs to change — only the actual patching
+    logic moves to one place.
+    """
+    import services.assignment_service as assignment_service
+    import services.audit_service as audit_service
+    import services.crew_service as crew_service
+    import services.flight_service as flight_service
+    import services.rotation_template_service as rotation_template_service
+
+    for mod in (assignment_service, audit_service, crew_service,
+                flight_service, rotation_template_service):
+        monkeypatch.setattr(mod, "get_engine", lambda: migrated_db)
+    return migrated_db
