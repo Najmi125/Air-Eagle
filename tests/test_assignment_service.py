@@ -192,15 +192,15 @@ def _seed_heavy_history_and_assign_far_future(engine, crew_id):
 def test_age_on_boundary_turning_65_today_counts_as_65():
     """Exactly 65 does not count as below 65 either way (settled
     wording) — turning 65 ON the reference date already counts."""
-    assert assignment_service._age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 2)) == 65
+    assert assignment_service.age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 2)) == 65
 
 
 def test_age_on_day_before_65th_birthday_is_still_64():
-    assert assignment_service._age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 1)) == 64
+    assert assignment_service.age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 1)) == 64
 
 
 def test_age_on_day_after_reference_before_birthday_is_64():
-    assert assignment_service._age_on(dt.date(1961, 8, 3), dt.date(2026, 8, 2)) == 64
+    assert assignment_service.age_on(dt.date(1961, 8, 3), dt.date(2026, 8, 2)) == 64
 
 
 @pytest.mark.parametrize("age_a, age_b, domestic, expected_illegal", [

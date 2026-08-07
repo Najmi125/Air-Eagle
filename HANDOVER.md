@@ -305,8 +305,16 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Merged into `main` — no outstanding branches as of this snapshot
-  (2026-08-04).** Most recent: `rotation-instance-approval-workflow` —
+- **One outstanding branch as of this snapshot (2026-08-04):
+  `roster-generator-phase7-final` — the roster generator, Phase 7's
+  last piece (fills CPT/FO seats on approved rotations via the real
+  `assign_crew_to_duty()` gate, writes `PROPOSED` roster rows pending
+  OCC publish). Tests written, traced by hand, NOT yet run against real
+  Postgres — see the dedicated log entry below. Do not merge until the
+  user verifies.**
+
+- **Merged into `main`** as of the point this branch was cut. Most
+  recent: `rotation-instance-approval-workflow` —
   DRAFT -> APPROVED promotion, the piece that makes a template actually
   produce operational flights (see the dedicated log entry below).
   382/382 verified against real Postgres 16, including a real fix found
@@ -450,18 +458,18 @@ resuming towards merge. See `Current active task` above for actual
 merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
-- `scripts/check_reachability.py` currently flags two files:
-  `services/assistant/reports.py` (as of the `assistant-report-
-  functions` branch, 2026-08-01 — nothing calls `run_report()` yet,
-  there's no assistant UI page) and `services/rotation_template_service.py`
-  (as of `rotation-templates-phase7-groundwork`, 2026-08-04 — nothing
-  calls it either, there's no template-management UI, and the generator
-  that will eventually be its real caller isn't built). Both correctly
-  so — built ahead of being wired into a page, same reason in both
-  cases. `core/duty_summary.py` and `core/rotation_expansion.py` are
-  NOT flagged: `reports.py`'s `utilization()` and
-  `rotation_template_service.py`'s `expand_and_persist()` are each
-  other's first real caller.
+- `scripts/check_reachability.py`, re-run on the
+  `roster-generator-phase7-final` branch (2026-08-04): now flags exactly
+  two files, `services/assistant/reports.py` (unchanged — still no
+  assistant UI page) and `services/roster_generator_service.py` (no
+  Phase 7 piece has UI yet, so nothing under `pages/` calls the
+  generator). `services/rotation_template_service.py` is NO LONGER
+  flagged, as expected — `services/roster_generator_service.py` is now
+  its first real caller (`get_instances()`/`get_promoted_flight_ids()`).
+  `core/roster_generation.py` was never flagged either, same one-hop
+  reachability reasoning already noted above for `core/duty_summary.py`/
+  `core/rotation_expansion.py` — its own importer doesn't need to be
+  reachable-from-pages itself for it to count.
 - **`find_legal_candidates_for_duty()` does not check the age-pairing
   rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02).** This function
   powers the downstream-swap candidate suggestions shown when an
@@ -3214,3 +3222,194 @@ against real Postgres 16 — migration 012 applies cleanly, the
 the end-to-end grounding test now passes, confirming a template-sourced
 flight is genuinely indistinguishable from a manually-entered one to
 `assign_crew_to_duty()`.
+
+## 2026-08-04 (continued): the roster generator — Phase 7's final piece
+
+Plan proposed first (seven explicit design questions — input source,
+fairness-counting scope, ordering strategy, the age-pairing order-
+dependence risk, output mechanism given draft -> review -> publish,
+partial-failure behavior, idempotency), reviewed twice by the user.
+First round: the plan's Q4 international analysis was confirmed
+correct, but its domestic premise ("a 65+ pilot in the first-filled
+domestic seat is never a problem") was proven wrong empirically against
+the real gate — see below. Branch `roster-generator-phase7-final`, off
+`main` at the `rotation-instance-approval-workflow` merge point.
+
+**The mechanism, settled and unchanged from the plan**: the generator
+never re-expresses an FTL or pairing rule — every legality decision
+goes through `assign_crew_to_duty()`, every single time. It only
+decides candidate ORDER (`core/roster_generation.py`'s
+`order_candidates()`) and whether a seat is already filled. Fairness =
+even duty counts within role only, scoped to the generation window
+itself (a real, duty-deduped count via `core/duty_summary.py`'s
+`group_roster_rows_into_duties()` — never a raw row count). Rotations
+walked chronologically, same-day ties broken by `rotation_code`
+alphabetically, for deterministic (idempotency-friendly) output.
+Output is a new `roster.status = 'PROPOSED'` (migration 013, mirrors
+009's exact CHECK-constraint pattern), never written straight to
+`PLANNED` — `assign_crew_to_duty()` gained an optional `roster_status`
+parameter (default `'PLANNED'`, every existing call site unaffected);
+`get_roster_for_crew()`/`get_roster_for_flight()`/`search_roster()`
+gained a matching `include_proposed` parameter (same shape as their
+existing `include_cancelled`) so `PROPOSED` stays invisible to
+crew-facing reads by default — "crew sees only published."
+`roster_coverage()` is the one deliberate exception
+(`include_proposed=True`): a generator-filled seat must not show as
+falsely UNCOVERED to a reviewing controller. `publish_window()` is the
+mechanical `PROPOSED -> PLANNED` flip, the roster-level analog of
+`approve_instance()`. Partial failure mid-run is not wrapped in one
+transaction — each `assign_crew_to_duty()` call is already its own
+atomic, committed unit (Step 6); a crash simply stops, safely resumable
+by re-running. Idempotent by construction: a seat with any existing
+ACTIVE assignment (including a prior run's own `PROPOSED`) is skipped,
+never re-attempted or replaced; a previously-UNCOVERED seat is the one
+thing retried on every run.
+
+**The domestic premise the plan got wrong, and the fix, proven
+empirically against the real pairing math before being coded** — not
+theorized. Original claim: only international suffers from candidate-
+selection order dooming a seat (a 65+ pilot in EITHER international
+seat makes the pair unconditionally illegal, so a naive fewest-duties
+pick can lock out a reachable, fully-legal crewing). Domestic was
+assumed safe because its rule is looser ("illegal only if BOTH 65+").
+Tested directly: a domestic rotation with an FO pool that's entirely
+65+ (66 and 68) and a CPT pool with a 67yo (fewest duty, picked first
+under plain ordering) and a 40yo alternative — plain fewest-duties
+picks the 67yo CPT, both FO candidates get REJECTED (both pilots 65+),
+seat UNCOVERED. The fix has to be asymmetric, not the same rule copied
+onto domestic: international's under-65-first ordering is
+UNCONDITIONAL on both seats (a 65+ pilot can never fly international
+once paired, so deprioritizing them costs nothing); domestic's must be
+CONDITIONAL — only kicks in for the seat filled SECOND, and only when
+the seat filled FIRST turned out to be 65+ — because applying it
+unconditionally on domestic would systematically under-assign legal
+65+ pilots and break the even-duty-counts fairness goal for no reason
+in the common case. `order_candidates(candidates, domestic,
+partner_age=None)`: `partner_age` is the actual age of whoever already
+fills the OTHER seat, `None` for the seat filled first. Age-aware
+ordering applies when `not domestic` (international, always) or
+`partner_age is not None and partner_age >= 65` (domestic,
+conditional).
+
+**A second gap, found by directly simulating the approved design
+against the real pairing math BEFORE writing the DB-integration
+tests** (same "verify via direct interpreter execution before trusting
+it" discipline this session has used for every pure-logic module):
+the domestic conditional fix only works at all if the SEAT WHOSE POOL
+IS AT RISK gets filled FIRST, since the first-filled seat is never
+blocked by pairing (no partner exists yet) and unconditionally locks in
+whoever plain fewest-duties picks — the SECOND seat's conditional
+ordering can only route around an already-known bad partner age, it
+cannot undo the first seat's own unconditioned pick. Filling CPT before
+FO (the naive, arbitrary choice) fails the exact scenario above: the
+67yo CPT gets locked in first (nothing blocks a solo assignment,
+however old), then FO's conditional ordering is powerless because
+EVERY FO candidate is 65+ — no reordering within an entirely-65+ pool
+changes the outcome. Filling FO before CPT fixes it: FO's forced 65+
+pick becomes the known `partner_age` feeding CPT's own conditional
+ordering, which then correctly prefers the 40yo over the 67yo. Verified
+directly in the interpreter (`order_candidates()` fed the exact
+scenario both ways) before being encoded as
+`services/roster_generator_service.py`'s `ROLES = ("FO", "CPT")`
+constant, with the reasoning recorded in that file's own comment — not
+an arbitrary pick, and it doubles as the operationally sound choice
+anyway, since FO is the smaller real-world pool (4 vs 6 CPT) and
+therefore the more likely one to end up homogeneously 65+ in the first
+place.
+
+A third, related gap caught the same way: seats were originally
+processed in one loop over a fixed role order, meaning an
+ALREADY-filled seat's age (e.g. a controller's own manual `PLANNED`
+assignment made before a generation run) would only reach the other
+seat's conditional ordering if that already-filled role happened to
+come first in `ROLES` — otherwise the information existed but arrived
+too late to matter. Fixed by splitting into two passes: first record
+every seat's existing state (populating `seat_ages` for anything
+already filled, regardless of role order), then fill only what's
+actually still needed, so a pre-existing seat's age is always available
+to condition the other seat's ordering, not just when it happens to be
+processed first.
+
+**Files**: `migrations/013_roster_proposed_status.sql`.
+`core/roster_generation.py` (new, pure, no DB — `Candidate`,
+`order_candidates()`; takes pre-computed `age: Optional[int]` rather
+than a raw `date_of_birth`, so age arithmetic is never duplicated —
+the caller computes it via the real, already-tested
+`assignment_service.age_on()` (promoted from private `_age_on`) and
+hands in plain ints, keeping `core/` modules' existing "never import
+from `services/`" placement principle intact rather than bending it for
+this one case). `services/roster_generator_service.py` (new —
+`generate_for_window()`, `publish_window()`, `GenerationSummary`/
+`SeatResult` dataclasses; writes only via `assignment_service.
+assign_crew_to_duty()`, Ownership Table unchanged).
+`services/assignment_service.py`: `age_on()` promoted public;
+`assign_crew_to_duty()` gained `roster_status`; `get_roster_for_crew()`/
+`get_roster_for_flight()`/`search_roster()` gained `include_proposed`.
+`services/rotation_template_service.py`: `_promoted_flight_ids()`
+factored out of `approve_instance()`'s own idempotency check, plus a
+public `get_promoted_flight_ids()` wrapper — the "which real flights
+make up this approved rotation" lookup the generator needs for every
+candidate rotation it considers. `services/assistant/reports.py`:
+`roster_coverage()` now calls `get_roster_for_flight(...,
+include_proposed=True)` — the one deliberate exception to "crew sees
+only published." `tests/conftest.py`: `roster_generator_service` added
+to `_patch_all_service_engines`' patched-module list, per the
+consolidation discipline from the previous piece — no new one-off
+local fixture.
+
+**Tests**: 8 pure-logic (`tests/test_roster_generation.py`, no DB) —
+plain fewest-duties when `partner_age` is `None` or under 65; the
+conditional domestic switch once `partner_age >= 65` (including the
+explicit regression proving ordinary domestic ordering is unaffected
+when the first pick is under 65); international's unconditional
+under-65-first regardless of `partner_age`; a missing-age candidate
+pushed later, never excluded; deterministic tie-breaking. 13
+DB-integration (`tests/test_roster_generator_service.py`, grounded in
+the real EPE 786/787 domestic and EPE 802/804/805 international
+rotations via the actual `expand_and_persist()` + `approve_instance()`
+arc, not synthetic shortcuts): basic domestic/international fill as
+`PROPOSED`; back-to-back international for a sole candidate ends
+UNCOVERED (the real gate's rest math, not the generator, causing it —
+isolated by using exactly one CPT candidate so fairness has no escape
+route to a different pilot); back-to-back domestic for a sole candidate
+succeeds (proving the reverse is legal, same isolation technique);
+duty counts stay even within role (max-min <= 1) and the smaller pool
+(FO) carries more average load than the larger one (CPT), scaled down
+from the real 6/4 grounding ratio; the corrected domestic scenario
+itself, end-to-end — an entirely-65+ FO pool still gets a fully-crewed
+pair when an eligible under-65 CPT candidate exists; idempotency on a
+fully-generated window (no duplicate rows); gap-filling on a partially
+(manually) generated window, confirming the pre-existing row is never
+touched; a previously-UNCOVERED seat retried and filled once the
+blocker (an inactive crew member) is resolved between runs;
+`publish_window()` flipping only in-range `PROPOSED` rows; `roster_
+coverage()` showing a `PROPOSED` seat as covered while `get_roster_
+for_crew()` hides it by default.
+
+**Verification status**: DB-integration tests NOT yet run against real
+Postgres — no `TEST_DATABASE_URL` in this sandbox, same as every other
+DB-integration piece this session; their expected outcomes were
+reasoned through by hand against the real gate's documented rules
+(age-pairing, back-to-back rest math already established as grounding
+facts earlier this session), including, for the two ordering-sensitive
+scenarios, literally simulating `order_candidates()` plus the pairing
+math in the interpreter first to confirm the predicted outcome before
+writing the assertion, not guessed. Everything that COULD run locally
+did: pure-logic tests (`test_roster_generation.py`, 8/8) and full-suite
+collection (`pytest tests/`: 157 passed, 246 skipped, both new test
+files collected cleanly with zero import errors). `check_reachability.py`
+re-run: flags exactly `services/assistant/reports.py` (unchanged) and
+`services/roster_generator_service.py` (no Phase 7 piece has UI yet).
+`services/rotation_template_service.py` is no longer flagged, as
+predicted — `roster_generator_service.py` is now its first real caller.
+`core/roster_generation.py` was never flagged (same one-hop reasoning
+as `core/duty_summary.py`/`core/rotation_expansion.py`). See `Current
+active task` near the top of this file for merge status, not this
+line.
+
+**Explicitly out of scope, same as the plan**: any UI (review,
+trigger, template management). Re-optimization or changing an existing
+assignment once made. True optimal bipartite matching / backtracking —
+this stays a greedy, single-pass loop with two targeted ordering fixes
+for the two identified failure modes, not a claim of finding the best
+possible crewing in every case.

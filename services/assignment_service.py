@@ -330,10 +330,17 @@ class PairingCheckResult:
     constraint_message: Optional[str] = None
 
 
-def _age_on(dob, reference_date) -> int:
+def age_on(dob, reference_date) -> int:
     """Complete years as of reference_date. Turning 65 ON
     reference_date already counts as 65, not 64 — "exactly 65 does
-    not count as below 65 either way" (HANDOVER.md, settled wording)."""
+    not count as below 65 either way" (HANDOVER.md, settled wording).
+
+    Promoted from private (_age_on) to a plain shared utility
+    (2026-08-04, Phase 7's roster generator) — services/
+    roster_generator_service.py reuses this exact, already-tested
+    function for its own candidate-ordering heuristic rather than
+    re-deriving age arithmetic; still the same function, same
+    behavior, every existing call site in this file unaffected."""
     years = reference_date.year - dob.year
     if (reference_date.month, reference_date.day) < (dob.month, dob.day):
         years -= 1
@@ -435,7 +442,7 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
     if paired is None:
         constraint = None
         if pd.notna(crew_row["date_of_birth"]):
-            age = _age_on(crew_row["date_of_birth"], reference_date)
+            age = age_on(crew_row["date_of_birth"], reference_date)
             if age >= 65:
                 constraint = _pairing_constraint_message(crew_row["crew_id"], age, domestic)
         return [], PairingCheckResult(pending=True, constraint_message=constraint)
@@ -454,8 +461,8 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
         )
         return [alert], PairingCheckResult(paired_crew_id=paired["crew_id"])
 
-    age_this = _age_on(crew_row["date_of_birth"], reference_date)
-    age_paired = _age_on(paired["date_of_birth"], reference_date)
+    age_this = age_on(crew_row["date_of_birth"], reference_date)
+    age_paired = age_on(paired["date_of_birth"], reference_date)
 
     if _evaluate_pair_age(age_this, age_paired, domestic):
         alert = RuleAlert(
@@ -586,17 +593,32 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
 # ------------------------------------------------------------------
 
 def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
-                         app_user: Optional[str] = None) -> AssignmentResult:
+                         app_user: Optional[str] = None,
+                         roster_status: str = "PLANNED") -> AssignmentResult:
     """
     Assigns crew_id to the duty formed by flight_ids (in chronological
     order — the caller's decision which flights form one duty).
     domestic is read from the flights themselves, not asked again
     here — all flights in the duty must agree on it.
 
-    ILLEGAL blocks the save entirely (status="REJECTED", nothing
-    written). LEGAL/WARNING saves and returns status="ALLOWED", along
-    with any downstream conflicts found on the crew member's other
-    already-scheduled future duties.
+    ILLEGAL blocks the save entirely (AssignmentResult.status=
+    "REJECTED", nothing written). LEGAL/WARNING saves and returns
+    AssignmentResult.status="ALLOWED", along with any downstream
+    conflicts found on the crew member's other already-scheduled
+    future duties.
+
+    roster_status: the value written to the new roster row's own
+    status column (migrations/003, 009, 013 — currently 'PLANNED',
+    'OPERATED', 'CANCELLED', 'DISRUPTED', 'NEEDS_REVIEW', 'PROPOSED')
+    — a completely different thing from AssignmentResult.status above,
+    which describes the OUTCOME of this call (REJECTED/NEEDS_REVIEW/
+    ALLOWED), not the roster row's own lifecycle state. Defaults to
+    'PLANNED', unchanged for every pre-existing call site (the Roster
+    page). Phase 7's roster generator (2026-08-04) is the one caller
+    that passes 'PROPOSED' — a draft assignment pending OCC review/
+    publish (services/roster_generator_service.py's publish_window()),
+    per the requirements doc's "draft -> OCC review -> publish, crew
+    sees only published."
     """
     engine = get_engine()
 
@@ -697,12 +719,13 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         for fid in flight_ids:
             result = conn.execute(text("""
                 INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
-                    report_time, debrief_time, fdp_hours, role_assigned)
+                    report_time, debrief_time, fdp_hours, role_assigned, status)
                 VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
-                    :report_time, :debrief_time, :fdp_hours, :role_assigned)
+                    :report_time, :debrief_time, :fdp_hours, :role_assigned, :roster_status)
                 RETURNING roster_id
             """), {
                 "crew_id": crew_id, "flight_id": fid, "duty_id": new_duty.duty_id,
+                "roster_status": roster_status,
                 "duty_date": duty_result.report_time.date(),
                 "report_time": duty_result.report_time, "debrief_time": duty_result.debrief_time,
                 "fdp_hours": duty_result.fdp_hours, "role_assigned": role_assigned,
@@ -1300,25 +1323,41 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
     return results
 
 
-def get_roster_for_crew(crew_id: str, include_cancelled: bool = False) -> pd.DataFrame:
+def get_roster_for_crew(crew_id: str, include_cancelled: bool = False,
+                         include_proposed: bool = False) -> pd.DataFrame:
+    """
+    include_proposed (2026-08-04, Phase 7's roster generator):
+    PROPOSED rows (services/roster_generator_service.py's
+    generate_for_window(), not yet published via publish_window()) are
+    excluded by default, same shape as include_cancelled — a crew
+    member's own duty history should show published assignments only,
+    matching the requirements doc's "crew sees only published."
+    """
     engine = get_engine()
     query = "SELECT * FROM roster WHERE crew_id = :crew_id"
     if not include_cancelled:
         query += " AND status != 'CANCELLED'"
+    if not include_proposed:
+        query += " AND status != 'PROPOSED'"
     query += " ORDER BY report_time"
     return pd.read_sql(text(query), engine, params={"crew_id": crew_id})
 
 
-def get_roster_for_flight(flight_id: int, include_cancelled: bool = False) -> pd.DataFrame:
+def get_roster_for_flight(flight_id: int, include_cancelled: bool = False,
+                           include_proposed: bool = False) -> pd.DataFrame:
+    """See get_roster_for_crew()'s docstring for include_proposed."""
     engine = get_engine()
     query = "SELECT * FROM roster WHERE flight_id = :flight_id"
     if not include_cancelled:
         query += " AND status != 'CANCELLED'"
+    if not include_proposed:
+        query += " AND status != 'PROPOSED'"
     return pd.read_sql(text(query), engine, params={"flight_id": flight_id})
 
 
 def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = None,
-                   date_from=None, date_to=None, include_cancelled: bool = False) -> pd.DataFrame:
+                   date_from=None, date_to=None, include_cancelled: bool = False,
+                   include_proposed: bool = False) -> pd.DataFrame:
     """
     Sector-level roster search across crew/date range — the query
     services/assistant/reports.py's crew_duty_history template needs.
@@ -1336,6 +1375,9 @@ def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = No
     history." A report-layer consumer of this data is exactly where
     that mistake would happen again if this warning weren't repeated
     here too.
+
+    include_proposed: see get_roster_for_crew()'s docstring — excluded
+    by default, same shape as include_cancelled.
     """
     engine = get_engine()
     query = """
@@ -1353,6 +1395,8 @@ def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = No
     params: dict = {}
     if not include_cancelled:
         conditions.append("r.status != 'CANCELLED'")
+    if not include_proposed:
+        conditions.append("r.status != 'PROPOSED'")
     if crew_ids:
         conditions.append("r.crew_id = ANY(:crew_ids)")
         params["crew_ids"] = list(crew_ids)

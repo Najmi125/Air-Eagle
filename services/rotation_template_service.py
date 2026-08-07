@@ -419,6 +419,32 @@ def get_instance_legs(instance_id: int) -> pd.DataFrame:
     """), engine, params={"instance_id": instance_id})
 
 
+def _promoted_flight_ids(conn, instance_id: int) -> List[int]:
+    """Shared query, given an already-open connection: the real
+    flight_ids an APPROVED instance's legs were promoted into, in leg
+    (chronological) order. Used by approve_instance()'s own idempotency
+    check and by get_promoted_flight_ids() below — factored out
+    (2026-08-04) so services/roster_generator_service.py, which needs
+    this exact "which real flights make up this approved rotation"
+    lookup for every candidate rotation it considers, doesn't have to
+    duplicate it."""
+    return list(conn.execute(text("""
+        SELECT flight_id FROM flights
+        WHERE rotation_instance_id = :id
+        ORDER BY dep_time_planned
+    """), {"id": instance_id}).scalars().all())
+
+
+def get_promoted_flight_ids(instance_id: int) -> List[int]:
+    """Public wrapper for _promoted_flight_ids() — the flight_ids an
+    APPROVED rotation_instance's legs were promoted into, in leg
+    (chronological — the order assign_crew_to_duty() needs) order.
+    Empty list if the instance isn't approved yet or doesn't exist."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        return _promoted_flight_ids(conn, instance_id)
+
+
 # ------------------------------------------------------------------
 # Approval workflow (2026-08-04) — DRAFT -> APPROVED promotes every
 # leg into a real flights row via the existing flight_service.
@@ -459,12 +485,7 @@ def approve_instance(instance_id: int, app_user: Optional[str] = None) -> List[i
             raise ValueError(f"No rotation_instance with id={instance_id}")
 
         if instance["status"] == "APPROVED":
-            existing = conn.execute(text("""
-                SELECT flight_id FROM flights
-                WHERE rotation_instance_id = :id
-                ORDER BY dep_time_planned
-            """), {"id": instance_id}).scalars().all()
-            return list(existing)
+            return _promoted_flight_ids(conn, instance_id)
 
         if instance["status"] != "DRAFT":
             raise ValueError(

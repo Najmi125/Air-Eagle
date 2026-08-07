@@ -76,6 +76,10 @@ def _patch_all_service_engines(migrated_db, monkeypatch):
     makes that whole class of gap structurally impossible instead of
     something each new test file has to remember to get right.
 
+    roster_generator_service added 2026-08-04 (Phase 7's roster
+    generator) — new modules join this list rather than getting a new
+    one-off local fixture, per the same discipline.
+
     Each test file keeps its own local `_patch_engine` name (a thin,
     3-line wrapper requesting this fixture) so no existing test
     function signature needs to change — only the actual patching
@@ -85,9 +89,10 @@ def _patch_all_service_engines(migrated_db, monkeypatch):
     import services.audit_service as audit_service
     import services.crew_service as crew_service
     import services.flight_service as flight_service
+    import services.roster_generator_service as roster_generator_service
     import services.rotation_template_service as rotation_template_service
 
     for mod in (assignment_service, audit_service, crew_service,
-                flight_service, rotation_template_service):
+                flight_service, rotation_template_service, roster_generator_service):
         monkeypatch.setattr(mod, "get_engine", lambda: migrated_db)
     return migrated_db
