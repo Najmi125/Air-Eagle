@@ -305,25 +305,22 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Merged into `main` — no outstanding branches as of this
-  snapshot (2026-08-04).** Most recent: `rotation-templates-phase7-
-  groundwork` (Phase 7 groundwork, the recurring-schedule-template
-  layer — see the dedicated log entries below) — 365/365 verified by
-  the user against real Postgres 16, including two real fixes found on
+- **Merged into `main` through `rotation-templates-phase7-groundwork`
+  (2026-08-04)** — the recurring-schedule-template layer, 365/365
+  verified against real Postgres 16, including two real fixes found on
   that first verification pass (`create_new_version()`'s `DEFERRABLE`
   constraint ordering, 5 tests asserting the wrong exception class)
-  and `btree_gist` confirmed available on Supabase specifically
-  (default_version 1.7), the last open risk on this piece. Before
-  that: Step 7 (the age-pairing rule, AE-CREW-PAIR-AGE-001) — 338/338
-  verified against real Postgres 16, including a real-data empirical
-  check (domestic 67+67 rejected, domestic 67+41 allowed, international
-  67+41 rejected). Step 6 (transactional atomicity, `log_audit()`'s
-  `conn` parameter) verified the same way one piece earlier, including
-  a manual crash simulation confirming the before/after difference
-  directly (orphaned flight + roster row -> full rollback).
-  `crew-data-role-dropdown-cpt-fo-only` (`ROLE_OPTIONS = ["CPT", "FO",
-  "Other"]` on `pages/2_Crew_Data.py`) landed the same way, re-verified
-  against Step 6/7 before merging rather than on its original baseline.
+  and `btree_gist` confirmed available on Supabase (default_version
+  1.7). Before that: Step 7 (age-pairing, AE-CREW-PAIR-AGE-001) and
+  Step 6 (transactional atomicity) — see prior entries below for full
+  detail on each.
+- **Pushed, not yet merged (2026-08-04)**:
+  `rotation-instance-approval-workflow` — DRAFT -> APPROVED promotion,
+  the piece that makes a template actually produce operational flights
+  (see the dedicated log entry below). Adds this repo's second
+  database-level uniqueness guarantee beyond migrations/011's `EXCLUDE`
+  constraint — a partial unique index (migrations/012) closing a real
+  gap found on review of this piece's own plan.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
@@ -723,11 +720,15 @@ phase so far:
    template layer only — `rotation_templates`/`rotation_template_legs`/
    `rotation_instances`/`rotation_instance_legs`, migrations/011) so
    the generator has DECLARED rotation membership to work from instead
-   of inferring it from Flight Log. The generator itself, and the
-   draft->OCC-review->publish approval workflow, are still not built.
-   Also: the 2026-07-19 OR-Tools CP-SAT decision is REVERSED — see
-   that entry too. Do not resume Phase 7 assuming CP-SAT is still the
-   plan.
+   of inferring it from Flight Log. **Approval workflow started
+   2026-08-04** (branch `rotation-instance-approval-workflow`, not yet
+   merged) — `approve_instance()`/`reject_instance()`, promoting a
+   DRAFT instance's legs into real `flights` rows via the existing
+   `flight_service.add_flight()`. The generator itself (whatever's
+   left to actually decide WHICH crew fills each promoted flight) is
+   still not built, and neither is any UI. Also: the 2026-07-19
+   OR-Tools CP-SAT decision is REVERSED — see that entry too. Do not
+   resume Phase 7 assuming CP-SAT is still the plan.
 
 Lower-priority findings, not yet sequenced: airport timezones not
 passed to the validator (every sector defaults to UTC+5 regardless
@@ -3046,3 +3047,170 @@ migration is the thing that discovers it isn't available there —
 confirmed working on real Postgres 16 (unmanaged), but Supabase is
 managed Postgres and extension availability on managed platforms isn't
 guaranteed to match a self-hosted instance.
+
+**RESOLVED 2026-08-04**: `btree_gist` confirmed available on Supabase
+— `default_version 1.7`, `installed_version NULL` (not yet enabled,
+which migrations/011's `CREATE EXTENSION IF NOT EXISTS` already
+handles on its own). This was the last open risk on this piece.
+
+## 2026-08-04 (continued): rotation_instance approval workflow —
+## DRAFT -> APPROVED promotes a template into real operational flights
+
+Plan proposed first (extend `add_flight()` the same way `log_audit()`
+was extended in Step 6, promotion atomicity, idempotency, what's out
+of scope), verified against merged `main` by the user before
+implementation, approved with one addition after review. Branch
+`rotation-instance-approval-workflow`, off `main` at the rotation-
+templates-phase7-groundwork merge point.
+
+**Why `add_flight()` needed the same `conn` treatment `log_audit()`
+got in Step 6 — confirmed by reading the code, not assumed**:
+`add_flight()` already inserted into `flights` inside its own
+`engine.begin()`, then called `log_audit()` as a separately-committed
+transaction — the exact same "data write, then separately-committed
+audit" shape Step 6 fixed elsewhere. Control Room's ad-hoc path
+bypasses `add_flight()` entirely with its own raw `INSERT`, specifically
+because `add_flight()` couldn't join an existing transaction at the
+time — unrelated to this change, still bypassing it, not touched here.
+Fixed by giving `add_flight()` the identical `conn` parameter contract
+`log_audit()` already has: when passed, both the `INSERT` and the
+`FLIGHT_ADDED` audit record join the caller's transaction; default (no
+`conn`) behavior is unchanged for every existing call site. This
+incidentally closes `add_flight()`'s own version of the same gap Step
+6 already fixed elsewhere, as a side effect of reuse, not separate work.
+
+**`approve_instance()`/`reject_instance()`**, both in
+`services/rotation_template_service.py` (the file already owns all
+four `rotation_*` tables — `rotation_instances`' lifecycle belongs
+there, not a new file). `approve_instance()`: one transaction,
+all-or-nothing — loads a DRAFT instance's legs from
+`rotation_instance_legs` (already carrying everything `add_flight()`'s
+`REQUIRED_FIELDS` needs, guaranteed by that table's own `NOT NULL`
+columns), calls `flight_service.add_flight(..., rotation_instance_id=
+instance_id, conn=conn)` once per leg in order, then flips
+`rotation_instances.status` to `APPROVED` and logs one
+`ROTATION_INSTANCE_APPROVED` audit entry alongside the per-leg
+`FLIGHT_ADDED` entries `add_flight()` already writes — same layered-
+audit pattern Control Room's own ad-hoc path already uses. Idempotent
+on an already-`APPROVED` instance: returns the existing `flight_ids`
+(via `flights.rotation_instance_id`) rather than creating anything new
+or erroring — same principle already established for
+`expand_and_persist()`. `reject_instance()` requires `DRAFT`, sets
+`REJECTED`, never touches `flights` at all — deliberately NOT
+idempotent the way approve is (rejecting an already-rejected instance
+raises; there's no prior side effect to safely return).
+
+**The gap caught on review, closed with a real database constraint,
+not left service-layer-only**: the original plan's duplicate-
+promotion protection was `approve_instance()`'s idempotency check
+alone. Reviewed against this piece's own established standard — the
+template layer chose database-level guarantees (`EXCLUDE`, triggers)
+for both of ITS invariants, explicitly rejecting "by convention" per
+this project's `ensure_basic_crew_table()` history — service-layer-
+only here would have been a visible inconsistency with that standard.
+Closed with `(rotation_instance_id, flight_no)` being genuinely unique
+per rotation: one rotation should never produce two flights sharing a
+flight number. New migration `012_rotation_legs_flight_no_required.sql`
+(011 is already merged and immutable — a new migration, not an edit):
+`flight_no` changed from nullable to `NOT NULL` on both
+`rotation_template_legs` and `rotation_instance_legs` (a template leg
+describes a known, named, recurring rotation — unlike an ad-hoc Control
+Room charter, where a missing flight number is legitimate and
+`flights.flight_no` itself stays nullable, untouched), plus a PARTIAL
+unique index on `flights (rotation_instance_id, flight_no) WHERE
+rotation_instance_id IS NOT NULL` — mirroring this repo's own existing
+precedent (`migrations/005_roster_partial_unique_index.sql`'s `WHERE
+status != 'CANCELLED'`) rather than relying on plain `UNIQUE`'s
+implicit NULL-handling, so ad-hoc flights are explicitly, visibly never
+subject to this constraint. `create_template()`/`create_new_version()`
+gained a matching service-layer check (`_validate_legs()`) rejecting a
+missing `flight_no` with a clean `ValueError` before ever reaching the
+database, same principle `add_flight()`'s own `REQUIRED_FIELDS` check
+already follows.
+
+**Explicitly out of scope**: un-approving an already-promoted instance
+(APPROVED -> REJECTED, cancelling the flights it produced) — would need
+the same kind of cascade `cancel_flight_and_roster()` (Step 5) already
+does for one flight, generalized across a whole rotation, and needs its
+own design once the generator exists and there's real crew to consider.
+Per-leg field overrides at approval time (aircraft, DG flag, remarks,
+LM/AME free text) — `approve_instance()` promotes exactly what
+`rotation_instance_legs` already has; OCC can fill these in afterward
+via the existing `update_flight()`. Any UI. The generator itself.
+
+**Tests**: 17 new. `tests/test_flight_service.py` gained 3 for
+`add_flight()`'s `conn` parameter, mirroring `log_audit()`'s own three
+Step-6 tests exactly (writes a real row on the success path; shares the
+caller's rollback; default behavior unaffected).
+`tests/test_rotation_template_service.py` gained 14: `approve_instance()`
+promoting every leg correctly with `rotation_instance_id` set on all of
+them; the layered audit entries; idempotency on a second call;
+rejecting a nonexistent or already-`REJECTED` instance; **the
+atomicity regression** — force the second leg's `add_flight()` to fail
+(same monkeypatch technique as Step 6's own crash-simulation test) and
+confirm ZERO flights exist afterward and the instance is still `DRAFT`,
+not partially approved; `reject_instance()`'s own success/error cases,
+including the deliberate non-idempotency on a second rejection; **the
+new database constraint tested directly**, not just through the
+idempotency path — a raw duplicate `(rotation_instance_id, flight_no)`
+insert is rejected even bypassing `approve_instance()` entirely, and
+two ad-hoc flights sharing a `flight_no` are confirmed NOT rejected
+(the partial index correctly ignores them); `create_template()`
+rejecting a leg with no `flight_no`. Plus **one end-to-end grounding
+test tying the whole groundwork arc together**: expand EPE 786/787 for
+a real date, approve it, assign real crew to the resulting flights
+through the actual, unmodified `assign_crew_to_duty()` legality gate,
+and confirm the exact same report 1815Z / debrief 0000Z / FDP 5.75h
+numbers already hand-verified in the template-layer piece — now
+produced by a template-sourced flight indistinguishable from a
+manually-entered one to every downstream consumer.
+
+**Verification status**: 382 total (365 on `main` + 17 new). `pytest
+tests/`: 149 passed, 233 skipped locally (no `TEST_DATABASE_URL` in
+this sandbox) — every new test here is DB-integration and traced by
+hand, not run; the logic was reasoned through directly, including
+hand-tracing the end-to-end test's exact datetime values against the
+already-confirmed `core/rotation_expansion.py` output. `check_
+reachability.py`: unchanged — `services/rotation_template_service.py`
+and `services/assistant/reports.py` remain the only two flagged files;
+`rotation_template_service.py` now importing `flight_service` doesn't
+change either file's own reachability status (`flight_service.py` was
+already reachable from `pages/`). See `Current active task` near the
+top of this file for merge status, not this line.
+
+**One real-Postgres failure found and fixed (381/382): a test-fixture
+gap, not a logic bug.** `test_expand_approve_then_assign_crew_
+reproduces_hand_verified_numbers` failed with `RuntimeError: DATABASE_URL
+not set`. Cause: this file's own `_patch_engine` fixture patched
+`rts`/`flight_service`/`assignment_service`/`crew_service` but omitted
+`audit_service` — invisible in every OTHER test here, since they all
+reach `log_audit()` through a `conn` parameter that's already joined to
+an already-patched connection. This one test calls
+`crew_service.add_crew()` directly, whose own `log_audit()` call has no
+`conn` and falls through to `get_engine()` — never patched, hence the
+real `DATABASE_URL` lookup failing.
+
+**Fixed at the root, not just the symptom**: this is the SECOND time a
+per-file fixture gap has masked something (the first was Step 7's
+`_QUALIFICATION_DEFAULTS` missing `date_of_birth`, a different kind of
+gap but the same shape — one file's own copy of a list, and forgetting
+an entry). `tests/conftest.py` gained
+`_patch_all_service_engines(migrated_db, monkeypatch)`, patching
+`get_engine()` on all five service modules that have one
+(`assignment_service`, `audit_service`, `crew_service`,
+`flight_service`, `rotation_template_service`) in one place. Every test
+file that previously hand-maintained its own subset
+(`test_assignment_service.py`, `test_assistant_reports.py`,
+`test_crew_service.py`, `test_flight_service.py`,
+`test_rotation_template_service.py`) now has a 3-line `_patch_engine`
+wrapper requesting this shared fixture instead — same fixture name in
+every file (no test function signature needed to change anywhere), but
+the actual module list now lives exactly once. This class of gap is now
+structurally impossible, not just fixed for this one occurrence.
+
+**Verification status after the fix**: 382/382 confirmed by the user
+against real Postgres 16 — migration 012 applies cleanly, the
+`flight_no NOT NULL` + partial unique index landed as specified, and
+the end-to-end grounding test now passes, confirming a template-sourced
+flight is genuinely indistinguishable from a manually-entered one to
+`assign_crew_to_duty()`.

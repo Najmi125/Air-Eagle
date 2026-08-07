@@ -2,19 +2,22 @@
 services/rotation_template_service.py
 
 Canonical write path for rotation_templates, rotation_template_legs,
-rotation_instances, and rotation_instance_legs (migrations/011). Phase
-7 groundwork (2026-08-04) — the template layer only. Does NOT write to
-flights or roster: promoting an APPROVED rotation_instance into real
-flights rows (via the existing flight_service.add_flight()) is a
-later, separate approval-workflow piece, not built here.
+rotation_instances, and rotation_instance_legs (migrations/011, 012).
+Also the write path for the approval workflow that promotes an
+APPROVED rotation_instance's legs into real flights rows — via the
+existing flight_service.add_flight(), never a direct INSERT here;
+`flights` stays owned exclusively by flight_service.py per the
+Ownership Table, this file only calls into it.
 
-Two immutability/no-overlap guarantees live at the DATABASE level
-(migrations/011's EXCLUDE constraint and triggers), not just here —
-this service's ordering (close the old version, then insert the new
-one; never expose an update/delete for template legs) is the
-convenient path that satisfies those constraints, not the mechanism
-that enforces them. See migrations/011_rotation_templates.sql's
-comments for the actual guarantees.
+Two immutability/no-overlap guarantees for rotation_templates/
+rotation_template_legs live at the DATABASE level (migrations/011's
+EXCLUDE constraint and triggers), not just here — this service's
+ordering (insert the new version, then close the old one; never
+expose an update/delete for template legs) is the convenient path that
+satisfies those constraints, not the mechanism that enforces them. A
+third guarantee, against double-promotion, lives at the database level
+too (migrations/012's partial unique index on flights). See both
+migration files' comments for the actual guarantees.
 """
 from __future__ import annotations
 
@@ -26,9 +29,30 @@ from sqlalchemy import text
 
 from db.db import get_engine
 from services.audit_service import log_audit
+from services import flight_service
 from core.rotation_expansion import TemplateLeg, expand_template
 
 REQUIRED_TEMPLATE_FIELDS = {"rotation_code", "days_of_week", "effective_from"}
+
+
+def _validate_legs(legs: Sequence[dict]) -> None:
+    """
+    Shared validation for create_template()/create_new_version(),
+    called before anything is written. flight_no is required
+    (migrations/012 enforces this at the database level too, but a
+    clean ValueError here beats a raw NOT NULL violation reaching the
+    caller — same principle flight_service.add_flight()'s own
+    REQUIRED_FIELDS check already follows) — a template leg describes
+    a known, named, recurring rotation, unlike an ad-hoc Control Room
+    charter, where a missing flight_no is legitimate.
+    """
+    for leg in legs:
+        if not leg.get("flight_no"):
+            raise ValueError(
+                f"leg_order={leg.get('leg_order')}: flight_no is required for a "
+                f"template leg (a recurring rotation is always named) — ad-hoc "
+                f"flights with no flight_no go through Control Room, not templates"
+            )
 
 
 def _insert_legs(conn, template_id: int, legs: Sequence[dict]) -> None:
@@ -82,6 +106,7 @@ def create_template(
         raise ValueError("legs must not be empty")
     if effective_from is None:
         raise ValueError("effective_from is required")
+    _validate_legs(legs)
 
     engine = get_engine()
     with engine.begin() as conn:
@@ -154,6 +179,7 @@ def create_new_version(
     """
     if not legs:
         raise ValueError("legs must not be empty")
+    _validate_legs(legs)
 
     engine = get_engine()
     with engine.begin() as conn:
@@ -391,3 +417,130 @@ def get_instance_legs(instance_id: int) -> pd.DataFrame:
         WHERE instance_id = :instance_id
         ORDER BY leg_order
     """), engine, params={"instance_id": instance_id})
+
+
+# ------------------------------------------------------------------
+# Approval workflow (2026-08-04) — DRAFT -> APPROVED promotes every
+# leg into a real flights row via the existing flight_service.
+# add_flight(); DRAFT -> REJECTED never touches flights at all. This
+# is the step that makes a template actually produce operational
+# flights.
+# ------------------------------------------------------------------
+
+def approve_instance(instance_id: int, app_user: Optional[str] = None) -> List[int]:
+    """
+    Approves a DRAFT rotation_instance and promotes every one of its
+    legs into a real flights row, all in ONE transaction — either
+    every leg becomes a real flight, or none does. A failure partway
+    through (e.g. leg 2 of 3) rolls back leg 1's insert too; nothing
+    is left half-promoted, and rotation_instances.status stays DRAFT.
+
+    Idempotent on an already-APPROVED instance: returns the existing
+    flight_ids (looked up via flights.rotation_instance_id) without
+    creating anything new — same idempotency principle already used
+    by expand_and_persist(). The database itself backs this up
+    independently: migrations/012's partial unique index on
+    (rotation_instance_id, flight_no) makes a genuine double-promotion
+    structurally impossible even if this idempotency check were ever
+    bypassed, not just discouraged by it.
+
+    Raises ValueError if instance_id doesn't exist, or if the instance
+    is REJECTED (not DRAFT and not already-APPROVED) — a rejected
+    instance can't be approved by this function; see HANDOVER.md for
+    why re-deciding a rejection is out of scope here.
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        instance = conn.execute(text("""
+            SELECT * FROM rotation_instances WHERE id = :id
+        """), {"id": instance_id}).mappings().first()
+
+        if instance is None:
+            raise ValueError(f"No rotation_instance with id={instance_id}")
+
+        if instance["status"] == "APPROVED":
+            existing = conn.execute(text("""
+                SELECT flight_id FROM flights
+                WHERE rotation_instance_id = :id
+                ORDER BY dep_time_planned
+            """), {"id": instance_id}).scalars().all()
+            return list(existing)
+
+        if instance["status"] != "DRAFT":
+            raise ValueError(
+                f"rotation_instance {instance_id} is {instance['status']}, not "
+                f"DRAFT — cannot approve"
+            )
+
+        legs = conn.execute(text("""
+            SELECT * FROM rotation_instance_legs
+            WHERE instance_id = :id ORDER BY leg_order
+        """), {"id": instance_id}).mappings().all()
+
+        flight_ids = []
+        for leg in legs:
+            flight_id = flight_service.add_flight({
+                "flight_no": leg["flight_no"],
+                "origin": leg["origin"],
+                "destination": leg["destination"],
+                "dep_time_planned": leg["dep_time_planned"],
+                "arr_time_planned": leg["arr_time_planned"],
+                "domestic": leg["domestic"],
+                "rotation_instance_id": instance_id,
+            }, app_user=app_user, conn=conn)
+            flight_ids.append(flight_id)
+
+        conn.execute(text("""
+            UPDATE rotation_instances SET status = 'APPROVED' WHERE id = :id
+        """), {"id": instance_id})
+
+        log_audit(
+            action_type="ROTATION_INSTANCE_APPROVED",
+            reason=f"{instance['rotation_code']} {instance['rotation_date']}",
+            changed_state=str({"instance_id": instance_id, "flight_ids": flight_ids}),
+            app_user=app_user,
+            conn=conn,
+        )
+
+    return flight_ids
+
+
+def reject_instance(instance_id: int, reason: Optional[str] = None,
+                     app_user: Optional[str] = None) -> None:
+    """
+    Rejects a DRAFT rotation_instance. Never touches flights — nothing
+    was ever created for a DRAFT, so there's nothing to undo.
+
+    Deliberately NOT idempotent the way approve_instance() is: raises
+    ValueError for any non-DRAFT status, including an already-REJECTED
+    instance. There's no prior side effect to safely return here the
+    way approve's existing flight_ids are — rejecting an already-
+    rejected instance a second time is a caller error to surface, not
+    a safe no-op.
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        instance = conn.execute(text("""
+            SELECT status, rotation_code, rotation_date FROM rotation_instances
+            WHERE id = :id
+        """), {"id": instance_id}).mappings().first()
+
+        if instance is None:
+            raise ValueError(f"No rotation_instance with id={instance_id}")
+
+        if instance["status"] != "DRAFT":
+            raise ValueError(
+                f"rotation_instance {instance_id} is {instance['status']}, not "
+                f"DRAFT — cannot reject"
+            )
+
+        conn.execute(text("""
+            UPDATE rotation_instances SET status = 'REJECTED' WHERE id = :id
+        """), {"id": instance_id})
+
+        log_audit(
+            action_type="ROTATION_INSTANCE_REJECTED",
+            reason=reason or f"{instance['rotation_code']} {instance['rotation_date']}",
+            app_user=app_user,
+            conn=conn,
+        )
