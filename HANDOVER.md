@@ -297,7 +297,7 @@ auth confirmed deliberately parked pending the operator's answer on
 two open questions. See the dedicated 2026-08-02 log entries below for
 full detail on this and everything since.
 
-**Merge status as of this snapshot (2026-08-02)** — this paragraph,
+**Merge status as of this snapshot (2026-08-08)** — this paragraph,
 not the individual dated log entries below, is the single place to
 check what's actually landed. A dated log entry describes what was
 built and why, and that doesn't go stale; a "MERGED"/"NOT MERGED" note
@@ -305,35 +305,47 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **One outstanding branch as of this snapshot (2026-08-08):
-  `roster-generator-phase7-final` — the roster generator, Phase 7's
-  last piece (fills CPT/FO seats on approved rotations via the real
-  `assign_crew_to_duty()` gate, writes `PROPOSED` roster rows pending
-  OCC publish). First real-Postgres verification (2026-08-08) found
-  5 failing tests, all tracing to one cause — `meal_provided` was
-  never populated anywhere in the pipeline, so every international
-  rotation (FDP > 6h) permanently hit D25's `NEEDS_MANUAL_REVIEW`
-  gate. Fixed on the same branch (migrations/014 + threading through
-  `services/rotation_template_service.py`/`services/assignment_service.py`
-  — see the dedicated log entry below). NOT yet re-verified against
-  real Postgres. Do not merge until the user verifies 403/403.**
+- **No outstanding branches as of this snapshot (2026-08-08).
+  `roster-generator-phase7-final` merged into `main`** — Phase 7's
+  last piece, the roster generator (fills CPT/FO seats on approved
+  rotations via the real `assign_crew_to_duty()` gate, writes
+  `PROPOSED` roster rows pending OCC publish). 403/403 verified against
+  real Postgres 16, across three real-Postgres passes: the first found
+  the `meal_provided` data gap (nothing in the pipeline ever populated
+  it, so every international rotation permanently hit D25's
+  `NEEDS_MANUAL_REVIEW` gate — fixed with migrations/014 and threaded
+  through every real `Duty`-construction site, including historical
+  duty rebuilding); the second and third found test-side bugs only (an
+  obsolete `NEEDS_REVIEW` premise, a sector-rows-vs-duties miscount
+  repeated in two call sites, and a test relying on `is_active=False`/
+  `update_crew(is_active=True)`, neither of which actually work —
+  `is_active` isn't in `crew_service.UPDATABLE_FIELDS` and no
+  `reactivate_crew()` exists at all, a real service-layer asymmetry now
+  flagged in `Open stubs`). See the four dated log entries below for
+  full detail on each pass. The user additionally ran the full chain
+  end-to-end against Air Eagle's real 28-day schedule (36 rotations, 6
+  CPT/4 FO): 72/72 seats filled, zero uncovered, duty counts exactly
+  matching the pre-computed demand arithmetic (6 and 9 per role) —
+  confirming the greedy no-backtracking design reaches optimal
+  distribution on the real problem, not just synthetic test scenarios.
+  Phase 7 (templates -> drafts -> approval -> generation) is complete.
 
-- **Merged into `main`** as of the point this branch was cut. Most
-  recent: `rotation-instance-approval-workflow` —
-  DRAFT -> APPROVED promotion, the piece that makes a template actually
-  produce operational flights (see the dedicated log entry below).
-  382/382 verified against real Postgres 16, including a real fix found
-  on that first pass (a per-file test fixture omitting `audit_service`,
-  closed by consolidating all five service modules' `get_engine()`
-  patching into one shared `tests/conftest.py` fixture — the second
-  time a fixture gap masked real behavior, so the class was closed, not
-  just the instance). Adds this repo's second database-level uniqueness
-  guarantee beyond migrations/011's `EXCLUDE` constraint — a partial
-  unique index (migrations/012) against double-promotion. Before that:
-  `rotation-templates-phase7-groundwork` (the recurring-schedule-
-  template layer, 365/365, `btree_gist` confirmed available on Supabase),
-  Step 7 (age-pairing, AE-CREW-PAIR-AGE-001), and Step 6 (transactional
-  atomicity) — see prior entries below for full detail on each.
+- **Merged into `main` before that**: `rotation-instance-approval-workflow`
+  — DRAFT -> APPROVED promotion, the piece that makes a template
+  actually produce operational flights (see the dedicated log entry
+  below). 382/382 verified against real Postgres 16, including a real
+  fix found on that first pass (a per-file test fixture omitting
+  `audit_service`, closed by consolidating all five service modules'
+  `get_engine()` patching into one shared `tests/conftest.py` fixture —
+  the second time a fixture gap masked real behavior, so the class was
+  closed, not just the instance). Adds this repo's second database-level
+  uniqueness guarantee beyond migrations/011's `EXCLUDE` constraint — a
+  partial unique index (migrations/012) against double-promotion.
+  Before that: `rotation-templates-phase7-groundwork` (the
+  recurring-schedule-template layer, 365/365, `btree_gist` confirmed
+  available on Supabase), Step 7 (age-pairing, AE-CREW-PAIR-AGE-001),
+  and Step 6 (transactional atomicity) — see prior entries below for
+  full detail on each.
 
 ## Files changed
 Since commit `727da58`'s push: services/assignment_service.py
