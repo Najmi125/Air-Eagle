@@ -82,6 +82,7 @@ def create_template(
     legs: Sequence[dict],
     effective_from: dt.date,
     meal_provided: bool,
+    snack_provided: bool,
     description: Optional[str] = None,
     effective_until: Optional[dt.date] = None,
     app_user: Optional[str] = None,
@@ -110,6 +111,14 @@ def create_template(
     meal_provided is unknown — this is the fix for that gap having no
     real data source anywhere in the pipeline.
 
+    snack_provided: same shape, same reasoning, same required-no-default
+    footing (migrations/015, 2026-08-08) — D2.18 fires a WARNING (not
+    NEEDS_MANUAL_REVIEW) for any duty over 4h whose snack_provided is
+    False, and stays silent when it's unknown, so this was previously
+    an accidentally-harmless gap rather than a blocking one the way
+    meal_provided was — still fixed the same way, as real data, not a
+    code default.
+
     Raises ValueError if rotation_code/days_of_week/effective_from is
     missing, or if legs is empty (matches expand_template()'s own
     validation — failing here, before anything is written, is
@@ -130,9 +139,9 @@ def create_template(
         result = conn.execute(text("""
             INSERT INTO rotation_templates
                 (rotation_code, description, days_of_week, effective_from,
-                 effective_until, version, meal_provided)
+                 effective_until, version, meal_provided, snack_provided)
             VALUES (:rotation_code, :description, :days_of_week, :effective_from,
-                    :effective_until, 1, :meal_provided)
+                    :effective_until, 1, :meal_provided, :snack_provided)
             RETURNING id
         """), {
             "rotation_code": rotation_code,
@@ -141,6 +150,7 @@ def create_template(
             "effective_from": effective_from,
             "effective_until": effective_until,
             "meal_provided": bool(meal_provided),
+            "snack_provided": bool(snack_provided),
         })
         template_id = result.scalar()
         _insert_legs(conn, template_id, legs)
@@ -165,6 +175,7 @@ def create_new_version(
     legs: Sequence[dict],
     effective_from: dt.date,
     meal_provided: bool,
+    snack_provided: bool,
     description: Optional[str] = None,
     effective_until: Optional[dt.date] = None,
     app_user: Optional[str] = None,
@@ -178,11 +189,11 @@ def create_new_version(
     the EXCLUDE constraint's '[]' inclusive bounds mean a single day
     cannot belong to two versions.
 
-    meal_provided: required, no default — see create_template()'s own
-    docstring for the full reasoning. A new version can genuinely set
-    a different value than the version it supersedes (that's the whole
-    point of storing this per-version rather than assuming it never
-    changes).
+    meal_provided/snack_provided: required, no default — see
+    create_template()'s own docstring for the full reasoning. A new
+    version can genuinely set different values than the version it
+    supersedes (that's the whole point of storing these per-version
+    rather than assuming they never change).
 
     This order is a genuine circular dependency, not an arbitrary
     choice: superseded_by can't be set until the new row exists, but a
@@ -238,9 +249,9 @@ def create_new_version(
         new_result = conn.execute(text("""
             INSERT INTO rotation_templates
                 (rotation_code, description, days_of_week, effective_from,
-                 effective_until, version, meal_provided)
+                 effective_until, version, meal_provided, snack_provided)
             VALUES (:rotation_code, :description, :days_of_week, :effective_from,
-                    :effective_until, :version, :meal_provided)
+                    :effective_until, :version, :meal_provided, :snack_provided)
             RETURNING id
         """), {
             "rotation_code": rotation_code,
@@ -250,6 +261,7 @@ def create_new_version(
             "effective_until": effective_until,
             "version": next_version,
             "meal_provided": bool(meal_provided),
+            "snack_provided": bool(snack_provided),
         })
         new_template_id = new_result.scalar()
 
@@ -390,17 +402,20 @@ def expand_and_persist(
                 instance_id = instance_result.scalar()
 
                 for leg in draft.legs:
-                    # meal_provided is rotation-level (version_row, not
-                    # leg) — broadcast the template version's one value
-                    # onto every leg this run creates, same denormalize-
-                    # at-expansion-time treatment domestic/flight_no
-                    # already get (see migrations/014's header).
+                    # meal_provided/snack_provided are rotation-level
+                    # (version_row, not leg) — broadcast the template
+                    # version's values onto every leg this run creates,
+                    # same denormalize-at-expansion-time treatment
+                    # domestic/flight_no already get (see migrations/014's
+                    # and migrations/015's headers).
                     conn.execute(text("""
                         INSERT INTO rotation_instance_legs
                             (instance_id, leg_order, flight_no, origin, destination,
-                             dep_time_planned, arr_time_planned, domestic, meal_provided)
+                             dep_time_planned, arr_time_planned, domestic,
+                             meal_provided, snack_provided)
                         VALUES (:instance_id, :leg_order, :flight_no, :origin, :destination,
-                                :dep_time_planned, :arr_time_planned, :domestic, :meal_provided)
+                                :dep_time_planned, :arr_time_planned, :domestic,
+                                :meal_provided, :snack_provided)
                     """), {
                         "instance_id": instance_id, "leg_order": leg.leg_order,
                         "flight_no": leg.flight_no, "origin": leg.origin,
@@ -409,6 +424,7 @@ def expand_and_persist(
                         "arr_time_planned": leg.arr_time_planned,
                         "domestic": leg.domestic,
                         "meal_provided": version_row["meal_provided"],
+                        "snack_provided": version_row["snack_provided"],
                     })
 
                 created_ids.append(instance_id)
@@ -540,6 +556,7 @@ def approve_instance(instance_id: int, app_user: Optional[str] = None) -> List[i
                 "arr_time_planned": leg["arr_time_planned"],
                 "domestic": leg["domestic"],
                 "meal_provided": leg["meal_provided"],
+                "snack_provided": leg["snack_provided"],
                 "rotation_instance_id": instance_id,
             }, app_user=app_user, conn=conn)
             flight_ids.append(flight_id)

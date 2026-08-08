@@ -305,9 +305,22 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-08).
-  `roster-generator-phase7-final` merged into `main`** — Phase 7's
-  last piece, the roster generator (fills CPT/FO seats on approved
+- **One outstanding branch as of this snapshot (2026-08-08):
+  `open-stubs-cleanup-2026-08-08`** — four operator decisions from
+  `Open stubs`, implemented as one piece: `snack_provided` wired up
+  exactly like `meal_provided` (migration 015, operator-confirmed);
+  `reactivate_crew()` settled as NOT needed (documentation only, no
+  code); age-pairing added to `find_legal_candidates_for_duty()`
+  (reuses `_check_crew_pairing_age()` per candidate, no new function);
+  `query_parser.parse()` now populates `ReportRequest.status_filter`.
+  Plus a record correction: the Supabase migration-status Open Stubs
+  entry was stale (see that entry's own 2026-08-08 correction). See
+  the dedicated log entry below for full detail. Tests written, not
+  yet run against real Postgres — no `TEST_DATABASE_URL` in this
+  sandbox. Do not merge until the user verifies.
+
+- **Merged into `main` before that**: `roster-generator-phase7-final`
+  — Phase 7's last piece, the roster generator (fills CPT/FO seats on approved
   rotations via the real `assign_crew_to_duty()` gate, writes
   `PROPOSED` roster rows pending OCC publish). 403/403 verified against
   real Postgres 16, across three real-Postgres passes: the first found
@@ -487,18 +500,22 @@ merge status, rather than repeating it here.
   reachability reasoning already noted above for `core/duty_summary.py`/
   `core/rotation_expansion.py` — its own importer doesn't need to be
   reachable-from-pages itself for it to count.
-- **No `reactivate_crew()` exists in `services/crew_service.py`
-  (found 2026-08-08, tracing a test bug — see the dedicated log entry
-  below).** `deactivate_crew()` is a real, dedicated, audited soft-delete
-  (`is_active = FALSE`); nothing symmetric exists to bring a crew
-  member back. `is_active` is also deliberately absent from
-  `UPDATABLE_FIELDS`, so neither `add_crew()` nor the generic
-  `update_crew()` can set it either — any future attempt to reactivate
-  via `update_crew(crew_id, {"is_active": True})` will silently no-op
-  (the field gets filtered out before the UPDATE is built), not raise.
-  Currently the only way to flip `is_active` back to `TRUE` is a raw
-  SQL statement outside the service layer. Worth a deliberate decision
-  once this is operationally needed, not a silent gap to rediscover.
+- **RESOLVED 2026-08-08 — no `reactivate_crew()` in `services/
+  crew_service.py`, and it stays that way.** Found 2026-08-08 tracing
+  a test bug (see the dedicated log entry for that date). Operator
+  decision: Air Eagle doesn't need reactivation — a deactivated crew
+  member stays deactivated. Not building it. Still worth knowing as a
+  trap, though: `deactivate_crew()` is a real, dedicated, audited
+  soft-delete (`is_active = FALSE`), and `is_active` is deliberately
+  absent from `UPDATABLE_FIELDS`, so neither `add_crew()` nor the
+  generic `update_crew()` can set it — any future attempt to
+  reactivate via `update_crew(crew_id, {"is_active": True})` will
+  silently no-op (the field gets filtered out before the UPDATE is
+  built), not raise, not that anyone's meant to try. The only way to
+  flip `is_active` back to `TRUE` is a raw SQL statement outside the
+  service layer, which is correct given the decision above — no
+  service-layer path should exist for something that isn't supposed
+  to happen.
 - **`Duty.meal_provided` is now real data, not a permanent `None`
   (migrations/014, 2026-08-08) — see the dedicated log entry below.
   ASSUMPTION, needs airline validation:** the operator confirmed a meal
@@ -519,27 +536,21 @@ merge status, rather than repeating it here.
   be exactly the kind of code-level guess the `meal_provided` fix
   exists to eliminate. Needs its own explicit operator confirmation
   before ever being wired up the same way.
-- **`find_legal_candidates_for_duty()` does not check the age-pairing
-  rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02).** This function
-  powers the downstream-swap candidate suggestions shown when an
-  assignment breaks a future duty's legality — it currently only
-  checks FTL/rest and qualification legality for each candidate, not
-  whether swapping them in would create an illegal flight-deck age
-  pairing with whoever's already on the other seat of that future
-  duty. Suggesting a replacement who'd create an illegal pairing is a
-  real gap, deliberately not fixed as part of Step 7 (kept scoped to
-  the direct assignment gate itself) — worth a deliberate decision
-  later, not a silent oversight.
-- `query_parser.py`'s `parse()` never actually populates
-  `ReportRequest.status_filter`, even though "cancelled"/"delayed"/
-  "diverted" are scoring keywords for the `flight_records` template.
-  A question like "which flights were cancelled in June" correctly
-  routes to `flight_records` but currently returns ALL flights in
-  June, not just cancelled ones, because `request.status_filter` stays
-  `None`. `reports.flight_records()` already passes `request.status_filter`
-  through to `flight_service.get_all_flights()`, so this fixes itself
-  the moment the parser starts setting it — a small, separate parser
-  enhancement, not touched as part of the report functions themselves.
+- RESOLVED 2026-08-08: `find_legal_candidates_for_duty()` now checks
+  the age-pairing rule (`AE-CREW-PAIR-AGE-001`) per candidate — see the
+  dedicated log entry. **New, narrower limitation left in its place**:
+  when a candidate is excluded for their OWN age-pairing violation,
+  fine; but when a candidate stays included despite the *other* seat's
+  real occupant having a missing `date_of_birth`
+  (`AE-CREW-PAIR-AGE-001_DOB_MISSING`, deliberately not excluded — see
+  that entry for the full reasoning), `DownstreamConflict.candidates`
+  (a bare `List[str]`) has nowhere to surface that the uncertainty
+  belongs to someone else, not the suggested candidate. First thing to
+  fix if `DownstreamConflict` ever grows per-candidate detail.
+- RESOLVED 2026-08-08: `query_parser.py`'s `parse()` now populates
+  `ReportRequest.status_filter` via `parse_status()` — see the
+  dedicated log entry. "cancelled"/"delayed"/"diverted" resolve to
+  `flights.status`'s real CHECK-constraint values.
 - RESOLVED 2026-08-02: `roster_coverage`'s earlier "required-crew-
   count-per-role is unconfirmed" open question no longer applies —
   see the dedicated log entry below. Coverage is now CPT/FO only;
@@ -627,13 +638,20 @@ merge status, rather than repeating it here.
 - **Supabase stays on the free tier — deliberate, not an oversight,
   same trigger as auth above.** No automated backups, and the project
   pauses after 7 days of inactivity — both accepted as long as the
-  database holds nothing real. DATABASE_URL is saved locally
-  (2026-07-19) but migrations were not yet confirmed applied against
-  the real Supabase DB as of that check — re-verify before assuming
-  that's settled, since migrations have been added since. The GitHub-
-  integration collision risk (Supabase's native migration deploy
-  expects a `supabase/migrations/` folder this repo doesn't use) was
-  explained but not yet confirmed resolved one way or the other.
+  database holds nothing real. **CORRECTED 2026-08-08 — the migration-
+  status claim above was stale.** Migrations 000-007 were confirmed
+  applied to the real Supabase database on 2026-07-30, verified two
+  ways: `run_migrations.py --status` (`Applied: 8, Pending: 0` at that
+  time) and cross-checked directly against Supabase's own dashboard
+  (see the "DB changes" entry near the top of this file for the full
+  detail, including the Direct-vs-Session-Pooler connection detour that
+  made this possible). What's actually true now: migrations 008-015
+  (`type_rating`/`contract_expiry` drop through this piece's
+  `snack_provided` columns) have never been applied to Supabase —
+  eight migrations behind, not zero. The GitHub-integration collision
+  risk (Supabase's native migration deploy expects a
+  `supabase/migrations/` folder this repo doesn't use) was explained
+  but not yet confirmed resolved one way or the other.
   **Backup research findings, recorded now so they don't need
   rediscovering later**: Supabase's own docs recommend free-tier
   projects export via the `supabase db dump` CLI command and keep an
@@ -3775,3 +3793,170 @@ room_page.py` (the third trigger substitution).
 passed, 246 skipped, 403 total, zero import errors). Not yet
 re-verified against real Postgres. Acceptance criterion unchanged:
 403/403.
+
+## 2026-08-08 (continued): four Open Stubs decisions from the operator,
+## implemented as one piece — snack_provided, reactivate_crew (settled
+## NO), age-pairing in find_legal_candidates_for_duty(), status_filter
+
+Branch `open-stubs-cleanup-2026-08-08`, off `main` at the Phase 7
+merge point. Three of four items were explicitly straightforward, no
+plan needed; the age-pairing item was plan-moded first per the
+operator's own instruction, since it needed real design care (a pair
+rule being checked per-candidate, against a real-vs-hypothetical
+assignment) — reviewed and approved with one refinement recorded
+below.
+
+**1. `snack_provided` — operator-confirmed 2026-08-08: a snack is
+provided on every rotation, today.** Wired up as an exact mirror of
+`meal_provided` (migrations/014): migration 015 adds `snack_provided
+BOOLEAN NOT NULL DEFAULT TRUE` to `rotation_templates`,
+`rotation_instance_legs`, `flights`; `create_template()`/
+`create_new_version()` gain a required `snack_provided` keyword, same
+no-default footing as `meal_provided`; threaded through
+`expand_and_persist()`/`approve_instance()` and all three real `Duty`-
+construction sites in `services/assignment_service.py`, including
+`_load_duty_records_for_crew()` for the same historical-duty reason
+`meal_provided` needed it (an unfixed historical duty would keep
+producing stale D2.18 signal on every future check otherwise).
+Recorded as `**ASSUMPTION — requires airline validation**` (migration
+015's own header + this file's `Open stubs`), same as `meal_provided`.
+Every `create_template()`/`create_new_version()` test call site (8 in
+`tests/test_rotation_template_service.py`, 2 in `tests/test_roster_
+generator_service.py`) updated to pass it. New tests: `test_approve_
+instance_promotes_every_leg_to_a_real_flight` strengthened to confirm
+`meal_provided`/`snack_provided` both flow all the way from template
+to promoted flights; `test_snack_not_provided_produces_warning_but_
+still_allowed` fires the real `D2.18_D25_SNACK_REQUIRED` WARNING for a
+domestic duty over 4h (but under D25's 6h) with `snack_provided=False`
+on the flight, confirming it warns without blocking the write —
+D2.18/D25's asymmetry (meal missing/unknown behaves differently from
+snack missing/unknown) hadn't been exercised for real anywhere before.
+`test_warning_only_status_still_allowed_and_written`'s docstring
+updated — its own stale "snack_provided is never set" reasoning no
+longer applies now that migration 015 exists.
+
+**2. `reactivate_crew()` — operator decision: NOT needed.** Air Eagle
+doesn't need reactivation; a deactivated crew member stays deactivated.
+Documentation only, no code — the `Open stubs` entry (added while
+tracing a test bug in the previous piece) is updated from "worth a
+deliberate decision once operationally needed" to a settled RESOLVED
+entry recording the decision, while keeping the actual trap intact:
+`is_active` is absent from `crew_service.UPDATABLE_FIELDS`, so
+`update_crew(crew_id, {"is_active": True})` still silently no-ops —
+true and worth knowing regardless of the decision not to build
+reactivation, since it's not that no one is SUPPOSED to try, it's that
+the service layer correctly has no path for it now that the decision
+is settled.
+
+**3. Age-pairing in `find_legal_candidates_for_duty()` — plan-moded,
+approved with one refinement.** The gap: this function powers
+downstream-swap candidate suggestions but never checked whether a
+candidate would pair legally (`AE-CREW-PAIR-AGE-001`) with whoever
+really holds the other seat of the future duty being evaluated. Fixed
+by reusing `_check_crew_pairing_age()` wholesale — the exact call
+`_validate_new_duty()` already makes for a real assignment — once per
+candidate in the loop, rather than writing anything new: that function
+was already generic enough (a plain `crew_row` + `flight_ids`, no
+assumption that its own caller's assignment is real) that asking it
+about a hypothetical candidate is the same question it already answers
+for a real one. `reference_date` (the rotation's first operating date)
+hoisted above the candidate loop, same treatment `domestic`/
+`meal_provided`/`snack_provided`/`duty_date` already get there. The
+FTL-exempt branch (LM/ENGR) needed no change — `_check_crew_pairing_age()`
+already returns immediately for non-CPT/FO roles.
+
+Alerts fold into the same `ValidationResult` the candidate's FDP/rest/
+qualification check already produces, using the existing `!= ILLEGAL`
+inclusion threshold — no new return type, no separate flagging
+channel. `AE-CREW-PAIR-AGE-001_AGE_LIMIT` (ILLEGAL) excludes a
+candidate; the "pending" case (nobody real on the other seat yet)
+emits no alert at all, by design, exactly matching the real assignment
+gate's own false-alarm avoidance.
+
+**The missing-DOB case (`AE-CREW-PAIR-AGE-001_DOB_MISSING`,
+NEEDS_MANUAL_REVIEW) stays included, not excluded — approved, but with
+a more complete reason than originally proposed.** The plan's own
+argument was consistency with `_check_crew_qualifications()`'s
+identically-severed missing-expiry-field case, which is already
+included today under this function's existing threshold. **The
+reviewed, fuller version**: there's a real asymmetry the consistency
+argument alone understates. A missing qualification field is about the
+CANDIDATE themselves — a controller reviewing that suggestion
+encounters the problem directly, on the person being suggested. A
+missing DOB on the OTHER seat's real occupant is about someone the
+controller isn't even looking at — the suggestion just reads "swap in
+Waqar," with nothing signaling that the uncertainty actually concerns
+Saleem, who occupies the other seat. Including the candidate is still
+correct: `DownstreamConflict.candidates` is a bare `List[str]` with
+nowhere to carry that nuance, and excluding would silently drop a
+legitimate candidate over someone else's incomplete data. But this is
+recorded as a known LIMITATION of that return type, not a claim the
+two cases are equivalent — flagged in `Open stubs` below as one of the
+first things that should change if `DownstreamConflict` ever grows
+per-candidate detail.
+
+Tests (`tests/test_assignment_service.py`, alongside `find_legal_
+candidates_for_duty`'s existing block): domestic age-illegal pairing
+(both 65+) excludes the candidate, a young candidate stays included;
+the same for international (illegal if EITHER is 65+ — a young real
+partner does NOT save a 65+ candidate, unlike domestic); the other
+seat genuinely uncovered — a 65+ candidate stays included (pending
+stays silent); the other seat's real occupant has no recorded DOB — the
+candidate stays included (the documented limitation above, pinned as a
+permanent test, not just prose); and one end-to-end test through the
+real caller (`_check_downstream_impact()`), confirming
+`DownstreamConflict.candidates` itself excludes an age-illegal
+candidate, not just the function in isolation.
+
+**4. `query_parser.parse()` now populates `ReportRequest.status_filter`.**
+Previously never called from `parse()` at all, even though "cancelled"/
+"delayed"/"diverted" were already scoring keywords for the
+`flight_records` template — a question like "which flights were
+cancelled in June" correctly routed to `flight_records` but returned
+ALL flights in June, since `reports.flight_records()` already passed
+`request.status_filter` through and had nothing to pass. New
+`parse_status()` (mirrors `parse_role()`'s exact shape) maps to
+`flights.status`'s real CHECK-constraint values
+(`migrations/002_flights_table.sql`: PLANNED/OPERATED/CANCELLED/
+DISRUPTED) — "cancelled" -> `CANCELLED`; "delayed"/"diverted" -> `DISRUPTED`,
+since there's no separate DELAYED/DIVERTED status to map to, both mean
+"didn't go as planned but did fly." Reuses the same keyword vocabulary
+already scored in `TEMPLATES["flight_records"]`, not a second list to
+keep in sync. `services/assistant/reports.py`'s own module docstring
+(which documented this exact gap) updated to RESOLVED — that file
+needed no code change, `flight_records()` already had the pass-through
+in place. Tests (`tests/test_query_parser.py`): each mapped keyword
+(`cancelled`/`delayed`/`diverted`) resolves to its real status value;
+an unmentioned status leaves `status_filter` `None`; one end-to-end
+`parse()` test confirming the field actually reaches `ReportRequest`,
+not just the standalone `parse_status()` function.
+
+**Record correction: Supabase migration status.** The `Open stubs`
+entry claiming migrations "were not yet confirmed applied against the
+real Supabase DB" was stale — migrations 000-007 WERE confirmed
+applied on 2026-07-30 (`run_migrations.py --status`: `Applied: 8,
+Pending: 0` at that time, cross-checked against Supabase's own
+dashboard — already recorded accurately in this file's "DB changes"
+section, just not reflected in the `Open stubs` entry itself). What's
+actually true now: migrations 008-015 have never been applied to
+Supabase — eight migrations behind, not zero. Corrected in place; see
+that entry's own 2026-08-08 note.
+
+**Files**: `migrations/015_snack_provided_columns.sql` (new).
+`services/rotation_template_service.py`, `services/flight_service.py`,
+`services/assignment_service.py` (snack_provided threading + the
+age-pairing addition, same file, different functions).
+`services/assistant/query_parser.py`, `services/assistant/reports.py`
+(docstring only). `tests/test_rotation_template_service.py`, `tests/
+test_roster_generator_service.py`, `tests/test_assignment_service.py`,
+`tests/test_query_parser.py`.
+
+**Verification status**: full local suite collection clean — 415
+total, 163 passed, 252 skipped, zero import errors (the DB-dependent
+new tests skip locally, same sandbox limitation as every other
+DB-integration piece this session). `scripts/check_reachability.py`
+re-run: unchanged (still exactly `services/assistant/reports.py` and
+`services/roster_generator_service.py`, as expected — no new files in
+this piece). Not yet run against real Postgres — no `TEST_DATABASE_URL`
+here. See `Current active task` near the top of this file for merge
+status, not this line.
