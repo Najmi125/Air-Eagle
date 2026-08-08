@@ -305,18 +305,23 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **One outstanding branch as of this snapshot (2026-08-08):
-  `query-parser-refusal-and-date-fixes`** — operator scope decision
-  (the OCC assistant generates tables only, never a legality/decision
-  answer, superseding any earlier general-assistant framing) plus
-  real-Postgres-tested `query_parser.py` fixes: a decision-question
-  refusal layer (5 confirmed wrong-template cases), DD-MM-YYYY/DD/MM/YYYY
-  date ranges, bare "N days", plural role words, two wrong-semantics
-  date bugs ("since"/"before"), and a `utilization` keyword gap. See
-  the dedicated log entry below. 191 passed, 252 skipped locally, zero
-  import errors. Not yet run against real Postgres for THIS piece — no
-  `TEST_DATABASE_URL` in this sandbox. Do not merge until the user
-  verifies.
+- **No outstanding branches as of this snapshot (2026-08-08).
+  `query-parser-refusal-and-date-fixes` merged into `main`** —
+  operator scope decision (the OCC assistant generates tables only,
+  never a legality/decision answer, superseding any earlier
+  general-assistant framing) plus real-Postgres-tested
+  `query_parser.py` fixes: a decision-question refusal layer (5
+  confirmed wrong-template cases), DD-MM-YYYY/DD/MM/YYYY date ranges,
+  bare "N days", plural role words, two wrong-semantics date bugs
+  ("since"/"before"), and a `utilization` keyword gap. 443/443 verified
+  against real Postgres 16, zero failures — the user independently
+  confirmed all 5 refusal cases, both flagged word-boundary collisions,
+  and every date fix beyond the test suite. One non-blocking follow-up
+  the user found in that verification: "how close is Waqar to his 1000
+  hour limit" routes to `utilization` correctly but resolves with no
+  `window_days`, so the report has nothing to compute D9.2.3's rolling
+  365-day limit against — recorded in `Open stubs`, not fixed here. See
+  the dedicated log entry below for full detail.
 
 - **Merged into `main` before that**: `open-stubs-cleanup-2026-08-08`
   — four operator decisions from `Open stubs`, implemented as one piece: `snack_provided`
@@ -505,6 +510,18 @@ resuming towards merge. See `Current active task` above for actual
 merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
+- **`query_parser.py`: "how close is Waqar to his 1000 hour limit"
+  resolves to `utilization` correctly but with no `window_days`, so the
+  report has nothing to compute against — found 2026-08-08 by the user
+  in real-Postgres verification, not a blocker.** D9.2.3 is a rolling
+  365-day limit — the operator's own suggestion: default
+  `window_days=365` when the query mentions an hour limit but names no
+  period, since that's the only window the question can sensibly mean.
+  Not implemented yet; would need a keyword/pattern check in `parse()`
+  similar to how `template` is already threaded into `parse_dates()`
+  for the bare-"N days" direction fix (2026-08-08) — the same
+  "already-resolved template informs date parsing" mechanism would
+  apply here too.
 - `scripts/check_reachability.py`, re-run on the
   `roster-generator-phase7-final` branch (2026-08-04): now flags exactly
   two files, `services/assistant/reports.py` (unchanged — still no
@@ -4079,6 +4096,19 @@ instruction — 4 for plural roles, 1 for the hour-limit keyword).
 fix verified directly in the interpreter against both the reported-
 broken phrasing and the existing "must still work" phrasings before
 being written up as a test, same discipline as every prior piece this
-session. Not yet run against real Postgres for this piece specifically
-— no `TEST_DATABASE_URL` in this sandbox. See `Current active task`
-near the top of this file for merge status, not this line.
+session.
+
+**Confirmed 443/443 against real Postgres 16, zero failures.** The
+user independently re-tested beyond the suite: all 5 refusal cases;
+both flagged word-boundary collisions specifically ("which flights
+were cancelled in June" still routes to `flight_records`, "everything
+blocked this week" still routes to `audit_compliance`); every date
+fix (DD-MM-YYYY/DD/MM/YYYY ranges, bare "N days" forward window,
+plural role words, both since/before corrections). One follow-up
+found in that pass, not a blocker — see `Open stubs`: "how close is
+Waqar to his 1000 hour limit" resolves to `utilization` with no
+`window_days` set, so the report has no window to compute D9.2.3's
+rolling 365-day limit against.
+
+See `Current active task` near the top of this file for merge status,
+not this line.
