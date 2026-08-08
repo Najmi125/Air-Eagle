@@ -468,11 +468,14 @@ def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engi
     while each flight keeps its own domestic flag for Flight
     Log/reporting purposes.
 
-    This particular duty is 9.5h, which correctly triggers
-    NEEDS_MANUAL_REVIEW (D25 nutrition data missing) — nothing gets
-    written to roster for a held assignment, so the buffer
-    calculation itself is checked via computed_report_time/
-    computed_debrief_time, which are populated regardless of status."""
+    This particular duty is 9.5h — under D25's 6h threshold it would
+    have needed real meal data to avoid NEEDS_MANUAL_REVIEW; since
+    migrations/014 (2026-08-08), flights.meal_provided defaults TRUE,
+    so this is correctly ALLOWED and written. The buffer calculation
+    is the real point of this test, checked against the written roster
+    row directly rather than the held-assignment computed_* fields
+    (still populated regardless of status, but no longer the only
+    place these numbers are visible now that the write succeeds)."""
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
                       origin="KHI", destination="LHE", domestic=True)
@@ -483,12 +486,14 @@ def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engi
 
     result = assignment_service.assign_crew_to_duty(crew_id, [f1, f2, f3], "CPT")
 
-    assert result.status == "NEEDS_REVIEW"  # 9.5h FDP, no meal data — correctly held
+    assert result.status == "ALLOWED"
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 3  # one row per sector
     # report_time = first dep (05:00) - 60min (international buffer,
     # NOT domestic's 45min, since one sector is international)
-    assert result.computed_report_time == dt.datetime(2026, 7, 20, 4, 0)
+    assert set(roster_df["report_time"]) == {dt.datetime(2026, 7, 20, 4, 0)}
     # debrief_time = last arr (13:00) + 30min (international, not 15)
-    assert result.computed_debrief_time == dt.datetime(2026, 7, 20, 13, 30)
+    assert set(roster_df["debrief_time"]) == {dt.datetime(2026, 7, 20, 13, 30)}
 
     roster_df = assignment_service.get_roster_for_crew(crew_id)
     assert len(roster_df) == 0  # held, not written

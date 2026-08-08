@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
 import pytest
 from sqlalchemy import text
 
@@ -28,6 +29,7 @@ import services.assignment_service as assignment_service
 import services.crew_service as crew_service
 from services.assistant import reports as assistant_reports
 from services.assistant.query_parser import ReportRequest
+from core.duty_summary import group_roster_rows_into_duties
 
 DOMESTIC_LEGS = [
     {"leg_order": 1, "origin": "KHI", "destination": "LHE",
@@ -98,9 +100,19 @@ def _make_international_instances(date_from, date_to, rotation_code="EPE-802-805
     return created
 
 
-def _roster_row_count(engine):
-    with engine.connect() as conn:
-        return conn.execute(text("SELECT COUNT(*) FROM roster")).scalar()
+def _roster_duty_count(engine):
+    """Distinct DUTIES, not sector rows — 003_roster_table.sql's own
+    header, in capitals, warns exactly against this: roster stores ONE
+    ROW PER CREW PER FLIGHT SECTOR, so a raw SELECT COUNT(*) over-counts
+    by the leg count (a 2-leg rotation crewed by CPT+FO is 4 rows, 2
+    duties). core/duty_summary.py's group_roster_rows_into_duties() is
+    the canonical dedup — used here rather than a raw COUNT(*), which
+    is what keeps this helper honest about which unit it measures.
+    Renamed from _roster_row_count (2026-08-08): that name itself
+    invited the exact row-vs-duty mistake Section 9 calls the single
+    most repeated bug in this platform's history."""
+    df = pd.read_sql(text("SELECT * FROM roster"), engine)
+    return len(group_roster_rows_into_duties(df))
 
 
 # ------------------------------------------------------------------
@@ -266,7 +278,7 @@ def test_generate_for_window_is_idempotent_on_a_fully_generated_window(_patch_en
     second = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     assert second.filled == []
     assert len(second.already_covered) == 2
-    assert _roster_row_count(engine) == 2  # not duplicated
+    assert _roster_duty_count(engine) == 2  # not duplicated (2 duties: CPT's, FO's)
 
 
 def test_generate_for_window_only_fills_gaps_on_a_partially_generated_window(_patch_engine):
@@ -300,14 +312,23 @@ def test_generate_for_window_only_fills_gaps_on_a_partially_generated_window(_pa
 
 
 def test_uncovered_seat_is_retried_and_succeeds_once_the_blocker_is_removed(_patch_engine):
+    """A missing qualification field, not is_active=False: is_active
+    isn't in crew_service.UPDATABLE_FIELDS, so _add_crew(is_active=False)
+    would silently no-op (add_crew() filters crew_data to that
+    allowlist before inserting) and there's no reactivate_crew()
+    either — update_crew(..., {"is_active": True}) would silently
+    no-op the same way. license_expiry IS in UPDATABLE_FIELDS, giving
+    a real, achievable block-then-unblock via the actual service API:
+    missing it produces a genuine NEEDS_REVIEW (uncovered, not
+    filled), and update_crew() can genuinely fix it between runs."""
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
-    cpt_id = _add_crew("CPT", is_active=False)
+    cpt_id = _add_crew("CPT", license_expiry=None)
     _add_crew("FO")
 
     first = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
-    assert [s.role for s in first.uncovered] == ["CPT"]  # no active CPT candidate exists
+    assert [s.role for s in first.uncovered] == ["CPT"]  # missing license_expiry -> NEEDS_REVIEW
 
-    crew_service.update_crew(cpt_id, {"is_active": True})
+    crew_service.update_crew(cpt_id, {"license_expiry": dt.date(2099, 1, 1)})
 
     second = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     assert second.uncovered == []

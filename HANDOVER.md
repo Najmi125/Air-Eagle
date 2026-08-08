@@ -475,6 +475,18 @@ merge status, rather than repeating it here.
   reachability reasoning already noted above for `core/duty_summary.py`/
   `core/rotation_expansion.py` — its own importer doesn't need to be
   reachable-from-pages itself for it to count.
+- **No `reactivate_crew()` exists in `services/crew_service.py`
+  (found 2026-08-08, tracing a test bug — see the dedicated log entry
+  below).** `deactivate_crew()` is a real, dedicated, audited soft-delete
+  (`is_active = FALSE`); nothing symmetric exists to bring a crew
+  member back. `is_active` is also deliberately absent from
+  `UPDATABLE_FIELDS`, so neither `add_crew()` nor the generic
+  `update_crew()` can set it either — any future attempt to reactivate
+  via `update_crew(crew_id, {"is_active": True})` will silently no-op
+  (the field gets filtered out before the UPDATE is built), not raise.
+  Currently the only way to flip `is_active` back to `TRUE` is a raw
+  SQL statement outside the service layer. Worth a deliberate decision
+  once this is operationally needed, not a silent gap to rediscover.
 - **`Duty.meal_provided` is now real data, not a permanent `None`
   (migrations/014, 2026-08-08) — see the dedicated log entry below.
   ASSUMPTION, needs airline validation:** the operator confirmed a meal
@@ -3612,3 +3624,70 @@ assignment once made. True optimal bipartite matching / backtracking —
 this stays a greedy, single-pass loop with two targeted ordering fixes
 for the two identified failure modes, not a claim of finding the best
 possible crewing in every case.
+
+## 2026-08-08 (continued): second real-Postgres pass — the meal_provided
+## fix itself confirmed working, 3 test-side bugs found and fixed
+
+The user's second real-Postgres verification confirmed the fix itself
+works (`test_generate_for_window_fills_international_rotation_as_proposed`
+passes in isolation, D25 no longer blocks international rotations) —
+the remaining 5 failures were all test-side, not product bugs.
+
+**One obsolete test premise**: `test_assignment_service.py::
+test_mixed_domestic_international_duty_uses_international_buffer`
+asserted `NEEDS_REVIEW` with a comment citing "no meal data" — written
+during the mixed-domestic/international buffer work, predating this
+piece, so it wasn't caught by the earlier redesign pass (which only
+searched for tests exercising the `NEEDS_MANUAL_REVIEW` GATE itself,
+not every test that happened to assert that status as a side effect of
+the same now-fixed gap). Fixed: now asserts `ALLOWED`; the buffer
+assertions (report 04:00, debrief 13:30 — the actual point of the
+test) now check the written roster row directly instead of the
+held-assignment `computed_*` fields.
+
+**Sector rows vs. duties — Section 9's trap, caught by the user, not
+avoided**: `tests/test_roster_generator_service.py`'s
+`_roster_row_count()` helper did `SELECT COUNT(*) FROM roster` and
+tests asserted `== 2` for a fully-crewed 2-leg rotation — but
+`003_roster_table.sql`'s own header says, in capitals, this table
+stores ONE ROW PER CREW PER FLIGHT SECTOR, so a 2-leg rotation crewed
+by CPT+FO is genuinely 4 rows, 2 duties. The helper's own name invited
+the exact mistake it made. Fixed: renamed `_roster_duty_count()`,
+implemented via `core/duty_summary.py`'s `group_roster_rows_into_duties()`
+— the canonical dedup this whole platform already has for exactly this
+— rather than a raw `COUNT(*)`, which is what makes the helper honest
+about which unit it measures going forward.
+
+**A second, unrelated test-authoring bug, found while checking the
+user's "may resolve, may be separate" third failure**:
+`test_uncovered_seat_is_retried_and_succeeds_once_the_blocker_is_removed`
+used `_add_crew("CPT", is_active=False)` intending a genuinely
+inactive (zero-candidate) CPT pool, then `crew_service.update_crew(cpt_id,
+{"is_active": True})` intending to reactivate it. Neither actually
+works: `is_active` is not in `crew_service.UPDATABLE_FIELDS` (`crew_service.py`
+line ~30), so both `add_crew()` and `update_crew()` silently filter it
+out of the fields they actually write — the crew member was active the
+entire time, on both calls, which is exactly why the first run's
+"uncovered" list came back empty (`assert [] == ['CPT']`) instead of
+holding the CPT seat. **A related, real product gap surfaced by
+tracing this**: there is no `reactivate_crew()` anywhere in
+`crew_service.py` — `deactivate_crew()` exists (a real, dedicated,
+audited soft-delete), but nothing symmetric brings a crew member back.
+Not fixed here (out of scope for this piece — flagged in `Open stubs`
+below). Fixed the test itself by switching to a real, achievable
+block/unblock mechanism already established in this same piece's
+qualification-based test redesigns: `license_expiry=None` (missing
+data → genuine `NEEDS_MANUAL_REVIEW`, correctly `uncovered`) then
+`update_crew(cpt_id, {"license_expiry": ...})` (`license_expiry` IS in
+`UPDATABLE_FIELDS`) to genuinely clear it between runs.
+
+**Files**: `tests/test_assignment_service.py` (the obsolete-premise
+fix), `tests/test_roster_generator_service.py` (the counting-helper
+rename/reimplementation and the `is_active`/`license_expiry` test
+redesign).
+
+**Verification status**: full local suite collection clean (157
+passed, 246 skipped, 403 total, zero import errors) — same sandbox
+limitation as every DB-integration piece this session. Not yet
+re-verified against real Postgres. Acceptance criterion unchanged:
+403/403.
