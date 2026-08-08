@@ -17,6 +17,19 @@ rotations and a handful of trained users, that's a controlled
 vocabulary — not open-ended public input — so keyword and pattern
 matching handles it without a model.
 
+SCOPE, SETTLED (operator decision, 2026-08-08, supersedes any earlier
+framing of this as a general OCC assistant): this assistant generates
+tables only. It must never answer a legality or decision question —
+not "this template happens not to cover that yet," a hard boundary.
+Found by testing 16 realistic OCC shift questions against real
+Postgres: 9 reporting questions routed correctly, but 5 decision-shaped
+ones ("who can fly tonight's 786", "is Waqar legal for tomorrow")
+resolved CONFIDENTLY to the wrong template and returned a
+plausible-looking table that didn't answer them — worse than refusing,
+since a controller at 0300 getting a neat spreadsheet may not register
+that it answered a different question. `is_decision_question()` below
+enforces this: checked before ANY template scoring, unconditionally.
+
 What this buys, all of which matter for a safety-critical system
 under a regulator: zero API cost, zero latency, no crew PII ever
 leaving the operator's infrastructure, works with no network, fully
@@ -117,6 +130,10 @@ TEMPLATES: dict[str, dict] = {
             "hours": 3, "utilisation": 4, "utilization": 4, "cumulative": 4,
             "how many hours": 4, "total fdp": 4, "block time": 3,
             "flight hours": 4, "duty hours": 4, "1000": 3, "annual": 2,
+            # 2026-08-08: "how close is Waqar to his 1000 hour limit"
+            # resolved ambiguously — "hours" (plural) doesn't match
+            # this singular phrasing at all. "hour limit" closes it.
+            "hour limit": 3,
         },
         "negative": {"expire": 3, "ano": 3, "blocked": 2},
         "description": "Duty/flight hours per crew over a rolling window",
@@ -159,6 +176,52 @@ MIN_MARGIN = 2         # winner must beat runner-up by this much
 
 
 # ------------------------------------------------------------------
+# Decision-question refusal (2026-08-08, operator decision): this
+# assistant generates tables from records that already exist — it
+# must NEVER answer a legality or decision question. Real-Postgres
+# testing against 16 realistic OCC questions found 5 decision-shaped
+# ones (e.g. "who can fly tonight's 786", "is Waqar legal for
+# tomorrow") that resolved CONFIDENTLY to the wrong template and
+# returned a plausible-looking table that didn't answer them — worse
+# than refusing, since a controller at 0300 getting a neat spreadsheet
+# may not register that it answered a different question.
+#
+# Checked BEFORE score_templates() runs at all, unconditionally — a
+# question that's both decision-shaped AND references a D-section
+# (SECTION_RE's own regulation-lookup boost) must still refuse, not
+# let the section reference win.
+#
+# Each keyword is word-boundary-matched deliberately, not a plain
+# substring check like score_templates() uses: "can" as a bare
+# substring would also match inside "cancelled" (a real, legitimate
+# flight_records keyword — "which flights were cancelled in June"
+# must NOT be refused), and "legal" as a bare substring would match
+# inside "illegal" (audit_compliance's own real keyword). Confirmed
+# safe against every existing test phrasing in this file before
+# landing this list.
+DECISION_KEYWORDS = ("can", "could", "should", "legal", "replace", "swap")
+DECISION_PHRASES = ("what if",)
+
+DECISION_REDIRECT = (
+    "This assistant generates reports from records that already exist "
+    "— it doesn't answer legality or \"who can\" questions. For "
+    "\"can X fly\", \"is X legal\", or \"who can replace Y\", use the "
+    "Roster page — it runs the real legality check."
+)
+
+
+def is_decision_question(question: str) -> bool:
+    """True if the question is asking for a decision/legality
+    determination rather than a report. Public and independently
+    testable — parse() calls this first, before any template scoring,
+    matching the operator's "tables only, never a decision" scope."""
+    q = question.lower()
+    if any(re.search(rf"\b{re.escape(kw)}\b", q) for kw in DECISION_KEYWORDS):
+        return True
+    return any(phrase in q for phrase in DECISION_PHRASES)
+
+
+# ------------------------------------------------------------------
 # Date parsing
 # ------------------------------------------------------------------
 
@@ -171,12 +234,19 @@ def _month_bounds(year: int, month: int) -> tuple[dt.date, dt.date]:
     return dt.date(year, month, 1), dt.date(year, month, last)
 
 
-def parse_dates(question: str, today: dt.date) -> tuple[Optional[dt.date], Optional[dt.date], Optional[int]]:
+def parse_dates(
+    question: str, today: dt.date, template: Optional[str] = None,
+) -> tuple[Optional[dt.date], Optional[dt.date], Optional[int]]:
     """
     Returns (date_from, date_to, window_days). window_days is set for
     rolling-window phrasings ('last 28 days') because cumulative
     limits are defined as rolling windows, not calendar ranges — the
     distinction matters to D9.1.x/D9.2.x and must not be flattened.
+
+    template: the already-resolved template name (parse() knows this
+    before it calls parse_dates() — template scoring runs first), used
+    ONLY to decide which direction a bare "N days" (no next/last/past
+    qualifier) means — see that check below.
     """
     q = question.lower()
 
@@ -184,6 +254,18 @@ def parse_dates(question: str, today: dt.date) -> tuple[Optional[dt.date], Optio
     m = re.search(r"(\d{4}-\d{2}-\d{2})\s*(?:to|and|-|—|until|through)\s*(\d{4}-\d{2}-\d{2})", q)
     if m:
         return dt.date.fromisoformat(m.group(1)), dt.date.fromisoformat(m.group(2)), None
+
+    # DD-MM-YYYY / DD/MM/YYYY range: 01-07-2026 to 31-07-2026,
+    # 01/07/2026 - 31/07/2026 — the format the operator's own filename
+    # spec uses. Structurally distinct from the ISO regex above (4
+    # digits LAST here, not first), so there's no ambiguity between
+    # the two regardless of check order.
+    m = re.search(
+        r"(\d{2})[-/](\d{2})[-/](\d{4})\s*(?:to|and|-|—|until|through)\s*"
+        r"(\d{2})[-/](\d{2})[-/](\d{4})", q)
+    if m:
+        d1, mo1, y1, d2, mo2, y2 = m.groups()
+        return dt.date(int(y1), int(mo1), int(d1)), dt.date(int(y2), int(mo2), int(d2)), None
 
     # "1 to 31 July" / "1-31 July"
     m = re.search(r"(\d{1,2})\s*(?:to|-|—|until|through)\s*(\d{1,2})\s+([a-z]+)", q)
@@ -203,6 +285,44 @@ def parse_dates(question: str, today: dt.date) -> tuple[Optional[dt.date], Optio
     if m:
         n = int(m.group(1))
         return today, today + dt.timedelta(days=n), None
+
+    # Bare "N days" (no next/last/past qualifier) — "expiring 60 days"/
+    # "expiring in 60 days". Only reached if the two explicit-qualifier
+    # checks above didn't already match. Direction depends on the
+    # template: crew_qualifications' whole point is future document
+    # expiry, so bare N-days there means forward, exactly like an
+    # explicit "next N days". Every other template's dominant use of
+    # an N-day duration in this domain is a rolling LOOKBACK window —
+    # the same concept D9.1.x/D9.2.x's own cumulative checks already
+    # use — so bare N-days elsewhere means backward, exactly like
+    # "last N days".
+    m = re.search(r"(\d+)\s+days?", q)
+    if m:
+        n = int(m.group(1))
+        if template == "crew_qualifications":
+            return today, today + dt.timedelta(days=n), None
+        return today - dt.timedelta(days=n), today, n
+
+    # "since 1 july" — start date through today, NOT the whole month.
+    # Must be checked before the bare-month-name fallback below, which
+    # would otherwise match "july" alone and return the full 1-31
+    # range, silently ignoring both "since" and the day number.
+    m = re.search(r"since\s+(\d{1,2})\s+([a-z]+)", q)
+    if m and m.group(2) in MONTHS:
+        month = MONTHS[m.group(2)]
+        year = today.year if month <= today.month else today.year - 1
+        return dt.date(year, month, int(m.group(1))), today, None
+
+    # "before august" — everything up to the END of the month BEFORE
+    # the named one, not the named month itself. Same fallback-order
+    # reasoning as "since" above.
+    m = re.search(r"before\s+([a-z]+)", q)
+    if m and m.group(1) in MONTHS:
+        month = MONTHS[m.group(1)]
+        year = today.year if month <= today.month else today.year - 1
+        prior_month, prior_year = (12, year - 1) if month == 1 else (month - 1, year)
+        _, date_to = _month_bounds(prior_year, prior_month)
+        return None, date_to, None
 
     if "last month" in q:
         first_this = today.replace(day=1)
@@ -257,9 +377,15 @@ _STOPWORDS = {
 
 
 def parse_role(question: str) -> Optional[str]:
+    """2026-08-08 fix: "all captains" didn't set role — ROLE_KEYWORDS'
+    own \\b...\\b word-boundary match required the EXACT singular form,
+    so a trailing "s" (captains, loadmasters, engineers) broke the
+    boundary and matched nothing. `s?` fixes every keyword generically,
+    not just "captain" — the same gap existed for all of them, "all FO"
+    only worked because FO's own plural happens to look identical."""
     q = question.lower()
     for keyword, role in ROLE_KEYWORDS:
-        if re.search(rf"\b{re.escape(keyword)}\b", q):
+        if re.search(rf"\b{re.escape(keyword)}s?\b", q):
             return role
     return None
 
@@ -441,6 +567,14 @@ def parse(
     if not text:
         return ReportRequest(resolved=False, reason="empty question")
 
+    # Decision-question refusal (2026-08-08) — checked before ANY
+    # resolution logic, including template scoring, so a decision-
+    # shaped question that also happens to reference a D-section
+    # (SECTION_RE's own regulation boost) still refuses rather than
+    # winning on that boost.
+    if is_decision_question(text):
+        return ReportRequest(resolved=False, reason=DECISION_REDIRECT, unmatched_text=text)
+
     scores = score_templates(text)
 
     # Parameter-informed tie-breaking. The parameters a question
@@ -481,7 +615,7 @@ def parse(
             unmatched_text=text,
         )
 
-    date_from, date_to, window_days = parse_dates(text, today)
+    date_from, date_to, window_days = parse_dates(text, today, template=best_name)
     crew_ids, ambiguous_crew = parse_crew(text, crew_directory)
     origin, destination = parse_route(text, known_airports)
 
