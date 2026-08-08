@@ -488,15 +488,13 @@ def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engi
 
     assert result.status == "ALLOWED"
     roster_df = assignment_service.get_roster_for_crew(crew_id)
-    assert len(roster_df) == 3  # one row per sector
+    assert len(roster_df) == 3  # one row per sector (003_roster_table.sql)
+    assert roster_df["duty_id"].nunique() == 1  # all 3 sector rows are ONE duty
     # report_time = first dep (05:00) - 60min (international buffer,
     # NOT domestic's 45min, since one sector is international)
     assert set(roster_df["report_time"]) == {dt.datetime(2026, 7, 20, 4, 0)}
     # debrief_time = last arr (13:00) + 30min (international, not 15)
     assert set(roster_df["debrief_time"]) == {dt.datetime(2026, 7, 20, 13, 30)}
-
-    roster_df = assignment_service.get_roster_for_crew(crew_id)
-    assert len(roster_df) == 0  # held, not written
 
 
 def test_all_domestic_duty_still_uses_domestic_buffer(_patch_engine):

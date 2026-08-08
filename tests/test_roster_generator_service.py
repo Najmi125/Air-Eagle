@@ -351,7 +351,10 @@ def test_publish_window_flips_only_proposed_rows_in_range(_patch_engine):
     rgs.generate_for_window(dt.date(2026, 9, 1), dt.date(2026, 9, 1))
 
     published = rgs.publish_window(dt.date(2026, 8, 1), dt.date(2026, 8, 31))
-    assert published == 2
+    # publish_window() returns a raw UPDATE rowcount (sector rows, per
+    # its own docstring), not a duty count — 2 legs x 2 crew (CPT+FO)
+    # in the August rotation = 4 rows flipped, not 2 duties.
+    assert published == 4
 
     aug_roster = assignment_service.search_roster(
         date_from=dt.date(2026, 8, 3), date_to=dt.date(2026, 8, 3), include_proposed=True)

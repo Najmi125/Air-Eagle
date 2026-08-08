@@ -130,8 +130,22 @@ def test_needs_review_adhoc_assignment_shows_warning_not_success(page_app):
     the 'else' (ALLOWED) branch, which references flight_ids[0] —
     but flight_ids is genuinely empty for a held assignment, so this
     would have raised an IndexError, not just shown a misleading
-    success message."""
-    _seed_crew()
+    success message.
+
+    Trigger: a missing qualification-expiry field
+    (AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING), not a >6h duty —
+    previously used a 7h FDP duty to trigger D25 nutrition-data-
+    missing instead, which migrations/014 (2026-08-08) fixed by
+    giving every flight a real meal_provided, making that trigger
+    structurally unreachable. Same substitution as
+    tests/test_assignment_service.py's own NEEDS_MANUAL_REVIEW-gate
+    tests. Local to this one test — _seed_crew()'s other 3 callers
+    still get fully-qualified crew, since this file deliberately
+    avoids exercising the qualification gate elsewhere (it has its
+    own dedicated tests in test_assignment_service.py)."""
+    from services import crew_service
+    crew_id = _seed_crew()
+    crew_service.update_crew(crew_id, {"license_expiry": None})
 
     at = page_app.run()
     at.text_input[0].input("KHI")
@@ -139,7 +153,7 @@ def test_needs_review_adhoc_assignment_shows_warning_not_success(page_app):
     at.date_input[0].set_value(dt.date(2026, 7, 20))
     at.time_input[0].set_value(dt.time(5, 0))
     at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(11, 0))   # 7h FDP -> D25 nutrition data missing
+    at.time_input[1].set_value(dt.time(7, 0))
     at.button[0].click()
     at = at.run()
 

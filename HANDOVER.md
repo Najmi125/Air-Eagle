@@ -3691,3 +3691,75 @@ passed, 246 skipped, 403 total, zero import errors) — same sandbox
 limitation as every DB-integration piece this session. Not yet
 re-verified against real Postgres. Acceptance criterion unchanged:
 403/403.
+
+## 2026-08-08 (continued): third real-Postgres pass — same two patterns,
+## caught in spots the second pass missed
+
+The second pass's fixes were correct as far as they went, but two of
+the three real-Postgres findings this round are the SAME two patterns
+recurring in spots not covered the first time — not new bugs, missed
+instances. The third is a genuinely new instance of the D25-premise
+pattern.
+
+**1. A leftover duplicate assertion, not a new bug**: `test_
+mixed_domestic_international_duty_uses_international_buffer`'s edit
+(previous pass) correctly added the `ALLOWED`/written-row assertions
+but didn't remove the OLD `assert len(roster_df) == 0  # held, not
+written` block that used to follow it — a stale duplicate from before
+the edit, not caught because the file still collected and the earlier
+assertions passed before reaching the dead one. Removed; also
+strengthened per the user's own suggestion: `roster_df["duty_id"].
+nunique() == 1` now confirms the 3 sector rows are genuinely one duty,
+not just "3 rows of some kind."
+
+**2. The row-vs-duty pattern, same root cause as `_roster_row_count()`,
+different call site**: `test_publish_window_flips_only_proposed_rows_
+in_range` asserted `publish_window()`'s return value `== 2`, but that
+return value is a raw `UPDATE ... rowcount` — sector rows, not duties,
+by design (`publish_window()`'s own docstring already says "returns
+the number of rows flipped"; this was never meant to be duty-counted).
+2 legs x 2 crew (CPT+FO) in the August rotation is genuinely 4 rows.
+Fixed the assertion, not the function — `published_count` staying
+row-based is correct given what a bulk `UPDATE`'s `rowcount` actually
+measures; a duty-level version would need a separate `SELECT` and
+isn't what this function is for. A full sweep of `tests/*.py` for any
+other `len()`/`COUNT(*)` over roster rows found nothing else
+miscounting — the remaining ones either measure single-sector duties
+(where sector-count and duty-count coincide, so the distinction
+doesn't matter) or are deliberately raw-row schema tests
+(`test_schema.py`'s partial-unique-index regression tests, which are
+correctly testing "N rows exist," not "N duties exist").
+
+**3. A third, genuinely new D25-premise test, found by the same sweep
+the user asked for**: `tests/test_control_room_page.py::
+test_needs_review_adhoc_assignment_shows_warning_not_success` drove
+the Control Room form with a 7h FDP duty specifically to trigger D25
+nutrition-data-missing, asserting the page shows "HELD FOR MANUAL
+REVIEW" without crashing on `flight_ids[0]` against an empty list
+(the actual regression this test guards). Missed in the first redesign
+pass because that pass only searched `test_assignment_service.py`.
+Same substitution as that file's own tests: the crew member gets
+`license_expiry=None` via `crew_service.update_crew()` after
+`_seed_crew()` (not a change to `_seed_crew()` itself, which 3 other
+tests in this file rely on staying fully-qualified) —
+`AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING` now provides the trigger
+instead. A repo-wide grep for `NEEDS_REVIEW`/`NEEDS_MANUAL_REVIEW`/
+`D25`/`nutrition`/`meal_provided` across every test and page file
+found no further instances: `test_alert_summary.py`'s `D25_
+NUTRITION_DATA_MISSING` references construct `RuleAlert` objects by
+hand to test the summarization/bucketing logic itself, independent of
+whether D25 can fire through the real pipeline — not affected by this
+fix at all. `test_schema.py`'s `NEEDS_REVIEW` references test the
+`roster.status` CHECK constraint's own vocabulary, not D25.
+`pages/*.py`'s references are generic `result.status` branch
+rendering, not D25-specific.
+
+**Files**: `tests/test_assignment_service.py` (leftover-assertion
+removal + duty_id strengthening), `tests/test_roster_generator_
+service.py` (the `publish_window()` count fix), `tests/test_control_
+room_page.py` (the third trigger substitution).
+
+**Verification status**: full local suite collection clean (157
+passed, 246 skipped, 403 total, zero import errors). Not yet
+re-verified against real Postgres. Acceptance criterion unchanged:
+403/403.
