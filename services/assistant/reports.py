@@ -282,7 +282,17 @@ def roster_coverage(request: query_parser.ReportRequest) -> Dataset:
     rows = []
     any_uncovered = False
     for _, flight in flights.iterrows():
-        roster = assignment_service.get_roster_for_flight(flight["flight_id"])
+        # include_proposed=True (2026-08-04): a seat the roster
+        # generator has proposed but OCC hasn't published yet is a
+        # real candidate for that seat, not an empty one — showing it
+        # as UNCOVERED here would be false, since "does this rotation
+        # have a candidate" is exactly what this report answers for a
+        # reviewing controller. Unlike get_roster_for_crew()/
+        # get_roster_for_flight()'s own default (PROPOSED hidden,
+        # "crew sees only published"), this is the one deliberate
+        # exception.
+        roster = assignment_service.get_roster_for_flight(
+            flight["flight_id"], include_proposed=True)
 
         cpt_ids = sorted(roster.loc[roster["role_assigned"] == "CPT", "crew_id"].tolist())
         fo_ids = sorted(roster.loc[roster["role_assigned"] == "FO", "crew_id"].tolist())

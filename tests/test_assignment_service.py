@@ -192,15 +192,15 @@ def _seed_heavy_history_and_assign_far_future(engine, crew_id):
 def test_age_on_boundary_turning_65_today_counts_as_65():
     """Exactly 65 does not count as below 65 either way (settled
     wording) — turning 65 ON the reference date already counts."""
-    assert assignment_service._age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 2)) == 65
+    assert assignment_service.age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 2)) == 65
 
 
 def test_age_on_day_before_65th_birthday_is_still_64():
-    assert assignment_service._age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 1)) == 64
+    assert assignment_service.age_on(dt.date(1961, 8, 2), dt.date(2026, 8, 1)) == 64
 
 
 def test_age_on_day_after_reference_before_birthday_is_64():
-    assert assignment_service._age_on(dt.date(1961, 8, 3), dt.date(2026, 8, 2)) == 64
+    assert assignment_service.age_on(dt.date(1961, 8, 3), dt.date(2026, 8, 2)) == 64
 
 
 @pytest.mark.parametrize("age_a, age_b, domestic, expected_illegal", [
@@ -468,11 +468,14 @@ def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engi
     while each flight keeps its own domestic flag for Flight
     Log/reporting purposes.
 
-    This particular duty is 9.5h, which correctly triggers
-    NEEDS_MANUAL_REVIEW (D25 nutrition data missing) — nothing gets
-    written to roster for a held assignment, so the buffer
-    calculation itself is checked via computed_report_time/
-    computed_debrief_time, which are populated regardless of status."""
+    This particular duty is 9.5h — under D25's 6h threshold it would
+    have needed real meal data to avoid NEEDS_MANUAL_REVIEW; since
+    migrations/014 (2026-08-08), flights.meal_provided defaults TRUE,
+    so this is correctly ALLOWED and written. The buffer calculation
+    is the real point of this test, checked against the written roster
+    row directly rather than the held-assignment computed_* fields
+    (still populated regardless of status, but no longer the only
+    place these numbers are visible now that the write succeeds)."""
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 7, 0),
                       origin="KHI", destination="LHE", domestic=True)
@@ -483,15 +486,15 @@ def test_mixed_domestic_international_duty_uses_international_buffer(_patch_engi
 
     result = assignment_service.assign_crew_to_duty(crew_id, [f1, f2, f3], "CPT")
 
-    assert result.status == "NEEDS_REVIEW"  # 9.5h FDP, no meal data — correctly held
+    assert result.status == "ALLOWED"
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 3  # one row per sector (003_roster_table.sql)
+    assert roster_df["duty_id"].nunique() == 1  # all 3 sector rows are ONE duty
     # report_time = first dep (05:00) - 60min (international buffer,
     # NOT domestic's 45min, since one sector is international)
-    assert result.computed_report_time == dt.datetime(2026, 7, 20, 4, 0)
+    assert set(roster_df["report_time"]) == {dt.datetime(2026, 7, 20, 4, 0)}
     # debrief_time = last arr (13:00) + 30min (international, not 15)
-    assert result.computed_debrief_time == dt.datetime(2026, 7, 20, 13, 30)
-
-    roster_df = assignment_service.get_roster_for_crew(crew_id)
-    assert len(roster_df) == 0  # held, not written
+    assert set(roster_df["debrief_time"]) == {dt.datetime(2026, 7, 20, 13, 30)}
 
 
 def test_all_domestic_duty_still_uses_domestic_buffer(_patch_engine):
@@ -608,22 +611,30 @@ def test_role_mismatch_via_control_room_path_also_rejected(_patch_engine):
 # previously fell through to the same write path as LEGAL/WARNING
 # and was silently treated as ALLOWED, directly contradicting its
 # own defined meaning ("cannot be determined deterministically,
-# requires authorized review"). A 7h+ FDP duty reliably produces this
-# status via D25 (meal/snack provision data is never populated by
-# this codebase), which is what these tests use to exercise it with
-# a real rule firing, not a synthetic/mocked one.
+# requires authorized review"). These tests exercise it with a real
+# rule firing, not a synthetic/mocked one — a crew member missing a
+# qualification-expiry field (AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING,
+# _check_crew_qualifications()), not a duty's own duration.
+#
+# Previously used a >6h FDP duty to trigger D25 nutrition-data-missing
+# instead (migrations/014 fixed meal_provided 2026-08-08 was the reason
+# that ever fired at all — see that migration's own header) — switched
+# to a missing-qualification trigger because D25 is now structurally
+# unreachable through the real API (every flight has a real
+# meal_provided). Arguably a better trigger than before: it no longer
+# accidentally depends on the very data gap that migration fixed.
 # ------------------------------------------------------------------
 
 def test_needs_manual_review_does_not_write_and_returns_needs_review_status(_patch_engine):
-    crew_id = _add_crew("CPT")
-    # 7h FDP, no prior history, no other violation — the ONLY thing
-    # flagged should be D25 nutrition-data-missing.
+    # Missing license_expiry, no other violation — the ONLY thing
+    # flagged should be the qualification-data-missing gate.
+    crew_id = _add_crew("CPT", license_expiry=None)
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))
     result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
 
     assert result.status == "NEEDS_REVIEW"
     assert result.legality_status == "NEEDS_MANUAL_REVIEW"
-    assert any(a.rule_code == "D25_NUTRITION_DATA_MISSING" for a in result.alerts)
+    assert any(a.rule_code == "AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING" for a in result.alerts)
     assert result.roster_ids == []
 
     roster_df = assignment_service.get_roster_for_crew(crew_id)
@@ -633,7 +644,7 @@ def test_needs_manual_review_does_not_write_and_returns_needs_review_status(_pat
 def test_needs_manual_review_still_reports_computed_duty_times(_patch_engine):
     """A human reviewing a held assignment needs to see what WAS
     computed, even though nothing was saved."""
-    crew_id = _add_crew("CPT")
+    crew_id = _add_crew("CPT", license_expiry=None)
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))
     result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
 
@@ -644,7 +655,7 @@ def test_needs_manual_review_still_reports_computed_duty_times(_patch_engine):
 
 
 def test_needs_manual_review_writes_audit_record_with_held_action_type(_patch_engine):
-    crew_id = _add_crew("CPT")
+    crew_id = _add_crew("CPT", license_expiry=None)
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))
     assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT", app_user="tester")
 
@@ -662,7 +673,7 @@ def test_needs_manual_review_via_control_room_saves_neither_flight_nor_assignmen
     """Same fix, Control Room path — consistent with the existing
     'no orphan flight' guarantee for ILLEGAL, now extended to
     NEEDS_MANUAL_REVIEW too."""
-    crew_id = _add_crew("CPT")
+    crew_id = _add_crew("CPT", license_expiry=None)
     flights_data = [_flight_data(dt.datetime(2026, 7, 20, 5, 0), dt.datetime(2026, 7, 20, 11, 0))]
 
     result, flight_ids = assignment_service.assign_crew_to_new_flights(crew_id, flights_data, "CPT")
@@ -681,11 +692,13 @@ def test_warning_only_status_still_allowed_and_written(_patch_engine):
     uncertainty gets held, not a legal-but-flagged duty. A duty just
     over 4h but at or under 6h gets the snack-required WARNING
     (D2.18_D25_SNACK_REQUIRED needs snack_provided is False
-    specifically, which never fires here since it's never set to
-    False — only None) — so this test instead confirms a duty with
-    NO alerts at all (comfortably under every threshold) writes
-    normally, as the plainest possible regression guard that the new
-    branch didn't accidentally start blocking LEGAL too."""
+    specifically — snack_provided is deliberately still never set by
+    this codebase post-migrations/014, see that migration's own header
+    and HANDOVER.md's open-stubs entry for why, so this never fires
+    here either) — so this test instead confirms a duty with NO alerts
+    at all (comfortably under every threshold) writes normally, as the
+    plainest possible regression guard that the new branch didn't
+    accidentally start blocking LEGAL too."""
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
     result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
@@ -732,12 +745,13 @@ def test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged(_patch_en
     debriefs only 10h before the future duty's report time must flag
     a downstream conflict on that future duty.
 
-    Deliberately kept under 6h FDP (5h, not the original 8h) so this
-    stays LEGAL/ALLOWED on its own — an 8h+ duty now correctly
-    triggers NEEDS_MANUAL_REVIEW (no meal/snack data), which is a
-    separate, already-tested gate. The 12h rest floor applies
-    regardless of duty length, so this still tests the same
-    downstream-conflict mechanism with the same numbers.
+    Kept at 5h FDP (not 8h) so this stays LEGAL/ALLOWED on its own —
+    historically to dodge D25's meal-data-missing NEEDS_MANUAL_REVIEW
+    (fixed by migrations/014, 2026-08-08; every flight now has a real
+    meal_provided), kept as-is post-fix since there's no reason to
+    change working numbers and the 12h rest floor applies regardless
+    of duty length anyway, so this still tests the same downstream-
+    conflict mechanism with the same numbers.
     """
     crew_id = _add_crew("CPT")
 
@@ -1402,8 +1416,8 @@ def test_cancelled_flight_duty_excluded_from_legality_history(_patch_engine):
 
 
 def test_delay_recompute_updates_debrief_and_fdp_report_stays_fixed(_patch_engine):
-    """Small delay, stays well under D25's 6h nutrition-review
-    threshold — proves the mechanical recompute itself (report_time
+    """Small delay, stays well under every review-gate threshold (D16.2.2's
+    10h included) — proves the mechanical recompute itself (report_time
     fixed, debrief_time/fdp_hours updated) without the review-gate
     noise, matching core/duty_builder.py's own documented
     report-time-never-shifts principle."""
@@ -1423,28 +1437,44 @@ def test_delay_recompute_updates_debrief_and_fdp_report_stays_fixed(_patch_engin
 
 
 def test_delay_recompute_flags_needs_review_when_no_longer_legal(_patch_engine):
-    """A delay that pushes FDP to 8h triggers D25 nutrition-data-
-    missing (the same latent gap exercised throughout this file via
-    an 8h duty specifically — deliberately NOT a bigger delay, which
-    would also trip D8.2.1's ~13h max-FDP-for-one-sector limit and
-    turn this into an ILLEGAL case instead of the NEEDS_MANUAL_REVIEW
-    case this test is about) — confirms the roster row itself gets
-    flagged NEEDS_REVIEW, not just an audit-log alert, per the
-    explicit 'flag the row, don't just log it' decision."""
+    """A delay that pushes FDP to 10.5h, with the duty's interval now
+    overlapping local 02:00-04:59, triggers
+    D16.2.2_NIGHT_DUTY_OVER_10H_FRM_REQUIRED (has_approved_frm defaults
+    False, ANO012CoreValidator() never overrides it) — confirms the
+    roster row itself gets flagged NEEDS_REVIEW, not just an audit-log
+    alert, per the explicit 'flag the row, don't just log it' decision.
+
+    Previously used an 8h delay to trigger D25 nutrition-data-missing
+    instead — switched (migrations/014, 2026-08-08) since D25 is now
+    structurally unreachable (every flight has a real meal_provided).
+    D25's trigger was duration-only and easy to hit; this one needs
+    BOTH duration (>10h) and a specific local-time window, verified by
+    direct interpreter execution against the real validator before
+    being locked in here (see this piece's own planning notes) —
+    report 19:00 UTC (2026-07-20) is local 00:00 (UTC+5) on 2026-07-21,
+    comfortably before the delay grows the duty span into 02:00-04:59;
+    a short initial arrival keeps the FIRST assignment legal and
+    outside that window entirely. Deliberately targets ~10.5h (not
+    closer to D8.2.1's 11h ceiling for this same overnight band's
+    1-sector duty), so this stays NEEDS_MANUAL_REVIEW, not ILLEGAL —
+    the same 'don't also trip a bigger rule' constraint the original
+    test already needed."""
     crew_id = _add_crew("CPT")
-    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 19, 45), dt.datetime(2026, 7, 20, 20, 0))
     result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
     assert result.status == "ALLOWED"
 
     outcomes = assignment_service.update_flight_actual_times_and_revalidate(
-        flight_id, arr_time_actual=dt.datetime(2026, 7, 20, 12, 45))
+        flight_id, arr_time_actual=dt.datetime(2026, 7, 21, 5, 15))
 
     assert len(outcomes) == 1
     assert outcomes[0]["validation_result"].status == "NEEDS_MANUAL_REVIEW"
+    assert any(a.rule_code == "D16.2.2_NIGHT_DUTY_OVER_10H_FRM_REQUIRED"
+               for a in outcomes[0]["validation_result"].alerts)
 
     roster_df = assignment_service.get_roster_for_crew(crew_id)
     assert roster_df.iloc[0]["status"] == "NEEDS_REVIEW"
-    assert roster_df.iloc[0]["fdp_hours"] == pytest.approx(8.0)
+    assert roster_df.iloc[0]["fdp_hours"] == pytest.approx(10.5)
 
     audit = _audit_rows(_patch_engine, "DUTY_FLAGGED_FOR_REVIEW_AFTER_DELAY")
     assert len(audit) == 1

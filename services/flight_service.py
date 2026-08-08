@@ -37,6 +37,13 @@ UPDATABLE_FIELDS = {
     # approve_instance(), migrations/011/012) — NULL for every Control
     # Room ad-hoc flight, set only at promotion time.
     "rotation_instance_id",
+    # NOT in REQUIRED_FIELDS, deliberately (migrations/014, 2026-08-08):
+    # an ad-hoc Control Room caller that omits it falls back to this
+    # column's own DEFAULT TRUE (operator-confirmed universal fact
+    # today), rather than forcing every ad-hoc caller to know about it.
+    # rotation-sourced flights always pass it explicitly (approve_
+    # instance()) from the template's own stored value.
+    "meal_provided",
 }
 
 

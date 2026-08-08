@@ -305,8 +305,21 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Merged into `main` — no outstanding branches as of this snapshot
-  (2026-08-04).** Most recent: `rotation-instance-approval-workflow` —
+- **One outstanding branch as of this snapshot (2026-08-08):
+  `roster-generator-phase7-final` — the roster generator, Phase 7's
+  last piece (fills CPT/FO seats on approved rotations via the real
+  `assign_crew_to_duty()` gate, writes `PROPOSED` roster rows pending
+  OCC publish). First real-Postgres verification (2026-08-08) found
+  5 failing tests, all tracing to one cause — `meal_provided` was
+  never populated anywhere in the pipeline, so every international
+  rotation (FDP > 6h) permanently hit D25's `NEEDS_MANUAL_REVIEW`
+  gate. Fixed on the same branch (migrations/014 + threading through
+  `services/rotation_template_service.py`/`services/assignment_service.py`
+  — see the dedicated log entry below). NOT yet re-verified against
+  real Postgres. Do not merge until the user verifies 403/403.**
+
+- **Merged into `main`** as of the point this branch was cut. Most
+  recent: `rotation-instance-approval-workflow` —
   DRAFT -> APPROVED promotion, the piece that makes a template actually
   produce operational flights (see the dedicated log entry below).
   382/382 verified against real Postgres 16, including a real fix found
@@ -450,18 +463,50 @@ resuming towards merge. See `Current active task` above for actual
 merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
-- `scripts/check_reachability.py` currently flags two files:
-  `services/assistant/reports.py` (as of the `assistant-report-
-  functions` branch, 2026-08-01 — nothing calls `run_report()` yet,
-  there's no assistant UI page) and `services/rotation_template_service.py`
-  (as of `rotation-templates-phase7-groundwork`, 2026-08-04 — nothing
-  calls it either, there's no template-management UI, and the generator
-  that will eventually be its real caller isn't built). Both correctly
-  so — built ahead of being wired into a page, same reason in both
-  cases. `core/duty_summary.py` and `core/rotation_expansion.py` are
-  NOT flagged: `reports.py`'s `utilization()` and
-  `rotation_template_service.py`'s `expand_and_persist()` are each
-  other's first real caller.
+- `scripts/check_reachability.py`, re-run on the
+  `roster-generator-phase7-final` branch (2026-08-04): now flags exactly
+  two files, `services/assistant/reports.py` (unchanged — still no
+  assistant UI page) and `services/roster_generator_service.py` (no
+  Phase 7 piece has UI yet, so nothing under `pages/` calls the
+  generator). `services/rotation_template_service.py` is NO LONGER
+  flagged, as expected — `services/roster_generator_service.py` is now
+  its first real caller (`get_instances()`/`get_promoted_flight_ids()`).
+  `core/roster_generation.py` was never flagged either, same one-hop
+  reachability reasoning already noted above for `core/duty_summary.py`/
+  `core/rotation_expansion.py` — its own importer doesn't need to be
+  reachable-from-pages itself for it to count.
+- **No `reactivate_crew()` exists in `services/crew_service.py`
+  (found 2026-08-08, tracing a test bug — see the dedicated log entry
+  below).** `deactivate_crew()` is a real, dedicated, audited soft-delete
+  (`is_active = FALSE`); nothing symmetric exists to bring a crew
+  member back. `is_active` is also deliberately absent from
+  `UPDATABLE_FIELDS`, so neither `add_crew()` nor the generic
+  `update_crew()` can set it either — any future attempt to reactivate
+  via `update_crew(crew_id, {"is_active": True})` will silently no-op
+  (the field gets filtered out before the UPDATE is built), not raise.
+  Currently the only way to flip `is_active` back to `TRUE` is a raw
+  SQL statement outside the service layer. Worth a deliberate decision
+  once this is operationally needed, not a silent gap to rediscover.
+- **`Duty.meal_provided` is now real data, not a permanent `None`
+  (migrations/014, 2026-08-08) — see the dedicated log entry below.
+  ASSUMPTION, needs airline validation:** the operator confirmed a meal
+  is provided on every rotation today; `rotation_templates.meal_provided`
+  defaults `TRUE` and is threaded through expansion/approval/ad-hoc
+  Control Room flights into every `Duty`-construction site
+  `services/assignment_service.py` has. If this operational fact ever
+  stops being universally true, it's now a real per-template value to
+  change (`create_new_version(..., meal_provided=False)`), not a
+  hardcoded assumption to hunt down.
+- **`snack_provided` deliberately still stays unset — not an accident,
+  a decision (2026-08-08).** `D2.18_D25_SNACK_REQUIRED` only alerts
+  when `snack_provided is False`; `None` produces no alert, which
+  happens to be harmless today but isn't *correct* the way
+  `meal_provided`'s fix now is. Not wired up because the operator's
+  confirmation was specifically about meals, not snacks — a materially
+  different D2.18/D25 category — and inferring one from the other would
+  be exactly the kind of code-level guess the `meal_provided` fix
+  exists to eliminate. Needs its own explicit operator confirmation
+  before ever being wired up the same way.
 - **`find_legal_candidates_for_duty()` does not check the age-pairing
   rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02).** This function
   powers the downstream-swap candidate suggestions shown when an
@@ -3214,3 +3259,507 @@ against real Postgres 16 — migration 012 applies cleanly, the
 the end-to-end grounding test now passes, confirming a template-sourced
 flight is genuinely indistinguishable from a manually-entered one to
 `assign_crew_to_duty()`.
+
+## 2026-08-04 (continued): the roster generator — Phase 7's final piece
+
+Plan proposed first (seven explicit design questions — input source,
+fairness-counting scope, ordering strategy, the age-pairing order-
+dependence risk, output mechanism given draft -> review -> publish,
+partial-failure behavior, idempotency), reviewed twice by the user.
+First round: the plan's Q4 international analysis was confirmed
+correct, but its domestic premise ("a 65+ pilot in the first-filled
+domestic seat is never a problem") was proven wrong empirically against
+the real gate — see below. Branch `roster-generator-phase7-final`, off
+`main` at the `rotation-instance-approval-workflow` merge point.
+
+**The mechanism, settled and unchanged from the plan**: the generator
+never re-expresses an FTL or pairing rule — every legality decision
+goes through `assign_crew_to_duty()`, every single time. It only
+decides candidate ORDER (`core/roster_generation.py`'s
+`order_candidates()`) and whether a seat is already filled. Fairness =
+even duty counts within role only, scoped to the generation window
+itself (a real, duty-deduped count via `core/duty_summary.py`'s
+`group_roster_rows_into_duties()` — never a raw row count). Rotations
+walked chronologically, same-day ties broken by `rotation_code`
+alphabetically, for deterministic (idempotency-friendly) output.
+Output is a new `roster.status = 'PROPOSED'` (migration 013, mirrors
+009's exact CHECK-constraint pattern), never written straight to
+`PLANNED` — `assign_crew_to_duty()` gained an optional `roster_status`
+parameter (default `'PLANNED'`, every existing call site unaffected);
+`get_roster_for_crew()`/`get_roster_for_flight()`/`search_roster()`
+gained a matching `include_proposed` parameter (same shape as their
+existing `include_cancelled`) so `PROPOSED` stays invisible to
+crew-facing reads by default — "crew sees only published."
+`roster_coverage()` is the one deliberate exception
+(`include_proposed=True`): a generator-filled seat must not show as
+falsely UNCOVERED to a reviewing controller. `publish_window()` is the
+mechanical `PROPOSED -> PLANNED` flip, the roster-level analog of
+`approve_instance()`. Partial failure mid-run is not wrapped in one
+transaction — each `assign_crew_to_duty()` call is already its own
+atomic, committed unit (Step 6); a crash simply stops, safely resumable
+by re-running. Idempotent by construction: a seat with any existing
+ACTIVE assignment (including a prior run's own `PROPOSED`) is skipped,
+never re-attempted or replaced; a previously-UNCOVERED seat is the one
+thing retried on every run.
+
+**The domestic premise the plan got wrong, and the fix, proven
+empirically against the real pairing math before being coded** — not
+theorized. Original claim: only international suffers from candidate-
+selection order dooming a seat (a 65+ pilot in EITHER international
+seat makes the pair unconditionally illegal, so a naive fewest-duties
+pick can lock out a reachable, fully-legal crewing). Domestic was
+assumed safe because its rule is looser ("illegal only if BOTH 65+").
+Tested directly: a domestic rotation with an FO pool that's entirely
+65+ (66 and 68) and a CPT pool with a 67yo (fewest duty, picked first
+under plain ordering) and a 40yo alternative — plain fewest-duties
+picks the 67yo CPT, both FO candidates get REJECTED (both pilots 65+),
+seat UNCOVERED. The fix has to be asymmetric, not the same rule copied
+onto domestic: international's under-65-first ordering is
+UNCONDITIONAL on both seats (a 65+ pilot can never fly international
+once paired, so deprioritizing them costs nothing); domestic's must be
+CONDITIONAL — only kicks in for the seat filled SECOND, and only when
+the seat filled FIRST turned out to be 65+ — because applying it
+unconditionally on domestic would systematically under-assign legal
+65+ pilots and break the even-duty-counts fairness goal for no reason
+in the common case. `order_candidates(candidates, domestic,
+partner_age=None)`: `partner_age` is the actual age of whoever already
+fills the OTHER seat, `None` for the seat filled first. Age-aware
+ordering applies when `not domestic` (international, always) or
+`partner_age is not None and partner_age >= 65` (domestic,
+conditional).
+
+**A second gap, found by directly simulating the approved design
+against the real pairing math BEFORE writing the DB-integration
+tests** (same "verify via direct interpreter execution before trusting
+it" discipline this session has used for every pure-logic module):
+the domestic conditional fix only works at all if the SEAT WHOSE POOL
+IS AT RISK gets filled FIRST, since the first-filled seat is never
+blocked by pairing (no partner exists yet) and unconditionally locks in
+whoever plain fewest-duties picks — the SECOND seat's conditional
+ordering can only route around an already-known bad partner age, it
+cannot undo the first seat's own unconditioned pick. Filling CPT before
+FO (the naive, arbitrary choice) fails the exact scenario above: the
+67yo CPT gets locked in first (nothing blocks a solo assignment,
+however old), then FO's conditional ordering is powerless because
+EVERY FO candidate is 65+ — no reordering within an entirely-65+ pool
+changes the outcome. Filling FO before CPT fixes it: FO's forced 65+
+pick becomes the known `partner_age` feeding CPT's own conditional
+ordering, which then correctly prefers the 40yo over the 67yo. Verified
+directly in the interpreter (`order_candidates()` fed the exact
+scenario both ways) before being encoded as
+`services/roster_generator_service.py`'s `ROLES = ("FO", "CPT")`
+constant, with the reasoning recorded in that file's own comment — not
+an arbitrary pick, and it doubles as the operationally sound choice
+anyway, since FO is the smaller real-world pool (4 vs 6 CPT) and
+therefore the more likely one to end up homogeneously 65+ in the first
+place.
+
+A third, related gap caught the same way: seats were originally
+processed in one loop over a fixed role order, meaning an
+ALREADY-filled seat's age (e.g. a controller's own manual `PLANNED`
+assignment made before a generation run) would only reach the other
+seat's conditional ordering if that already-filled role happened to
+come first in `ROLES` — otherwise the information existed but arrived
+too late to matter. Fixed by splitting into two passes: first record
+every seat's existing state (populating `seat_ages` for anything
+already filled, regardless of role order), then fill only what's
+actually still needed, so a pre-existing seat's age is always available
+to condition the other seat's ordering, not just when it happens to be
+processed first.
+
+**Files**: `migrations/013_roster_proposed_status.sql`.
+`core/roster_generation.py` (new, pure, no DB — `Candidate`,
+`order_candidates()`; takes pre-computed `age: Optional[int]` rather
+than a raw `date_of_birth`, so age arithmetic is never duplicated —
+the caller computes it via the real, already-tested
+`assignment_service.age_on()` (promoted from private `_age_on`) and
+hands in plain ints, keeping `core/` modules' existing "never import
+from `services/`" placement principle intact rather than bending it for
+this one case). `services/roster_generator_service.py` (new —
+`generate_for_window()`, `publish_window()`, `GenerationSummary`/
+`SeatResult` dataclasses; writes only via `assignment_service.
+assign_crew_to_duty()`, Ownership Table unchanged).
+`services/assignment_service.py`: `age_on()` promoted public;
+`assign_crew_to_duty()` gained `roster_status`; `get_roster_for_crew()`/
+`get_roster_for_flight()`/`search_roster()` gained `include_proposed`.
+`services/rotation_template_service.py`: `_promoted_flight_ids()`
+factored out of `approve_instance()`'s own idempotency check, plus a
+public `get_promoted_flight_ids()` wrapper — the "which real flights
+make up this approved rotation" lookup the generator needs for every
+candidate rotation it considers. `services/assistant/reports.py`:
+`roster_coverage()` now calls `get_roster_for_flight(...,
+include_proposed=True)` — the one deliberate exception to "crew sees
+only published." `tests/conftest.py`: `roster_generator_service` added
+to `_patch_all_service_engines`' patched-module list, per the
+consolidation discipline from the previous piece — no new one-off
+local fixture.
+
+**Tests**: 8 pure-logic (`tests/test_roster_generation.py`, no DB) —
+plain fewest-duties when `partner_age` is `None` or under 65; the
+conditional domestic switch once `partner_age >= 65` (including the
+explicit regression proving ordinary domestic ordering is unaffected
+when the first pick is under 65); international's unconditional
+under-65-first regardless of `partner_age`; a missing-age candidate
+pushed later, never excluded; deterministic tie-breaking. 13
+DB-integration (`tests/test_roster_generator_service.py`, grounded in
+the real EPE 786/787 domestic and EPE 802/804/805 international
+rotations via the actual `expand_and_persist()` + `approve_instance()`
+arc, not synthetic shortcuts): basic domestic/international fill as
+`PROPOSED`; back-to-back international for a sole candidate ends
+UNCOVERED (the real gate's rest math, not the generator, causing it —
+isolated by using exactly one CPT candidate so fairness has no escape
+route to a different pilot); back-to-back domestic for a sole candidate
+succeeds (proving the reverse is legal, same isolation technique);
+duty counts stay even within role (max-min <= 1) and the smaller pool
+(FO) carries more average load than the larger one (CPT), scaled down
+from the real 6/4 grounding ratio; the corrected domestic scenario
+itself, end-to-end — an entirely-65+ FO pool still gets a fully-crewed
+pair when an eligible under-65 CPT candidate exists; idempotency on a
+fully-generated window (no duplicate rows); gap-filling on a partially
+(manually) generated window, confirming the pre-existing row is never
+touched; a previously-UNCOVERED seat retried and filled once the
+blocker (an inactive crew member) is resolved between runs;
+`publish_window()` flipping only in-range `PROPOSED` rows; `roster_
+coverage()` showing a `PROPOSED` seat as covered while `get_roster_
+for_crew()` hides it by default.
+
+**Verification status**: DB-integration tests NOT yet run against real
+Postgres — no `TEST_DATABASE_URL` in this sandbox, same as every other
+DB-integration piece this session; their expected outcomes were
+reasoned through by hand against the real gate's documented rules
+(age-pairing, back-to-back rest math already established as grounding
+facts earlier this session), including, for the two ordering-sensitive
+scenarios, literally simulating `order_candidates()` plus the pairing
+math in the interpreter first to confirm the predicted outcome before
+writing the assertion, not guessed. Everything that COULD run locally
+did: pure-logic tests (`test_roster_generation.py`, 8/8) and full-suite
+collection (`pytest tests/`: 157 passed, 246 skipped, both new test
+files collected cleanly with zero import errors). `check_reachability.py`
+re-run: flags exactly `services/assistant/reports.py` (unchanged) and
+`services/roster_generator_service.py` (no Phase 7 piece has UI yet).
+`services/rotation_template_service.py` is no longer flagged, as
+predicted — `roster_generator_service.py` is now its first real caller.
+`core/roster_generation.py` was never flagged (same one-hop reasoning
+as `core/duty_summary.py`/`core/rotation_expansion.py`). See `Current
+active task` near the top of this file for merge status, not this
+line.
+
+## 2026-08-08: meal_provided data gap — the generator's first real-Postgres
+## finding, fixed on the same branch
+
+The user's own real-Postgres verification of `roster-generator-phase7-final`
+found 5 failing tests, all tracing to one cause: `core/legality/
+pcaa_ano012_core.py`'s D25 rule (`_check_nutrition()`) fires
+`NEEDS_MANUAL_REVIEW` whenever a duty's FDP exceeds 6h and
+`Duty.meal_provided` is `None` — and nothing anywhere in this codebase
+had ever populated that field. Every international rotation (FDP
+10.75h) hit this on both seats, permanently — 16 of 36 real rotations
+per 28 days, 44% of the roster, UNCOVERED. This exact gap was already
+noted as a discovery in this file's 2026-08-01 "Step 2" entry, but its
+consequence for a fully-automated generator (no human in the loop to
+manually override a `NEEDS_MANUAL_REVIEW`) was never followed through
+until the generator itself existed to expose it.
+
+Plan proposed first (schema layer, data flow through expansion/
+approval/assign, the `snack_provided` decision, and — found only
+during planning, not assumed — which existing tests structurally
+depended on the bug being fixed), reviewed and approved by the user,
+who independently re-verified the `D16.2.2` night-duty-window math used
+to redesign one test (see below) before approving. Same branch, new
+commit — this is a fix to that piece's own verification, not separate
+work.
+
+**Root cause, confirmed by reading the code, not assumed**: `Duty.
+meal_provided: Optional[bool] = None` (`core/legality/pcaa_ano012_core.py`
+line 141) is a deliberate tri-state — `None` (unknown, the branch that
+always fired), `False` (confirmed not provided, a real `WARNING`),
+`True` (confirmed provided, silent) — and the rule engine itself is
+correct and untouched by this fix. There are exactly 3 real `Duty(...)`
+construction sites in `services/assignment_service.py`:
+`_load_duty_records_for_crew()` (rebuilds **historical** duties for
+lookback/rest checks — matters just as much as the "new duty" site,
+since `_check_duties()` loops over every duty in the list passed to
+`validate_schedule()`, historical included, so an unfixed historical
+>6h duty would have kept blocking that crew member's future
+assignments indefinitely even after this fix shipped — the subtlest
+part of this piece, confirmed by reading `_check_duties()`'s own loop),
+`_validate_new_duty()` (the new duty being gated, shared by
+`assign_crew_to_duty()`/`assign_crew_to_new_flights()`), and
+`find_legal_candidates_for_duty()`'s inline `candidate_duty`
+construction. None of these had anything from `flights` to feed
+`meal_provided` — the column didn't exist anywhere in the schema.
+
+**Operator-confirmed (2026-08-08): a meal is provided on every
+rotation, today.** Recorded as DATA (migration 014), not a code
+default — hardcoding `True` in the rule engine itself would silently
+defeat D25 for a future rotation where a meal genuinely isn't provided.
+`rotation_templates.meal_provided BOOLEAN NOT NULL DEFAULT TRUE` is the
+source of truth, one value per template *version* (not per leg — meal
+provision is a whole-duty operational fact in this airline's own
+framing, "provided on every rotation," not a per-leg one the way
+`domestic` genuinely can be). Broadcast onto every `rotation_instance_
+legs` row at expansion time (`expand_and_persist()`, same denormalize-
+at-expansion-time treatment `domestic`/`flight_no` already get — an
+already-expanded instance keeps the value that was true when expanded,
+not a later template version's edit) and from there onto every
+promoted `flights` row at `approve_instance()` time. `flights.
+meal_provided` is the column every `Duty`-construction site actually
+reads (via `get_flight()`'s `SELECT *`); an ad-hoc Control Room flight
+that omits it falls back to this column's own `DEFAULT TRUE`.
+`create_template()`/`create_new_version()` gained a **required**
+`meal_provided: bool` parameter — no Python default, mirroring the
+column's own `NOT NULL` intent at the call-site level, the same way
+`rotation_code`/`effective_from` already have none.
+
+**Every Duty-construction site now aggregates `meal_provided` the same
+way `domestic` already was** (`all(bool(f["meal_provided"]) for f in
+flights)`, reusing an existing pattern rather than inventing a new
+one) — a duty only "had a meal provided" if every leg genuinely did.
+`assign_crew_to_new_flights()`'s pre-insert version needed one extra
+deliberate detail: `flights_data` are plain caller-supplied dicts that
+may omit the key entirely (nothing in the DB yet), so its computation
+explicitly defaults missing entries to `True`
+(`f.get("meal_provided", True)`) — this function gates legality
+*before* any write happens, so the in-memory computation has to mirror
+`flights.meal_provided`'s own `DEFAULT TRUE`, or the pre-insert gate
+and the post-insert reality would silently disagree.
+
+**`snack_provided` — a deliberate decision, not left an accident.**
+Not wired up. `D2.18` only alerts when `snack_provided is False`;
+`None` produces no alert, harmless today but not *correct* the way
+`meal_provided` now is. The operator's confirmation was specifically
+about meals; inferring a snack is therefore also provided would be
+guessing at a legally distinct D2.18/D25 category never actually
+asked about — exactly the kind of assumption this fix exists to
+eliminate for `meal_provided`. Recorded as an explicit, visible open
+item (see `Open stubs`), not silently left as today's accidental
+non-alert.
+
+**A real, necessary test redesign, not a find-replace** — caught
+during planning, not discovered mid-implementation: several tests in
+`tests/test_assignment_service.py` deliberately used the *bug itself*
+(an unset-meal >6h duty) as their real-rule `NEEDS_MANUAL_REVIEW`
+trigger. Once `meal_provided` is `NOT NULL` everywhere,
+`D25_NUTRITION_DATA_MISSING` becomes structurally unreachable through
+the real API — correct, that's the fix — so these needed a genuinely
+different real trigger, not deletion or a mock (this codebase tests
+against the real rule engine, not synthetic/mocked triggers, per this
+file's own established discipline):
+- `test_needs_manual_review_does_not_write_and_returns_needs_review_status`,
+  `test_needs_manual_review_still_reports_computed_duty_times`,
+  `test_needs_manual_review_writes_audit_record_with_held_action_type`,
+  `test_needs_manual_review_via_control_room_saves_neither_flight_nor_
+  assignment`: switched to a missing crew qualification-expiry field
+  (`_add_crew("CPT", license_expiry=None)` →
+  `AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING`) — a real, already-
+  implemented, static trigger fully decoupled from nutrition data.
+  Arguably better than before: no longer accidentally dependent on the
+  very gap this piece fixes.
+- `test_delay_recompute_flags_needs_review_when_no_longer_legal` was
+  harder: it specifically needs "legal at assignment time, flips to
+  `NEEDS_MANUAL_REVIEW` because a delay made the duty longer" — a
+  missing qualification field can't do that (static, not duration-
+  dependent, would fail the test's own first assertion). Found a real,
+  still-reachable, duration-sensitive alternative:
+  `D16.2.2_NIGHT_DUTY_OVER_10H_FRM_REQUIRED` (`has_approved_frm`
+  defaults `False`, never overridden by this codebase's module-level
+  `validator = ANO012CoreValidator()`) — fires when a duty's local time
+  overlaps 02:00-04:59 and FDP exceeds 10h. Verified directly against
+  the real validator in the interpreter before being locked in (same
+  discipline as the EPE 786/787 grounding numbers): report 19:00 UTC
+  2026-07-20 (local 00:00 on 2026-07-21, UTC+5) with a short initial
+  arrival stays `LEGAL` with zero alerts; delaying `arr_time_actual` to
+  2026-07-21 05:15 grows the duty to exactly 10.5h (630 min) whose
+  local span now overlaps 02:00-04:59, firing `NEEDS_MANUAL_REVIEW` via
+  `D16.2.2` alone (no other alert), confirmed comfortably under this
+  band's own 660-minute (11h), 1-sector D8.2.1 ceiling — the same
+  "don't also trip a bigger rule" constraint the original test already
+  needed. The user independently re-verified this exact window (the
+  overnight band's 11h cap and D16.2.2's 10h floor) before approving.
+- `test_warning_only_status_still_allowed_and_written` and
+  `test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged`:
+  no functional change — both already avoided the >6h/D25 trigger by
+  design; only stale docstring prose updated (both cited D25/meal-data
+  as their reasoning, now inaccurate).
+- `_seed_duty()` (the direct-SQL history-seeding helper, ~10 call
+  sites) and its docstring's framing of D25 as *the* reason an 8h+
+  prior duty couldn't go through the real API: left alone, deliberately
+  — legitimate test infrastructure independent of this bug; the
+  docstring becomes slightly imprecise but not wrong enough to justify
+  auditing ~10 call sites for a fix that isn't about test
+  infrastructure.
+
+**Files**: `migrations/014_meal_provided_columns.sql` (new).
+`services/rotation_template_service.py` (`create_template()`/
+`create_new_version()` gain required `meal_provided`;
+`expand_and_persist()`/`approve_instance()` thread it through).
+`services/flight_service.py` (`meal_provided` added to
+`UPDATABLE_FIELDS`, deliberately not `REQUIRED_FIELDS`).
+`services/assignment_service.py` (all 3 `Duty`-construction sites plus
+both `_validate_new_duty()` callers). `core/legality/pcaa_ano012_core.py`:
+untouched, confirmed correct as-is. `tests/test_rotation_template_
+service.py` (8 call sites via 2 helpers + direct calls) and `tests/
+test_roster_generator_service.py` (2 helpers) updated to pass
+`meal_provided=True`. `tests/test_assignment_service.py`: the redesign
+above.
+
+**Verification status**: full local suite collection clean (no
+`TEST_DATABASE_URL` in this sandbox, same as every DB-integration piece
+this session) — see "Run full suite + reachability check" in the
+current task list for the exact numbers. The `D16.2.2` scenario was
+additionally run directly against the real validator (bypassing the DB
+entirely, pure `core/legality` logic) confirming the exact predicted
+transition: `LEGAL` (zero alerts) → `NEEDS_MANUAL_REVIEW` via
+`D16.2.2_NIGHT_DUTY_OVER_10H_FRM_REQUIRED` alone, FDP 630 min. Not yet
+re-verified against real Postgres — acceptance criterion is 403/403,
+plus the user specifically checking the least-covered consequence: a
+crew member with an existing >6h historical duty in their lookback
+window should no longer be permanently blocked from new assignments.
+See `Current active task` near the top of this file for merge status,
+not this line.
+
+**Explicitly out of scope, same as the plan**: any UI (review,
+trigger, template management). Re-optimization or changing an existing
+assignment once made. True optimal bipartite matching / backtracking —
+this stays a greedy, single-pass loop with two targeted ordering fixes
+for the two identified failure modes, not a claim of finding the best
+possible crewing in every case.
+
+## 2026-08-08 (continued): second real-Postgres pass — the meal_provided
+## fix itself confirmed working, 3 test-side bugs found and fixed
+
+The user's second real-Postgres verification confirmed the fix itself
+works (`test_generate_for_window_fills_international_rotation_as_proposed`
+passes in isolation, D25 no longer blocks international rotations) —
+the remaining 5 failures were all test-side, not product bugs.
+
+**One obsolete test premise**: `test_assignment_service.py::
+test_mixed_domestic_international_duty_uses_international_buffer`
+asserted `NEEDS_REVIEW` with a comment citing "no meal data" — written
+during the mixed-domestic/international buffer work, predating this
+piece, so it wasn't caught by the earlier redesign pass (which only
+searched for tests exercising the `NEEDS_MANUAL_REVIEW` GATE itself,
+not every test that happened to assert that status as a side effect of
+the same now-fixed gap). Fixed: now asserts `ALLOWED`; the buffer
+assertions (report 04:00, debrief 13:30 — the actual point of the
+test) now check the written roster row directly instead of the
+held-assignment `computed_*` fields.
+
+**Sector rows vs. duties — Section 9's trap, caught by the user, not
+avoided**: `tests/test_roster_generator_service.py`'s
+`_roster_row_count()` helper did `SELECT COUNT(*) FROM roster` and
+tests asserted `== 2` for a fully-crewed 2-leg rotation — but
+`003_roster_table.sql`'s own header says, in capitals, this table
+stores ONE ROW PER CREW PER FLIGHT SECTOR, so a 2-leg rotation crewed
+by CPT+FO is genuinely 4 rows, 2 duties. The helper's own name invited
+the exact mistake it made. Fixed: renamed `_roster_duty_count()`,
+implemented via `core/duty_summary.py`'s `group_roster_rows_into_duties()`
+— the canonical dedup this whole platform already has for exactly this
+— rather than a raw `COUNT(*)`, which is what makes the helper honest
+about which unit it measures going forward.
+
+**A second, unrelated test-authoring bug, found while checking the
+user's "may resolve, may be separate" third failure**:
+`test_uncovered_seat_is_retried_and_succeeds_once_the_blocker_is_removed`
+used `_add_crew("CPT", is_active=False)` intending a genuinely
+inactive (zero-candidate) CPT pool, then `crew_service.update_crew(cpt_id,
+{"is_active": True})` intending to reactivate it. Neither actually
+works: `is_active` is not in `crew_service.UPDATABLE_FIELDS` (`crew_service.py`
+line ~30), so both `add_crew()` and `update_crew()` silently filter it
+out of the fields they actually write — the crew member was active the
+entire time, on both calls, which is exactly why the first run's
+"uncovered" list came back empty (`assert [] == ['CPT']`) instead of
+holding the CPT seat. **A related, real product gap surfaced by
+tracing this**: there is no `reactivate_crew()` anywhere in
+`crew_service.py` — `deactivate_crew()` exists (a real, dedicated,
+audited soft-delete), but nothing symmetric brings a crew member back.
+Not fixed here (out of scope for this piece — flagged in `Open stubs`
+below). Fixed the test itself by switching to a real, achievable
+block/unblock mechanism already established in this same piece's
+qualification-based test redesigns: `license_expiry=None` (missing
+data → genuine `NEEDS_MANUAL_REVIEW`, correctly `uncovered`) then
+`update_crew(cpt_id, {"license_expiry": ...})` (`license_expiry` IS in
+`UPDATABLE_FIELDS`) to genuinely clear it between runs.
+
+**Files**: `tests/test_assignment_service.py` (the obsolete-premise
+fix), `tests/test_roster_generator_service.py` (the counting-helper
+rename/reimplementation and the `is_active`/`license_expiry` test
+redesign).
+
+**Verification status**: full local suite collection clean (157
+passed, 246 skipped, 403 total, zero import errors) — same sandbox
+limitation as every DB-integration piece this session. Not yet
+re-verified against real Postgres. Acceptance criterion unchanged:
+403/403.
+
+## 2026-08-08 (continued): third real-Postgres pass — same two patterns,
+## caught in spots the second pass missed
+
+The second pass's fixes were correct as far as they went, but two of
+the three real-Postgres findings this round are the SAME two patterns
+recurring in spots not covered the first time — not new bugs, missed
+instances. The third is a genuinely new instance of the D25-premise
+pattern.
+
+**1. A leftover duplicate assertion, not a new bug**: `test_
+mixed_domestic_international_duty_uses_international_buffer`'s edit
+(previous pass) correctly added the `ALLOWED`/written-row assertions
+but didn't remove the OLD `assert len(roster_df) == 0  # held, not
+written` block that used to follow it — a stale duplicate from before
+the edit, not caught because the file still collected and the earlier
+assertions passed before reaching the dead one. Removed; also
+strengthened per the user's own suggestion: `roster_df["duty_id"].
+nunique() == 1` now confirms the 3 sector rows are genuinely one duty,
+not just "3 rows of some kind."
+
+**2. The row-vs-duty pattern, same root cause as `_roster_row_count()`,
+different call site**: `test_publish_window_flips_only_proposed_rows_
+in_range` asserted `publish_window()`'s return value `== 2`, but that
+return value is a raw `UPDATE ... rowcount` — sector rows, not duties,
+by design (`publish_window()`'s own docstring already says "returns
+the number of rows flipped"; this was never meant to be duty-counted).
+2 legs x 2 crew (CPT+FO) in the August rotation is genuinely 4 rows.
+Fixed the assertion, not the function — `published_count` staying
+row-based is correct given what a bulk `UPDATE`'s `rowcount` actually
+measures; a duty-level version would need a separate `SELECT` and
+isn't what this function is for. A full sweep of `tests/*.py` for any
+other `len()`/`COUNT(*)` over roster rows found nothing else
+miscounting — the remaining ones either measure single-sector duties
+(where sector-count and duty-count coincide, so the distinction
+doesn't matter) or are deliberately raw-row schema tests
+(`test_schema.py`'s partial-unique-index regression tests, which are
+correctly testing "N rows exist," not "N duties exist").
+
+**3. A third, genuinely new D25-premise test, found by the same sweep
+the user asked for**: `tests/test_control_room_page.py::
+test_needs_review_adhoc_assignment_shows_warning_not_success` drove
+the Control Room form with a 7h FDP duty specifically to trigger D25
+nutrition-data-missing, asserting the page shows "HELD FOR MANUAL
+REVIEW" without crashing on `flight_ids[0]` against an empty list
+(the actual regression this test guards). Missed in the first redesign
+pass because that pass only searched `test_assignment_service.py`.
+Same substitution as that file's own tests: the crew member gets
+`license_expiry=None` via `crew_service.update_crew()` after
+`_seed_crew()` (not a change to `_seed_crew()` itself, which 3 other
+tests in this file rely on staying fully-qualified) —
+`AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING` now provides the trigger
+instead. A repo-wide grep for `NEEDS_REVIEW`/`NEEDS_MANUAL_REVIEW`/
+`D25`/`nutrition`/`meal_provided` across every test and page file
+found no further instances: `test_alert_summary.py`'s `D25_
+NUTRITION_DATA_MISSING` references construct `RuleAlert` objects by
+hand to test the summarization/bucketing logic itself, independent of
+whether D25 can fire through the real pipeline — not affected by this
+fix at all. `test_schema.py`'s `NEEDS_REVIEW` references test the
+`roster.status` CHECK constraint's own vocabulary, not D25.
+`pages/*.py`'s references are generic `result.status` branch
+rendering, not D25-specific.
+
+**Files**: `tests/test_assignment_service.py` (leftover-assertion
+removal + duty_id strengthening), `tests/test_roster_generator_
+service.py` (the `publish_window()` count fix), `tests/test_control_
+room_page.py` (the third trigger substitution).
+
+**Verification status**: full local suite collection clean (157
+passed, 246 skipped, 403 total, zero import errors). Not yet
+re-verified against real Postgres. Acceptance criterion unchanged:
+403/403.

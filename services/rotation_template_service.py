@@ -81,6 +81,7 @@ def create_template(
     days_of_week: Sequence[int],
     legs: Sequence[dict],
     effective_from: dt.date,
+    meal_provided: bool,
     description: Optional[str] = None,
     effective_until: Optional[dt.date] = None,
     app_user: Optional[str] = None,
@@ -92,6 +93,22 @@ def create_template(
     core.rotation_expansion.TemplateLeg expects, kept as plain dicts
     here so callers don't need to import a core dataclass just to call
     this function.
+
+    meal_provided: whether a meal is provided across this WHOLE
+    rotation (2026-08-08) — required, no default, mirroring the
+    rotation_templates.meal_provided column's own NOT NULL intent at
+    this call-site level: a caller must make a real choice, the same
+    way rotation_code/effective_from already have none. Broadcast onto
+    every rotation_instance_leg this template's versions ever expand
+    into (expand_and_persist()) and, from there, onto every promoted
+    flights row (approve_instance()) — see migrations/014's own header
+    for why this lives on the template, not on rotation_template_legs
+    (a whole-duty operational fact, not a per-leg one) and why it's
+    NOT NULL DEFAULT TRUE at the database level even though this
+    parameter itself has no default. core/legality/pcaa_ano012_core.py's
+    D25 rule fires NEEDS_MANUAL_REVIEW for any duty over 6h whose
+    meal_provided is unknown — this is the fix for that gap having no
+    real data source anywhere in the pipeline.
 
     Raises ValueError if rotation_code/days_of_week/effective_from is
     missing, or if legs is empty (matches expand_template()'s own
@@ -113,9 +130,9 @@ def create_template(
         result = conn.execute(text("""
             INSERT INTO rotation_templates
                 (rotation_code, description, days_of_week, effective_from,
-                 effective_until, version)
+                 effective_until, version, meal_provided)
             VALUES (:rotation_code, :description, :days_of_week, :effective_from,
-                    :effective_until, 1)
+                    :effective_until, 1, :meal_provided)
             RETURNING id
         """), {
             "rotation_code": rotation_code,
@@ -123,6 +140,7 @@ def create_template(
             "days_of_week": list(days_of_week),
             "effective_from": effective_from,
             "effective_until": effective_until,
+            "meal_provided": bool(meal_provided),
         })
         template_id = result.scalar()
         _insert_legs(conn, template_id, legs)
@@ -146,6 +164,7 @@ def create_new_version(
     days_of_week: Sequence[int],
     legs: Sequence[dict],
     effective_from: dt.date,
+    meal_provided: bool,
     description: Optional[str] = None,
     effective_until: Optional[dt.date] = None,
     app_user: Optional[str] = None,
@@ -158,6 +177,12 @@ def create_new_version(
     BEFORE the new version's effective_from — not the same day, since
     the EXCLUDE constraint's '[]' inclusive bounds mean a single day
     cannot belong to two versions.
+
+    meal_provided: required, no default — see create_template()'s own
+    docstring for the full reasoning. A new version can genuinely set
+    a different value than the version it supersedes (that's the whole
+    point of storing this per-version rather than assuming it never
+    changes).
 
     This order is a genuine circular dependency, not an arbitrary
     choice: superseded_by can't be set until the new row exists, but a
@@ -213,9 +238,9 @@ def create_new_version(
         new_result = conn.execute(text("""
             INSERT INTO rotation_templates
                 (rotation_code, description, days_of_week, effective_from,
-                 effective_until, version)
+                 effective_until, version, meal_provided)
             VALUES (:rotation_code, :description, :days_of_week, :effective_from,
-                    :effective_until, :version)
+                    :effective_until, :version, :meal_provided)
             RETURNING id
         """), {
             "rotation_code": rotation_code,
@@ -224,6 +249,7 @@ def create_new_version(
             "effective_from": effective_from,
             "effective_until": effective_until,
             "version": next_version,
+            "meal_provided": bool(meal_provided),
         })
         new_template_id = new_result.scalar()
 
@@ -364,12 +390,17 @@ def expand_and_persist(
                 instance_id = instance_result.scalar()
 
                 for leg in draft.legs:
+                    # meal_provided is rotation-level (version_row, not
+                    # leg) — broadcast the template version's one value
+                    # onto every leg this run creates, same denormalize-
+                    # at-expansion-time treatment domestic/flight_no
+                    # already get (see migrations/014's header).
                     conn.execute(text("""
                         INSERT INTO rotation_instance_legs
                             (instance_id, leg_order, flight_no, origin, destination,
-                             dep_time_planned, arr_time_planned, domestic)
+                             dep_time_planned, arr_time_planned, domestic, meal_provided)
                         VALUES (:instance_id, :leg_order, :flight_no, :origin, :destination,
-                                :dep_time_planned, :arr_time_planned, :domestic)
+                                :dep_time_planned, :arr_time_planned, :domestic, :meal_provided)
                     """), {
                         "instance_id": instance_id, "leg_order": leg.leg_order,
                         "flight_no": leg.flight_no, "origin": leg.origin,
@@ -377,6 +408,7 @@ def expand_and_persist(
                         "dep_time_planned": leg.dep_time_planned,
                         "arr_time_planned": leg.arr_time_planned,
                         "domestic": leg.domestic,
+                        "meal_provided": version_row["meal_provided"],
                     })
 
                 created_ids.append(instance_id)
@@ -419,6 +451,32 @@ def get_instance_legs(instance_id: int) -> pd.DataFrame:
     """), engine, params={"instance_id": instance_id})
 
 
+def _promoted_flight_ids(conn, instance_id: int) -> List[int]:
+    """Shared query, given an already-open connection: the real
+    flight_ids an APPROVED instance's legs were promoted into, in leg
+    (chronological) order. Used by approve_instance()'s own idempotency
+    check and by get_promoted_flight_ids() below — factored out
+    (2026-08-04) so services/roster_generator_service.py, which needs
+    this exact "which real flights make up this approved rotation"
+    lookup for every candidate rotation it considers, doesn't have to
+    duplicate it."""
+    return list(conn.execute(text("""
+        SELECT flight_id FROM flights
+        WHERE rotation_instance_id = :id
+        ORDER BY dep_time_planned
+    """), {"id": instance_id}).scalars().all())
+
+
+def get_promoted_flight_ids(instance_id: int) -> List[int]:
+    """Public wrapper for _promoted_flight_ids() — the flight_ids an
+    APPROVED rotation_instance's legs were promoted into, in leg
+    (chronological — the order assign_crew_to_duty() needs) order.
+    Empty list if the instance isn't approved yet or doesn't exist."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        return _promoted_flight_ids(conn, instance_id)
+
+
 # ------------------------------------------------------------------
 # Approval workflow (2026-08-04) — DRAFT -> APPROVED promotes every
 # leg into a real flights row via the existing flight_service.
@@ -459,12 +517,7 @@ def approve_instance(instance_id: int, app_user: Optional[str] = None) -> List[i
             raise ValueError(f"No rotation_instance with id={instance_id}")
 
         if instance["status"] == "APPROVED":
-            existing = conn.execute(text("""
-                SELECT flight_id FROM flights
-                WHERE rotation_instance_id = :id
-                ORDER BY dep_time_planned
-            """), {"id": instance_id}).scalars().all()
-            return list(existing)
+            return _promoted_flight_ids(conn, instance_id)
 
         if instance["status"] != "DRAFT":
             raise ValueError(
@@ -486,6 +539,7 @@ def approve_instance(instance_id: int, app_user: Optional[str] = None) -> List[i
                 "dep_time_planned": leg["dep_time_planned"],
                 "arr_time_planned": leg["arr_time_planned"],
                 "domestic": leg["domestic"],
+                "meal_provided": leg["meal_provided"],
                 "rotation_instance_id": instance_id,
             }, app_user=app_user, conn=conn)
             flight_ids.append(flight_id)

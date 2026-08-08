@@ -255,7 +255,7 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
                r.role_assigned, f.flight_id,
                COALESCE(f.dep_time_actual, f.dep_time_planned) AS dep_time,
                COALESCE(f.arr_time_actual, f.arr_time_planned) AS arr_time,
-               f.origin, f.destination
+               f.origin, f.destination, f.meal_provided
         FROM roster r
         JOIN flights f ON r.flight_id = f.flight_id
         WHERE r.crew_id = :crew_id AND r.status != 'CANCELLED'
@@ -281,6 +281,13 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
                    origin=row["origin"], destination=row["destination"])
             for _, row in group.iterrows()
         ]
+        # meal_provided aggregated across every flight in this duty,
+        # same all()-of-the-legs pattern already used for `domestic`
+        # elsewhere in this file (e.g. assign_crew_to_duty()) — a duty
+        # only "had a meal provided" if every leg genuinely did.
+        # flights.meal_provided is NOT NULL (migrations/014), so this
+        # is always a real True/False, never the None that used to
+        # silently trip D25 for every rebuilt historical duty.
         duty = Duty(
             duty_type=DutyType.FDP,
             start_utc=first["report_time"],
@@ -290,6 +297,7 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
             report_location=sectors[0].origin,
             home_base=home_base or "",
             sectors=sectors,
+            meal_provided=bool(group["meal_provided"].all()),
         )
         records.append({
             "duty": duty,
@@ -330,10 +338,17 @@ class PairingCheckResult:
     constraint_message: Optional[str] = None
 
 
-def _age_on(dob, reference_date) -> int:
+def age_on(dob, reference_date) -> int:
     """Complete years as of reference_date. Turning 65 ON
     reference_date already counts as 65, not 64 — "exactly 65 does
-    not count as below 65 either way" (HANDOVER.md, settled wording)."""
+    not count as below 65 either way" (HANDOVER.md, settled wording).
+
+    Promoted from private (_age_on) to a plain shared utility
+    (2026-08-04, Phase 7's roster generator) — services/
+    roster_generator_service.py reuses this exact, already-tested
+    function for its own candidate-ordering heuristic rather than
+    re-deriving age arithmetic; still the same function, same
+    behavior, every existing call site in this file unaffected."""
     years = reference_date.year - dob.year
     if (reference_date.month, reference_date.day) < (dob.month, dob.day):
         years -= 1
@@ -435,7 +450,7 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
     if paired is None:
         constraint = None
         if pd.notna(crew_row["date_of_birth"]):
-            age = _age_on(crew_row["date_of_birth"], reference_date)
+            age = age_on(crew_row["date_of_birth"], reference_date)
             if age >= 65:
                 constraint = _pairing_constraint_message(crew_row["crew_id"], age, domestic)
         return [], PairingCheckResult(pending=True, constraint_message=constraint)
@@ -454,8 +469,8 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
         )
         return [alert], PairingCheckResult(paired_crew_id=paired["crew_id"])
 
-    age_this = _age_on(crew_row["date_of_birth"], reference_date)
-    age_paired = _age_on(paired["date_of_birth"], reference_date)
+    age_this = age_on(crew_row["date_of_birth"], reference_date)
+    age_paired = age_on(paired["date_of_birth"], reference_date)
 
     if _evaluate_pair_age(age_this, age_paired, domestic):
         alert = RuleAlert(
@@ -477,12 +492,19 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
 
 
 def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str,
-                        flight_ids: Optional[List[int]] = None):
+                        meal_provided: bool, flight_ids: Optional[List[int]] = None):
     """
     Shared validation core for both assign_crew_to_duty() (assigning
     to flights that already exist) and assign_crew_to_new_flights()
     (Control Room's atomic flight+assignment). Builds the duty, loads
     the crew member's existing history, validates — writes nothing.
+
+    meal_provided: required, no default, same footing as the existing
+    `domestic` parameter — both callers compute it the same way, from
+    the flights that make up this duty (migrations/014, 2026-08-08).
+    core/legality/pcaa_ano012_core.py's D25 rule fires NEEDS_MANUAL_REVIEW
+    for any FDP over 6h whose meal_provided is unknown; this is what
+    finally gives it real data instead of the dataclass default.
 
     Enforces role_assigned == crew_row["role"] (case-normalized).
     This is a real, confirmed fix, not defensive boilerplate: without
@@ -533,6 +555,7 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
         home_base=crew_row["base"] or "",
         sectors=[Sector(departure_utc=l.dep_time, arrival_utc=l.arr_time,
                          origin=l.origin, destination=l.destination) for l in legs],
+        meal_provided=meal_provided,
     )
 
     if crew_row["role"] in FTL_EXEMPT_ROLES:
@@ -586,17 +609,32 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
 # ------------------------------------------------------------------
 
 def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
-                         app_user: Optional[str] = None) -> AssignmentResult:
+                         app_user: Optional[str] = None,
+                         roster_status: str = "PLANNED") -> AssignmentResult:
     """
     Assigns crew_id to the duty formed by flight_ids (in chronological
     order — the caller's decision which flights form one duty).
     domestic is read from the flights themselves, not asked again
     here — all flights in the duty must agree on it.
 
-    ILLEGAL blocks the save entirely (status="REJECTED", nothing
-    written). LEGAL/WARNING saves and returns status="ALLOWED", along
-    with any downstream conflicts found on the crew member's other
-    already-scheduled future duties.
+    ILLEGAL blocks the save entirely (AssignmentResult.status=
+    "REJECTED", nothing written). LEGAL/WARNING saves and returns
+    AssignmentResult.status="ALLOWED", along with any downstream
+    conflicts found on the crew member's other already-scheduled
+    future duties.
+
+    roster_status: the value written to the new roster row's own
+    status column (migrations/003, 009, 013 — currently 'PLANNED',
+    'OPERATED', 'CANCELLED', 'DISRUPTED', 'NEEDS_REVIEW', 'PROPOSED')
+    — a completely different thing from AssignmentResult.status above,
+    which describes the OUTCOME of this call (REJECTED/NEEDS_REVIEW/
+    ALLOWED), not the roster row's own lifecycle state. Defaults to
+    'PLANNED', unchanged for every pre-existing call site (the Roster
+    page). Phase 7's roster generator (2026-08-04) is the one caller
+    that passes 'PROPOSED' — a draft assignment pending OCC review/
+    publish (services/roster_generator_service.py's publish_window()),
+    per the requirements doc's "draft -> OCC review -> publish, crew
+    sees only published."
     """
     engine = get_engine()
 
@@ -615,6 +653,12 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     # only affects which buffer applies to the duty as a whole.
     domestic = all(bool(f["domestic"]) for f in flights)
 
+    # Same all()-of-the-legs aggregation as `domestic` above — a duty
+    # only "had a meal provided" if every leg genuinely did.
+    # flights.meal_provided is NOT NULL (migrations/014), so this is
+    # always a real True/False.
+    meal_provided = all(bool(f["meal_provided"]) for f in flights)
+
     legs = [
         FlightLeg(
             dep_time=f["dep_time_actual"] if pd.notna(f["dep_time_actual"]) else f["dep_time_planned"],
@@ -625,7 +669,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     ]
 
     validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
-        engine, crew_id, legs, domestic, role_assigned, flight_ids=flight_ids)
+        engine, crew_id, legs, domestic, role_assigned, meal_provided, flight_ids=flight_ids)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -697,12 +741,13 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         for fid in flight_ids:
             result = conn.execute(text("""
                 INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
-                    report_time, debrief_time, fdp_hours, role_assigned)
+                    report_time, debrief_time, fdp_hours, role_assigned, status)
                 VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
-                    :report_time, :debrief_time, :fdp_hours, :role_assigned)
+                    :report_time, :debrief_time, :fdp_hours, :role_assigned, :roster_status)
                 RETURNING roster_id
             """), {
                 "crew_id": crew_id, "flight_id": fid, "duty_id": new_duty.duty_id,
+                "roster_status": roster_status,
                 "duty_date": duty_result.report_time.date(),
                 "report_time": duty_result.report_time, "debrief_time": duty_result.debrief_time,
                 "fdp_hours": duty_result.fdp_hours, "role_assigned": role_assigned,
@@ -775,6 +820,15 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     # whole duty international for D7.1.2 buffer purposes.
     domestic = all(bool(f["domestic"]) for f in flights_data)
 
+    # flights_data are plain caller-supplied dicts, not yet-inserted
+    # rows — a caller may omit the key entirely. Default True here
+    # explicitly (not just bool(None)=False) to mirror flights.
+    # meal_provided's own DEFAULT TRUE: this function gates legality
+    # BEFORE any DB write happens, so the pre-insert computation here
+    # must agree with what the row will actually end up holding once
+    # written, or the gate and the stored data would silently disagree.
+    meal_provided = all(bool(f.get("meal_provided", True)) for f in flights_data)
+
     legs = [
         FlightLeg(dep_time=f["dep_time_planned"], arr_time=f["arr_time_planned"],
                   origin=f["origin"], destination=f["destination"])
@@ -782,7 +836,7 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     ]
 
     validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
-        engine, crew_id, legs, domestic, role_assigned, flight_ids=None)
+        engine, crew_id, legs, domestic, role_assigned, meal_provided, flight_ids=None)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -1004,6 +1058,8 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     # Same duty-level classification rule as assign_crew_to_duty() —
     # any international sector makes the whole duty international.
     domestic = all(bool(f["domestic"]) for f in flights)
+    # Same all()-of-the-legs aggregation as `domestic` above.
+    meal_provided = all(bool(f["meal_provided"]) for f in flights)
     legs = [FlightLeg(
         dep_time=f["dep_time_actual"] if pd.notna(f["dep_time_actual"]) else f["dep_time_planned"],
         arr_time=f["arr_time_actual"] if pd.notna(f["arr_time_actual"]) else f["arr_time_planned"],
@@ -1042,6 +1098,7 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
             home_base=crew_row["base"] or "",
             sectors=[Sector(departure_utc=l.dep_time, arrival_utc=l.arr_time,
                              origin=l.origin, destination=l.destination) for l in legs],
+            meal_provided=meal_provided,
         )
 
         lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
@@ -1300,25 +1357,41 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
     return results
 
 
-def get_roster_for_crew(crew_id: str, include_cancelled: bool = False) -> pd.DataFrame:
+def get_roster_for_crew(crew_id: str, include_cancelled: bool = False,
+                         include_proposed: bool = False) -> pd.DataFrame:
+    """
+    include_proposed (2026-08-04, Phase 7's roster generator):
+    PROPOSED rows (services/roster_generator_service.py's
+    generate_for_window(), not yet published via publish_window()) are
+    excluded by default, same shape as include_cancelled — a crew
+    member's own duty history should show published assignments only,
+    matching the requirements doc's "crew sees only published."
+    """
     engine = get_engine()
     query = "SELECT * FROM roster WHERE crew_id = :crew_id"
     if not include_cancelled:
         query += " AND status != 'CANCELLED'"
+    if not include_proposed:
+        query += " AND status != 'PROPOSED'"
     query += " ORDER BY report_time"
     return pd.read_sql(text(query), engine, params={"crew_id": crew_id})
 
 
-def get_roster_for_flight(flight_id: int, include_cancelled: bool = False) -> pd.DataFrame:
+def get_roster_for_flight(flight_id: int, include_cancelled: bool = False,
+                           include_proposed: bool = False) -> pd.DataFrame:
+    """See get_roster_for_crew()'s docstring for include_proposed."""
     engine = get_engine()
     query = "SELECT * FROM roster WHERE flight_id = :flight_id"
     if not include_cancelled:
         query += " AND status != 'CANCELLED'"
+    if not include_proposed:
+        query += " AND status != 'PROPOSED'"
     return pd.read_sql(text(query), engine, params={"flight_id": flight_id})
 
 
 def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = None,
-                   date_from=None, date_to=None, include_cancelled: bool = False) -> pd.DataFrame:
+                   date_from=None, date_to=None, include_cancelled: bool = False,
+                   include_proposed: bool = False) -> pd.DataFrame:
     """
     Sector-level roster search across crew/date range — the query
     services/assistant/reports.py's crew_duty_history template needs.
@@ -1336,6 +1409,9 @@ def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = No
     history." A report-layer consumer of this data is exactly where
     that mistake would happen again if this warning weren't repeated
     here too.
+
+    include_proposed: see get_roster_for_crew()'s docstring — excluded
+    by default, same shape as include_cancelled.
     """
     engine = get_engine()
     query = """
@@ -1353,6 +1429,8 @@ def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = No
     params: dict = {}
     if not include_cancelled:
         conditions.append("r.status != 'CANCELLED'")
+    if not include_proposed:
+        conditions.append("r.status != 'PROPOSED'")
     if crew_ids:
         conditions.append("r.crew_id = ANY(:crew_ids)")
         params["crew_ids"] = list(crew_ids)

@@ -1,0 +1,64 @@
+-- ============================================================
+-- 014_meal_provided_columns.sql
+--
+-- Real-Postgres verification of roster-generator-phase7-final found 5
+-- failing tests, all tracing to one cause: core/legality/
+-- pcaa_ano012_core.py's D25 rule (_check_nutrition()) fires
+-- NEEDS_MANUAL_REVIEW whenever a duty's FDP exceeds 6h and
+-- Duty.meal_provided is None (its actual, permanent default) — and
+-- nothing in this codebase has ever populated that field. Every
+-- international rotation (FDP 10.75h) hits this on both seats, so the
+-- roster generator could never fill an international rotation at all
+-- (16 of 36 real rotations per 28 days). This was already noted as a
+-- discovery in HANDOVER.md's 2026-08-01 "Step 2" entry, but its
+-- consequence for a fully-automated generator (no human in the loop to
+-- manually override a NEEDS_MANUAL_REVIEW) was never followed through
+-- until now.
+--
+-- Operator-confirmed (2026-08-08): a meal is provided on every
+-- rotation, today. Recorded as DATA, not a code default — D25
+-- deliberately distinguishes three states (None=unknown,
+-- False=confirmed not provided, True=confirmed provided); hardcoding
+-- True anywhere in the rule engine itself would silently defeat D25
+-- for a future rotation where a meal genuinely isn't provided.
+-- ASSUMPTION — requires airline validation (see HANDOVER.md).
+--
+-- All three columns BOOLEAN NOT NULL DEFAULT TRUE. The DEFAULT exists
+-- for two concrete reasons: (a) it's what lets ADD COLUMN ... NOT NULL
+-- succeed against any pre-existing rows without a separate backfill
+-- UPDATE (Postgres 11+ makes this a fast metadata-only change for a
+-- constant default — DDL, not a row-level UPDATE, so it does not trip
+-- rotation_templates'/rotation_instance_legs' mutation-guard triggers,
+-- which only fire on INSERT/UPDATE/DELETE), and (b) it's the correct
+-- safety net for the one write path that never flows through a
+-- template at all (ad-hoc Control Room flights) — see
+-- services/flight_service.py's UPDATABLE_FIELDS and
+-- services/assignment_service.py's assign_crew_to_new_flights().
+--
+-- rotation_templates.meal_provided is the source of truth, one value
+-- per template VERSION (a future version can genuinely differ from
+-- today's universal TRUE). Deliberately NOT added to
+-- rotation_template_legs: meal provision is a whole-duty operational
+-- fact in this airline's own framing ("a meal is provided on every
+-- rotation"), not a per-leg one — unlike domestic, where a rotation
+-- mixing domestic and international legs is a real, already-handled
+-- case, one column on the parent table is the honest model here.
+--
+-- rotation_instance_legs.meal_provided is denormalized per leg at
+-- expansion time (services/rotation_template_service.py's
+-- expand_and_persist(), broadcasting the enclosing template version's
+-- one value onto every leg it creates) — same reasoning already
+-- applied to domestic/flight_no there: an already-expanded instance
+-- must keep the value that was true when it was expanded, not
+-- silently follow a later template version's edit.
+--
+-- flights.meal_provided is the column every Duty-construction site in
+-- services/assignment_service.py ultimately reads (via get_flight()'s
+-- SELECT *). Populated explicitly from the rotation-instance leg at
+-- approve_instance() time; an ad-hoc Control Room flight that omits it
+-- falls back to this column's own DEFAULT TRUE.
+-- ============================================================
+
+ALTER TABLE rotation_templates ADD COLUMN IF NOT EXISTS meal_provided BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE rotation_instance_legs ADD COLUMN IF NOT EXISTS meal_provided BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE flights ADD COLUMN IF NOT EXISTS meal_provided BOOLEAN NOT NULL DEFAULT TRUE;
