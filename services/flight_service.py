@@ -44,6 +44,9 @@ UPDATABLE_FIELDS = {
     # rotation-sourced flights always pass it explicitly (approve_
     # instance()) from the template's own stored value.
     "meal_provided",
+    # Same shape and reasoning as meal_provided, one migration later
+    # (migrations/015, 2026-08-08).
+    "snack_provided",
 }
 
 

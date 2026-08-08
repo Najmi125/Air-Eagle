@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from services.assistant.query_parser import (
-    parse, parse_dates, parse_crew, parse_role, describe_capabilities,
+    parse, parse_dates, parse_crew, parse_role, parse_status, describe_capabilities,
 )
 
 CREW = {
@@ -186,6 +186,38 @@ def test_route_is_extracted():
     result = _parse("all KHI-DWC flights last month")
     assert result.origin == "KHI"
     assert result.destination == "DWC"
+
+
+# ------------------------------------------------------------------
+# status_filter (2026-08-08 fix — parse() previously never populated
+# it, even though these are the exact words already scored as
+# flight_records keywords; see query_parser.py's own STATUS_KEYWORDS
+# comment for why "delayed"/"diverted" both map to DISRUPTED, not two
+# separate values that don't exist on flights.status)
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("which flights were cancelled in June", "CANCELLED"),
+    ("show delayed flights last week", "DISRUPTED"),
+    ("any diverted flights this month", "DISRUPTED"),
+])
+def test_status_parsing(text, expected):
+    assert parse_status(text) == expected
+
+
+def test_status_parsing_none_when_unmentioned():
+    assert parse_status("show all flights last month") is None
+
+
+def test_parse_populates_status_filter_end_to_end():
+    result = _parse("which flights were cancelled in June")
+    assert result.template == "flight_records"
+    assert result.status_filter == "CANCELLED"
+
+
+def test_parse_leaves_status_filter_none_when_unmentioned():
+    result = _parse("all KHI-DWC flights last month")
+    assert result.status_filter is None
 
 
 # ------------------------------------------------------------------

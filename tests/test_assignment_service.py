@@ -689,16 +689,13 @@ def test_needs_manual_review_via_control_room_saves_neither_flight_nor_assignmen
 def test_warning_only_status_still_allowed_and_written(_patch_engine):
     """Regression guard: WARNING must NOT be swept up into the same
     hold-for-review treatment as NEEDS_MANUAL_REVIEW — only genuine
-    uncertainty gets held, not a legal-but-flagged duty. A duty just
-    over 4h but at or under 6h gets the snack-required WARNING
-    (D2.18_D25_SNACK_REQUIRED needs snack_provided is False
-    specifically — snack_provided is deliberately still never set by
-    this codebase post-migrations/014, see that migration's own header
-    and HANDOVER.md's open-stubs entry for why, so this never fires
-    here either) — so this test instead confirms a duty with NO alerts
-    at all (comfortably under every threshold) writes normally, as the
-    plainest possible regression guard that the new branch didn't
-    accidentally start blocking LEGAL too."""
+    uncertainty gets held, not a legal-but-flagged duty. This test
+    confirms a duty with NO alerts at all (comfortably under every
+    threshold) writes normally, as the plainest possible regression
+    guard that the new branch didn't accidentally start blocking LEGAL
+    too. See test_snack_not_provided_produces_warning_but_still_allowed
+    below for the real D2.18_D25_SNACK_REQUIRED WARNING firing and
+    still writing — the case this test deliberately stays clear of."""
     crew_id = _add_crew("CPT")
     f1 = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
     result = assignment_service.assign_crew_to_duty(crew_id, [f1], "CPT")
@@ -707,6 +704,35 @@ def test_warning_only_status_still_allowed_and_written(_patch_engine):
     assert result.legality_status == "LEGAL"
     roster_df = assignment_service.get_roster_for_crew(crew_id)
     assert len(roster_df) == 1
+
+
+def test_snack_not_provided_produces_warning_but_still_allowed(_patch_engine):
+    """The real D2.18_D25_SNACK_REQUIRED rule, fired for real
+    (migrations/015, 2026-08-08 — snack_provided is now real data, not
+    a permanent None): a domestic duty just over 4h but at or under 6h
+    (so D25's meal-nutrition threshold doesn't also fire) with
+    snack_provided=False on its flight must produce a WARNING, not
+    block the write — WARNING is a legal-but-flagged duty, not genuine
+    uncertainty, so it must NOT get swept into the NEEDS_MANUAL_REVIEW
+    hold-for-review branch."""
+    crew_id = _add_crew("CPT")
+    # 05:00-09:15 -> report 04:15, debrief 09:30 (domestic +15min),
+    # FDP 5.25h -- over D2.18's 4h snack threshold, under D25's 6h
+    # meal threshold.
+    flight_id = flight_service.add_flight({
+        "origin": "KHI", "destination": "LHE",
+        "dep_time_planned": dt.datetime(2026, 7, 20, 5, 0),
+        "arr_time_planned": dt.datetime(2026, 7, 20, 9, 15),
+        "domestic": True, "snack_provided": False,
+    })
+
+    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
+
+    assert result.status == "ALLOWED"
+    assert result.legality_status == "WARNING"
+    assert any(a.rule_code == "D2.18_D25_SNACK_REQUIRED" for a in result.alerts)
+    roster_df = assignment_service.get_roster_for_crew(crew_id)
+    assert len(roster_df) == 1  # WARNING still writes, unlike NEEDS_MANUAL_REVIEW
 
 
 def test_roster_crash_before_audit_write_rolls_back_the_roster_insert_too(_patch_engine, monkeypatch):
@@ -843,6 +869,113 @@ def test_find_legal_candidates_only_matches_role(_patch_engine):
 
     assert lm_crew in candidates
     assert cpt_crew not in candidates
+
+
+# ------------------------------------------------------------------
+# find_legal_candidates_for_duty x age-pairing (AE-CREW-PAIR-AGE-001,
+# 2026-08-08) — a candidate is only illegal RELATIVE to whoever really
+# holds the other seat of the target duty; find_legal_candidates_for_duty()
+# reuses _check_crew_pairing_age() (the same call _validate_new_duty()
+# already makes for a real assignment) once per candidate, rather than
+# re-deriving the rule.
+# ------------------------------------------------------------------
+
+def test_find_legal_candidates_excludes_domestic_age_illegal_pairing(_patch_engine):
+    """Real FO occupant is 67. A 67yo CPT candidate would pair BOTH
+    65+ (domestic: illegal only if both are) -- excluded. A young CPT
+    candidate pairs fine -- included."""
+    fo_old = _add_crew("FO", date_of_birth=dt.date(1959, 1, 1))  # 67 in Aug 2026
+    old_candidate = _add_crew("CPT", date_of_birth=dt.date(1959, 1, 1))
+    young_candidate = _add_crew("CPT", date_of_birth=dt.date(1986, 1, 1))  # 40
+
+    target_flight = _add_flight(dt.datetime(2026, 8, 3, 5, 45), dt.datetime(2026, 8, 3, 7, 45))
+    fo_result = assignment_service.assign_crew_to_duty(fo_old, [target_flight], "FO")
+    assert fo_result.status == "ALLOWED"  # no CPT yet -- pending, not blocked
+
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "CPT")
+
+    assert old_candidate not in candidates
+    assert young_candidate in candidates
+
+
+def test_find_legal_candidates_excludes_international_age_illegal_pairing(_patch_engine):
+    """International: illegal if EITHER pilot is 65+ -- even a YOUNG
+    real FO occupant doesn't save a 65+ CPT candidate, unlike domestic."""
+    fo_young = _add_crew("FO", date_of_birth=dt.date(1986, 1, 1))  # 40
+    old_candidate = _add_crew("CPT", date_of_birth=dt.date(1959, 1, 1))  # 67
+    young_candidate = _add_crew("CPT", date_of_birth=dt.date(1990, 1, 1))
+
+    target_flight = _add_flight(dt.datetime(2026, 8, 3, 1, 45), dt.datetime(2026, 8, 3, 3, 30),
+                                 origin="KHI", destination="LHE", domestic=False)
+    fo_result = assignment_service.assign_crew_to_duty(fo_young, [target_flight], "FO")
+    assert fo_result.status == "ALLOWED"
+
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "CPT")
+
+    assert old_candidate not in candidates
+    assert young_candidate in candidates
+
+
+def test_find_legal_candidates_includes_65_plus_when_other_seat_uncovered(_patch_engine):
+    """No real occupant on the other seat at all -- _check_crew_pairing_age()
+    returns 'pending' with no alert (the same false-alarm avoidance the
+    real assignment gate already gets), so a 65+ candidate is NOT
+    excluded just because nobody else is assigned yet."""
+    old_candidate = _add_crew("CPT", date_of_birth=dt.date(1959, 1, 1))  # 67
+
+    target_flight = _add_flight(dt.datetime(2026, 8, 3, 5, 45), dt.datetime(2026, 8, 3, 7, 45))
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "CPT")
+
+    assert old_candidate in candidates
+
+
+def test_find_legal_candidates_includes_candidate_when_other_seats_dob_missing(_patch_engine):
+    """The real other-seat occupant has no recorded date_of_birth --
+    AE-CREW-PAIR-AGE-001_DOB_MISSING (NEEDS_MANUAL_REVIEW), not
+    ILLEGAL, so the candidate stays included. Deliberately the same
+    treatment _check_crew_qualifications()'s own missing-expiry-field
+    case already gets in this function -- not a new asymmetry.
+    Recorded as a known limitation of DownstreamConflict.candidates
+    being a bare List[str] (no room to flag "this candidate is fine,
+    but their would-be partner's data is incomplete") in HANDOVER.md,
+    not a claim the two cases are equivalent."""
+    fo_unknown_dob = _add_crew("FO", date_of_birth=None)
+    candidate = _add_crew("CPT", date_of_birth=dt.date(1986, 1, 1))
+
+    target_flight = _add_flight(dt.datetime(2026, 8, 3, 5, 45), dt.datetime(2026, 8, 3, 7, 45))
+    fo_result = assignment_service.assign_crew_to_duty(fo_unknown_dob, [target_flight], "FO")
+    assert fo_result.status == "ALLOWED"  # pending -- no partner yet, DOB gap alone doesn't block
+
+    candidates = assignment_service.find_legal_candidates_for_duty([target_flight], "CPT")
+
+    assert candidate in candidates
+
+
+def test_downstream_conflict_candidates_exclude_age_illegal_pairing(_patch_engine):
+    """End-to-end through the real caller (_check_downstream_impact()),
+    not just find_legal_candidates_for_duty() in isolation: a
+    downstream-conflict suggestion list must not include a candidate
+    who'd be age-illegal with the future duty's real other-seat
+    occupant."""
+    crew_a = _add_crew("CPT")  # DOB 1980 default -- the one whose ad-hoc duty causes the conflict
+    fo_old = _add_crew("FO", date_of_birth=dt.date(1959, 1, 1))  # 67
+    legal_candidate = _add_crew("CPT", date_of_birth=dt.date(1986, 1, 1))  # 40
+    age_illegal_candidate = _add_crew("CPT", date_of_birth=dt.date(1959, 1, 1))  # 67
+
+    future_flight = _add_flight(dt.datetime(2026, 7, 22, 5, 45), dt.datetime(2026, 7, 22, 7, 45))
+    assert assignment_service.assign_crew_to_duty(crew_a, [future_flight], "CPT").status == "ALLOWED"
+    assert assignment_service.assign_crew_to_duty(fo_old, [future_flight], "FO").status == "ALLOWED"
+
+    # 5h FDP, under the 6h nutrition-review threshold — see the
+    # comment on test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged
+    adhoc_flight = _add_flight(dt.datetime(2026, 7, 21, 14, 45), dt.datetime(2026, 7, 21, 18, 45))
+    result = assignment_service.assign_crew_to_duty(crew_a, [adhoc_flight], "CPT")
+
+    assert len(result.downstream_conflicts) == 1
+    candidates = result.downstream_conflicts[0].candidates
+    assert legal_candidate in candidates
+    assert age_illegal_candidate not in candidates  # both 65+ with fo_old, domestic
+    assert crew_a not in candidates  # excluded — they're the conflicted one
 
 
 # ------------------------------------------------------------------

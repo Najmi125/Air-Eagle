@@ -264,6 +264,37 @@ def parse_role(question: str) -> Optional[str]:
     return None
 
 
+# Mapped to flights.status's actual CHECK-constraint values
+# (migrations/002_flights_table.sql: PLANNED/OPERATED/CANCELLED/
+# DISRUPTED) — not invented values. "delayed"/"diverted" both mean
+# "didn't go as planned but did fly", which is what DISRUPTED already
+# covers; there's no separate DELAYED/DIVERTED status to map to.
+STATUS_KEYWORDS = [
+    ("cancelled", "CANCELLED"),
+    ("delayed", "DISRUPTED"),
+    ("diverted", "DISRUPTED"),
+]
+
+
+def parse_status(question: str) -> Optional[str]:
+    """
+    2026-08-08 fix: previously never called from parse(), so
+    ReportRequest.status_filter stayed None even when a question named
+    a status — "which flights were cancelled in June" correctly routed
+    to flight_records but returned ALL flights in June, not just
+    cancelled ones, since reports.flight_records() already passes
+    status_filter through to flight_service.get_all_flights() and had
+    nothing to pass. Same keyword vocabulary already scored in
+    TEMPLATES["flight_records"]'s positive keywords (cancelled/delayed/
+    diverted) — reused here, not a second list to keep in sync.
+    """
+    q = question.lower()
+    for keyword, status in STATUS_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", q):
+            return status
+    return None
+
+
 def parse_crew(question: str, crew_directory: dict[str, str]) -> tuple[list[str], dict[str, list[str]]]:
     """
     Resolve crew references against the real crew directory
@@ -474,6 +505,7 @@ def parse(
         origin=origin,
         destination=destination,
         flight_no=parse_flight_no(text),
+        status_filter=parse_status(text),
         window_days=window_days,
         resolved=True,
         reason="ok",

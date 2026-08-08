@@ -24,17 +24,13 @@ asks utilization() to compute a rolling PEAK inside that fetched
 range via core/duty_summary.py's calculate_max_rolling_fdp() — a
 different number than the range's own total.
 
-Known, pre-existing gap in query_parser.py (not fixed here — that
-file is already merged and tested, and this piece of work is scoped
-to the report functions, not the parser): parse() never actually
-populates ReportRequest.status_filter, even though "cancelled" /
-"delayed" / "diverted" are scoring keywords for flight_records. A
-question like "which flights were cancelled in June" correctly routes
-to flight_records but currently returns ALL flights in June, not just
-cancelled ones, because request.status_filter stays None. Flagged in
-HANDOVER.md as a follow-up; flight_records() below does pass
-request.status_filter through, so this fixes itself the moment the
-parser starts setting it.
+RESOLVED 2026-08-08: query_parser.py's parse() now populates
+ReportRequest.status_filter via parse_status() — "cancelled" ->
+CANCELLED, "delayed"/"diverted" -> DISRUPTED (flights.status's real
+CHECK-constraint values, migrations/002_flights_table.sql). This file
+needed no change itself: flight_records() below already passed
+request.status_filter through, so the fix was entirely on the parser
+side.
 """
 from __future__ import annotations
 
