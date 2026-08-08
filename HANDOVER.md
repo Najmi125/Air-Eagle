@@ -305,13 +305,18 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **One outstanding branch as of this snapshot (2026-08-04):
+- **One outstanding branch as of this snapshot (2026-08-08):
   `roster-generator-phase7-final` — the roster generator, Phase 7's
   last piece (fills CPT/FO seats on approved rotations via the real
   `assign_crew_to_duty()` gate, writes `PROPOSED` roster rows pending
-  OCC publish). Tests written, traced by hand, NOT yet run against real
-  Postgres — see the dedicated log entry below. Do not merge until the
-  user verifies.**
+  OCC publish). First real-Postgres verification (2026-08-08) found
+  5 failing tests, all tracing to one cause — `meal_provided` was
+  never populated anywhere in the pipeline, so every international
+  rotation (FDP > 6h) permanently hit D25's `NEEDS_MANUAL_REVIEW`
+  gate. Fixed on the same branch (migrations/014 + threading through
+  `services/rotation_template_service.py`/`services/assignment_service.py`
+  — see the dedicated log entry below). NOT yet re-verified against
+  real Postgres. Do not merge until the user verifies 403/403.**
 
 - **Merged into `main`** as of the point this branch was cut. Most
   recent: `rotation-instance-approval-workflow` —
@@ -470,6 +475,26 @@ merge status, rather than repeating it here.
   reachability reasoning already noted above for `core/duty_summary.py`/
   `core/rotation_expansion.py` — its own importer doesn't need to be
   reachable-from-pages itself for it to count.
+- **`Duty.meal_provided` is now real data, not a permanent `None`
+  (migrations/014, 2026-08-08) — see the dedicated log entry below.
+  ASSUMPTION, needs airline validation:** the operator confirmed a meal
+  is provided on every rotation today; `rotation_templates.meal_provided`
+  defaults `TRUE` and is threaded through expansion/approval/ad-hoc
+  Control Room flights into every `Duty`-construction site
+  `services/assignment_service.py` has. If this operational fact ever
+  stops being universally true, it's now a real per-template value to
+  change (`create_new_version(..., meal_provided=False)`), not a
+  hardcoded assumption to hunt down.
+- **`snack_provided` deliberately still stays unset — not an accident,
+  a decision (2026-08-08).** `D2.18_D25_SNACK_REQUIRED` only alerts
+  when `snack_provided is False`; `None` produces no alert, which
+  happens to be harmless today but isn't *correct* the way
+  `meal_provided`'s fix now is. Not wired up because the operator's
+  confirmation was specifically about meals, not snacks — a materially
+  different D2.18/D25 category — and inferring one from the other would
+  be exactly the kind of code-level guess the `meal_provided` fix
+  exists to eliminate. Needs its own explicit operator confirmation
+  before ever being wired up the same way.
 - **`find_legal_candidates_for_duty()` does not check the age-pairing
   rule (AE-CREW-PAIR-AGE-001, Step 7, 2026-08-02).** This function
   powers the downstream-swap candidate suggestions shown when an
@@ -3406,6 +3431,180 @@ predicted — `roster_generator_service.py` is now its first real caller.
 as `core/duty_summary.py`/`core/rotation_expansion.py`). See `Current
 active task` near the top of this file for merge status, not this
 line.
+
+## 2026-08-08: meal_provided data gap — the generator's first real-Postgres
+## finding, fixed on the same branch
+
+The user's own real-Postgres verification of `roster-generator-phase7-final`
+found 5 failing tests, all tracing to one cause: `core/legality/
+pcaa_ano012_core.py`'s D25 rule (`_check_nutrition()`) fires
+`NEEDS_MANUAL_REVIEW` whenever a duty's FDP exceeds 6h and
+`Duty.meal_provided` is `None` — and nothing anywhere in this codebase
+had ever populated that field. Every international rotation (FDP
+10.75h) hit this on both seats, permanently — 16 of 36 real rotations
+per 28 days, 44% of the roster, UNCOVERED. This exact gap was already
+noted as a discovery in this file's 2026-08-01 "Step 2" entry, but its
+consequence for a fully-automated generator (no human in the loop to
+manually override a `NEEDS_MANUAL_REVIEW`) was never followed through
+until the generator itself existed to expose it.
+
+Plan proposed first (schema layer, data flow through expansion/
+approval/assign, the `snack_provided` decision, and — found only
+during planning, not assumed — which existing tests structurally
+depended on the bug being fixed), reviewed and approved by the user,
+who independently re-verified the `D16.2.2` night-duty-window math used
+to redesign one test (see below) before approving. Same branch, new
+commit — this is a fix to that piece's own verification, not separate
+work.
+
+**Root cause, confirmed by reading the code, not assumed**: `Duty.
+meal_provided: Optional[bool] = None` (`core/legality/pcaa_ano012_core.py`
+line 141) is a deliberate tri-state — `None` (unknown, the branch that
+always fired), `False` (confirmed not provided, a real `WARNING`),
+`True` (confirmed provided, silent) — and the rule engine itself is
+correct and untouched by this fix. There are exactly 3 real `Duty(...)`
+construction sites in `services/assignment_service.py`:
+`_load_duty_records_for_crew()` (rebuilds **historical** duties for
+lookback/rest checks — matters just as much as the "new duty" site,
+since `_check_duties()` loops over every duty in the list passed to
+`validate_schedule()`, historical included, so an unfixed historical
+>6h duty would have kept blocking that crew member's future
+assignments indefinitely even after this fix shipped — the subtlest
+part of this piece, confirmed by reading `_check_duties()`'s own loop),
+`_validate_new_duty()` (the new duty being gated, shared by
+`assign_crew_to_duty()`/`assign_crew_to_new_flights()`), and
+`find_legal_candidates_for_duty()`'s inline `candidate_duty`
+construction. None of these had anything from `flights` to feed
+`meal_provided` — the column didn't exist anywhere in the schema.
+
+**Operator-confirmed (2026-08-08): a meal is provided on every
+rotation, today.** Recorded as DATA (migration 014), not a code
+default — hardcoding `True` in the rule engine itself would silently
+defeat D25 for a future rotation where a meal genuinely isn't provided.
+`rotation_templates.meal_provided BOOLEAN NOT NULL DEFAULT TRUE` is the
+source of truth, one value per template *version* (not per leg — meal
+provision is a whole-duty operational fact in this airline's own
+framing, "provided on every rotation," not a per-leg one the way
+`domestic` genuinely can be). Broadcast onto every `rotation_instance_
+legs` row at expansion time (`expand_and_persist()`, same denormalize-
+at-expansion-time treatment `domestic`/`flight_no` already get — an
+already-expanded instance keeps the value that was true when expanded,
+not a later template version's edit) and from there onto every
+promoted `flights` row at `approve_instance()` time. `flights.
+meal_provided` is the column every `Duty`-construction site actually
+reads (via `get_flight()`'s `SELECT *`); an ad-hoc Control Room flight
+that omits it falls back to this column's own `DEFAULT TRUE`.
+`create_template()`/`create_new_version()` gained a **required**
+`meal_provided: bool` parameter — no Python default, mirroring the
+column's own `NOT NULL` intent at the call-site level, the same way
+`rotation_code`/`effective_from` already have none.
+
+**Every Duty-construction site now aggregates `meal_provided` the same
+way `domestic` already was** (`all(bool(f["meal_provided"]) for f in
+flights)`, reusing an existing pattern rather than inventing a new
+one) — a duty only "had a meal provided" if every leg genuinely did.
+`assign_crew_to_new_flights()`'s pre-insert version needed one extra
+deliberate detail: `flights_data` are plain caller-supplied dicts that
+may omit the key entirely (nothing in the DB yet), so its computation
+explicitly defaults missing entries to `True`
+(`f.get("meal_provided", True)`) — this function gates legality
+*before* any write happens, so the in-memory computation has to mirror
+`flights.meal_provided`'s own `DEFAULT TRUE`, or the pre-insert gate
+and the post-insert reality would silently disagree.
+
+**`snack_provided` — a deliberate decision, not left an accident.**
+Not wired up. `D2.18` only alerts when `snack_provided is False`;
+`None` produces no alert, harmless today but not *correct* the way
+`meal_provided` now is. The operator's confirmation was specifically
+about meals; inferring a snack is therefore also provided would be
+guessing at a legally distinct D2.18/D25 category never actually
+asked about — exactly the kind of assumption this fix exists to
+eliminate for `meal_provided`. Recorded as an explicit, visible open
+item (see `Open stubs`), not silently left as today's accidental
+non-alert.
+
+**A real, necessary test redesign, not a find-replace** — caught
+during planning, not discovered mid-implementation: several tests in
+`tests/test_assignment_service.py` deliberately used the *bug itself*
+(an unset-meal >6h duty) as their real-rule `NEEDS_MANUAL_REVIEW`
+trigger. Once `meal_provided` is `NOT NULL` everywhere,
+`D25_NUTRITION_DATA_MISSING` becomes structurally unreachable through
+the real API — correct, that's the fix — so these needed a genuinely
+different real trigger, not deletion or a mock (this codebase tests
+against the real rule engine, not synthetic/mocked triggers, per this
+file's own established discipline):
+- `test_needs_manual_review_does_not_write_and_returns_needs_review_status`,
+  `test_needs_manual_review_still_reports_computed_duty_times`,
+  `test_needs_manual_review_writes_audit_record_with_held_action_type`,
+  `test_needs_manual_review_via_control_room_saves_neither_flight_nor_
+  assignment`: switched to a missing crew qualification-expiry field
+  (`_add_crew("CPT", license_expiry=None)` →
+  `AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING`) — a real, already-
+  implemented, static trigger fully decoupled from nutrition data.
+  Arguably better than before: no longer accidentally dependent on the
+  very gap this piece fixes.
+- `test_delay_recompute_flags_needs_review_when_no_longer_legal` was
+  harder: it specifically needs "legal at assignment time, flips to
+  `NEEDS_MANUAL_REVIEW` because a delay made the duty longer" — a
+  missing qualification field can't do that (static, not duration-
+  dependent, would fail the test's own first assertion). Found a real,
+  still-reachable, duration-sensitive alternative:
+  `D16.2.2_NIGHT_DUTY_OVER_10H_FRM_REQUIRED` (`has_approved_frm`
+  defaults `False`, never overridden by this codebase's module-level
+  `validator = ANO012CoreValidator()`) — fires when a duty's local time
+  overlaps 02:00-04:59 and FDP exceeds 10h. Verified directly against
+  the real validator in the interpreter before being locked in (same
+  discipline as the EPE 786/787 grounding numbers): report 19:00 UTC
+  2026-07-20 (local 00:00 on 2026-07-21, UTC+5) with a short initial
+  arrival stays `LEGAL` with zero alerts; delaying `arr_time_actual` to
+  2026-07-21 05:15 grows the duty to exactly 10.5h (630 min) whose
+  local span now overlaps 02:00-04:59, firing `NEEDS_MANUAL_REVIEW` via
+  `D16.2.2` alone (no other alert), confirmed comfortably under this
+  band's own 660-minute (11h), 1-sector D8.2.1 ceiling — the same
+  "don't also trip a bigger rule" constraint the original test already
+  needed. The user independently re-verified this exact window (the
+  overnight band's 11h cap and D16.2.2's 10h floor) before approving.
+- `test_warning_only_status_still_allowed_and_written` and
+  `test_adhoc_assignment_that_breaks_future_scheduled_duty_is_flagged`:
+  no functional change — both already avoided the >6h/D25 trigger by
+  design; only stale docstring prose updated (both cited D25/meal-data
+  as their reasoning, now inaccurate).
+- `_seed_duty()` (the direct-SQL history-seeding helper, ~10 call
+  sites) and its docstring's framing of D25 as *the* reason an 8h+
+  prior duty couldn't go through the real API: left alone, deliberately
+  — legitimate test infrastructure independent of this bug; the
+  docstring becomes slightly imprecise but not wrong enough to justify
+  auditing ~10 call sites for a fix that isn't about test
+  infrastructure.
+
+**Files**: `migrations/014_meal_provided_columns.sql` (new).
+`services/rotation_template_service.py` (`create_template()`/
+`create_new_version()` gain required `meal_provided`;
+`expand_and_persist()`/`approve_instance()` thread it through).
+`services/flight_service.py` (`meal_provided` added to
+`UPDATABLE_FIELDS`, deliberately not `REQUIRED_FIELDS`).
+`services/assignment_service.py` (all 3 `Duty`-construction sites plus
+both `_validate_new_duty()` callers). `core/legality/pcaa_ano012_core.py`:
+untouched, confirmed correct as-is. `tests/test_rotation_template_
+service.py` (8 call sites via 2 helpers + direct calls) and `tests/
+test_roster_generator_service.py` (2 helpers) updated to pass
+`meal_provided=True`. `tests/test_assignment_service.py`: the redesign
+above.
+
+**Verification status**: full local suite collection clean (no
+`TEST_DATABASE_URL` in this sandbox, same as every DB-integration piece
+this session) — see "Run full suite + reachability check" in the
+current task list for the exact numbers. The `D16.2.2` scenario was
+additionally run directly against the real validator (bypassing the DB
+entirely, pure `core/legality` logic) confirming the exact predicted
+transition: `LEGAL` (zero alerts) → `NEEDS_MANUAL_REVIEW` via
+`D16.2.2_NIGHT_DUTY_OVER_10H_FRM_REQUIRED` alone, FDP 630 min. Not yet
+re-verified against real Postgres — acceptance criterion is 403/403,
+plus the user specifically checking the least-covered consequence: a
+crew member with an existing >6h historical duty in their lookback
+window should no longer be permanently blocked from new assignments.
+See `Current active task` near the top of this file for merge status,
+not this line.
 
 **Explicitly out of scope, same as the plan**: any UI (review,
 trigger, template management). Re-optimization or changing an existing

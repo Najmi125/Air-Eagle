@@ -49,10 +49,12 @@ def _patch_engine(_patch_all_service_engines):
     return _patch_all_service_engines
 
 
-def _create_domestic_template(effective_from=dt.date(2026, 1, 1), effective_until=None):
+def _create_domestic_template(effective_from=dt.date(2026, 1, 1), effective_until=None,
+                               meal_provided=True):
     return rts.create_template(
         rotation_code="EPE-786-787", days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
-        effective_from=effective_from, effective_until=effective_until,
+        effective_from=effective_from, meal_provided=meal_provided,
+        effective_until=effective_until,
         description="KHI-LHE-KHI domestic",
     )
 
@@ -77,7 +79,7 @@ def test_create_new_version_closes_prior_version_and_sets_superseded_by(_patch_e
     v1_id = _create_domestic_template(effective_from=dt.date(2026, 1, 1))
     v2_id = rts.create_new_version(
         rotation_code="EPE-786-787", days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
-        effective_from=dt.date(2026, 9, 1),
+        effective_from=dt.date(2026, 9, 1), meal_provided=True,
     )
 
     versions = rts.get_versions("EPE-786-787")
@@ -96,7 +98,7 @@ def test_create_new_version_without_an_open_version_raises(_patch_engine):
     with pytest.raises(ValueError, match="No open version"):
         rts.create_new_version(
             rotation_code="DOES-NOT-EXIST", days_of_week=DOMESTIC_DAYS,
-            legs=DOMESTIC_LEGS, effective_from=dt.date(2026, 9, 1),
+            legs=DOMESTIC_LEGS, effective_from=dt.date(2026, 9, 1), meal_provided=True,
         )
 
 
@@ -166,7 +168,7 @@ def test_different_rotation_codes_never_conflict(_patch_engine):
     _create_domestic_template(effective_from=dt.date(2026, 1, 1))
     rts.create_template(
         rotation_code="EPE-802-805", days_of_week=[2, 4, 5, 6],
-        legs=DOMESTIC_LEGS, effective_from=dt.date(2026, 1, 1),
+        legs=DOMESTIC_LEGS, effective_from=dt.date(2026, 1, 1), meal_provided=True,
     )
     assert len(rts.get_versions("EPE-786-787")) == 1
     assert len(rts.get_versions("EPE-802-805")) == 1
@@ -234,7 +236,7 @@ def test_rotation_templates_cannot_reopen_or_re_close_effective_until(_patch_eng
     v1_id = _create_domestic_template(effective_from=dt.date(2026, 1, 1))
     rts.create_new_version(
         rotation_code="EPE-786-787", days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
-        effective_from=dt.date(2026, 9, 1),
+        effective_from=dt.date(2026, 9, 1), meal_provided=True,
     )
     with pytest.raises(DatabaseError):
         with engine.begin() as conn:
@@ -293,7 +295,7 @@ def test_expand_and_persist_after_new_version_only_adds_forward_never_touches_ex
     # second real rotation shape.
     rts.create_new_version(
         rotation_code="EPE-786-787", days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
-        effective_from=dt.date(2026, 8, 10),
+        effective_from=dt.date(2026, 8, 10), meal_provided=True,
     )
 
     second_batch = rts.expand_and_persist("EPE-786-787", dt.date(2026, 8, 3), dt.date(2026, 8, 14))
@@ -493,7 +495,7 @@ def test_create_template_rejects_leg_with_missing_flight_no(_patch_engine):
     with pytest.raises(ValueError, match="flight_no"):
         rts.create_template(
             rotation_code="BAD-ROTATION", days_of_week=[1], legs=bad_legs,
-            effective_from=dt.date(2026, 1, 1),
+            effective_from=dt.date(2026, 1, 1), meal_provided=True,
         )
     assert rts.get_versions("BAD-ROTATION").empty
 

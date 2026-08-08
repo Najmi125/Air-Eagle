@@ -77,7 +77,8 @@ def _add_crew(role, dob=_YOUNG_DOB, **overrides):
 def _make_domestic_instances(date_from, date_to, rotation_code="EPE-786-787"):
     rts.create_template(
         rotation_code=rotation_code, days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
-        effective_from=dt.date(2026, 1, 1), description="KHI-LHE-KHI domestic",
+        effective_from=dt.date(2026, 1, 1), meal_provided=True,
+        description="KHI-LHE-KHI domestic",
     )
     created = rts.expand_and_persist(rotation_code, date_from, date_to)
     for instance_id in created:
@@ -88,7 +89,8 @@ def _make_domestic_instances(date_from, date_to, rotation_code="EPE-786-787"):
 def _make_international_instances(date_from, date_to, rotation_code="EPE-802-805"):
     rts.create_template(
         rotation_code=rotation_code, days_of_week=INTERNATIONAL_DAYS, legs=INTERNATIONAL_LEGS,
-        effective_from=dt.date(2026, 1, 1), description="KHI-LHE-DWC-KHI international",
+        effective_from=dt.date(2026, 1, 1), meal_provided=True,
+        description="KHI-LHE-DWC-KHI international",
     )
     created = rts.expand_and_persist(rotation_code, date_from, date_to)
     for instance_id in created:

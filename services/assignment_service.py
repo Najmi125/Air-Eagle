@@ -255,7 +255,7 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
                r.role_assigned, f.flight_id,
                COALESCE(f.dep_time_actual, f.dep_time_planned) AS dep_time,
                COALESCE(f.arr_time_actual, f.arr_time_planned) AS arr_time,
-               f.origin, f.destination
+               f.origin, f.destination, f.meal_provided
         FROM roster r
         JOIN flights f ON r.flight_id = f.flight_id
         WHERE r.crew_id = :crew_id AND r.status != 'CANCELLED'
@@ -281,6 +281,13 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
                    origin=row["origin"], destination=row["destination"])
             for _, row in group.iterrows()
         ]
+        # meal_provided aggregated across every flight in this duty,
+        # same all()-of-the-legs pattern already used for `domestic`
+        # elsewhere in this file (e.g. assign_crew_to_duty()) — a duty
+        # only "had a meal provided" if every leg genuinely did.
+        # flights.meal_provided is NOT NULL (migrations/014), so this
+        # is always a real True/False, never the None that used to
+        # silently trip D25 for every rebuilt historical duty.
         duty = Duty(
             duty_type=DutyType.FDP,
             start_utc=first["report_time"],
@@ -290,6 +297,7 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
             report_location=sectors[0].origin,
             home_base=home_base or "",
             sectors=sectors,
+            meal_provided=bool(group["meal_provided"].all()),
         )
         records.append({
             "duty": duty,
@@ -484,12 +492,19 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
 
 
 def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str,
-                        flight_ids: Optional[List[int]] = None):
+                        meal_provided: bool, flight_ids: Optional[List[int]] = None):
     """
     Shared validation core for both assign_crew_to_duty() (assigning
     to flights that already exist) and assign_crew_to_new_flights()
     (Control Room's atomic flight+assignment). Builds the duty, loads
     the crew member's existing history, validates — writes nothing.
+
+    meal_provided: required, no default, same footing as the existing
+    `domestic` parameter — both callers compute it the same way, from
+    the flights that make up this duty (migrations/014, 2026-08-08).
+    core/legality/pcaa_ano012_core.py's D25 rule fires NEEDS_MANUAL_REVIEW
+    for any FDP over 6h whose meal_provided is unknown; this is what
+    finally gives it real data instead of the dataclass default.
 
     Enforces role_assigned == crew_row["role"] (case-normalized).
     This is a real, confirmed fix, not defensive boilerplate: without
@@ -540,6 +555,7 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
         home_base=crew_row["base"] or "",
         sectors=[Sector(departure_utc=l.dep_time, arrival_utc=l.arr_time,
                          origin=l.origin, destination=l.destination) for l in legs],
+        meal_provided=meal_provided,
     )
 
     if crew_row["role"] in FTL_EXEMPT_ROLES:
@@ -637,6 +653,12 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     # only affects which buffer applies to the duty as a whole.
     domestic = all(bool(f["domestic"]) for f in flights)
 
+    # Same all()-of-the-legs aggregation as `domestic` above — a duty
+    # only "had a meal provided" if every leg genuinely did.
+    # flights.meal_provided is NOT NULL (migrations/014), so this is
+    # always a real True/False.
+    meal_provided = all(bool(f["meal_provided"]) for f in flights)
+
     legs = [
         FlightLeg(
             dep_time=f["dep_time_actual"] if pd.notna(f["dep_time_actual"]) else f["dep_time_planned"],
@@ -647,7 +669,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     ]
 
     validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
-        engine, crew_id, legs, domestic, role_assigned, flight_ids=flight_ids)
+        engine, crew_id, legs, domestic, role_assigned, meal_provided, flight_ids=flight_ids)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -798,6 +820,15 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     # whole duty international for D7.1.2 buffer purposes.
     domestic = all(bool(f["domestic"]) for f in flights_data)
 
+    # flights_data are plain caller-supplied dicts, not yet-inserted
+    # rows — a caller may omit the key entirely. Default True here
+    # explicitly (not just bool(None)=False) to mirror flights.
+    # meal_provided's own DEFAULT TRUE: this function gates legality
+    # BEFORE any DB write happens, so the pre-insert computation here
+    # must agree with what the row will actually end up holding once
+    # written, or the gate and the stored data would silently disagree.
+    meal_provided = all(bool(f.get("meal_provided", True)) for f in flights_data)
+
     legs = [
         FlightLeg(dep_time=f["dep_time_planned"], arr_time=f["arr_time_planned"],
                   origin=f["origin"], destination=f["destination"])
@@ -805,7 +836,7 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     ]
 
     validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
-        engine, crew_id, legs, domestic, role_assigned, flight_ids=None)
+        engine, crew_id, legs, domestic, role_assigned, meal_provided, flight_ids=None)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -1027,6 +1058,8 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     # Same duty-level classification rule as assign_crew_to_duty() —
     # any international sector makes the whole duty international.
     domestic = all(bool(f["domestic"]) for f in flights)
+    # Same all()-of-the-legs aggregation as `domestic` above.
+    meal_provided = all(bool(f["meal_provided"]) for f in flights)
     legs = [FlightLeg(
         dep_time=f["dep_time_actual"] if pd.notna(f["dep_time_actual"]) else f["dep_time_planned"],
         arr_time=f["arr_time_actual"] if pd.notna(f["arr_time_actual"]) else f["arr_time_planned"],
@@ -1065,6 +1098,7 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
             home_base=crew_row["base"] or "",
             sectors=[Sector(departure_utc=l.dep_time, arrival_utc=l.arr_time,
                              origin=l.origin, destination=l.destination) for l in legs],
+            meal_provided=meal_provided,
         )
 
         lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
