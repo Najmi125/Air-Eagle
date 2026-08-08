@@ -305,19 +305,24 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **One outstanding branch as of this snapshot (2026-08-08):
-  `open-stubs-cleanup-2026-08-08`** — four operator decisions from
-  `Open stubs`, implemented as one piece: `snack_provided` wired up
-  exactly like `meal_provided` (migration 015, operator-confirmed);
-  `reactivate_crew()` settled as NOT needed (documentation only, no
-  code); age-pairing added to `find_legal_candidates_for_duty()`
-  (reuses `_check_crew_pairing_age()` per candidate, no new function);
+- **No outstanding branches as of this snapshot (2026-08-08).
+  `open-stubs-cleanup-2026-08-08` merged into `main`** — four operator
+  decisions from `Open stubs`, implemented as one piece: `snack_provided`
+  wired up exactly like `meal_provided` (migration 015,
+  operator-confirmed); `reactivate_crew()` settled as NOT needed
+  (documentation only, no code); age-pairing added to
+  `find_legal_candidates_for_duty()` (reuses `_check_crew_pairing_age()`
+  per candidate, no new function — plan-moded per the operator's own
+  instruction, approved with a refinement on the missing-DOB case, now
+  recorded as a known `DownstreamConflict.candidates` limitation);
   `query_parser.parse()` now populates `ReportRequest.status_filter`.
-  Plus a record correction: the Supabase migration-status Open Stubs
-  entry was stale (see that entry's own 2026-08-08 correction). See
-  the dedicated log entry below for full detail. Tests written, not
-  yet run against real Postgres — no `TEST_DATABASE_URL` in this
-  sandbox. Do not merge until the user verifies.
+  Plus a record correction: the Supabase migration-status `Open stubs`
+  entry was stale (see that entry's own 2026-08-08 correction). 415/415
+  verified against real Postgres 16, first run, zero failures. The user
+  additionally re-tested the age-pairing behavior directly beyond the
+  test suite (domestic/international discrimination, the "pending"
+  silent case) and confirmed it matches the design exactly. See the
+  dedicated log entry below for full detail.
 
 - **Merged into `main` before that**: `roster-generator-phase7-final`
   — Phase 7's last piece, the roster generator (fills CPT/FO seats on approved
