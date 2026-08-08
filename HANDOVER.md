@@ -305,9 +305,21 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-08).
-  `open-stubs-cleanup-2026-08-08` merged into `main`** — four operator
-  decisions from `Open stubs`, implemented as one piece: `snack_provided`
+- **One outstanding branch as of this snapshot (2026-08-08):
+  `query-parser-refusal-and-date-fixes`** — operator scope decision
+  (the OCC assistant generates tables only, never a legality/decision
+  answer, superseding any earlier general-assistant framing) plus
+  real-Postgres-tested `query_parser.py` fixes: a decision-question
+  refusal layer (5 confirmed wrong-template cases), DD-MM-YYYY/DD/MM/YYYY
+  date ranges, bare "N days", plural role words, two wrong-semantics
+  date bugs ("since"/"before"), and a `utilization` keyword gap. See
+  the dedicated log entry below. 191 passed, 252 skipped locally, zero
+  import errors. Not yet run against real Postgres for THIS piece — no
+  `TEST_DATABASE_URL` in this sandbox. Do not merge until the user
+  verifies.
+
+- **Merged into `main` before that**: `open-stubs-cleanup-2026-08-08`
+  — four operator decisions from `Open stubs`, implemented as one piece: `snack_provided`
   wired up exactly like `meal_provided` (migration 015,
   operator-confirmed); `reactivate_crew()` settled as NOT needed
   (documentation only, no code); age-pairing added to
@@ -3965,3 +3977,108 @@ re-run: unchanged (still exactly `services/assistant/reports.py` and
 this piece). Not yet run against real Postgres — no `TEST_DATABASE_URL`
 here. See `Current active task` near the top of this file for merge
 status, not this line.
+
+## 2026-08-08 (continued): OCC assistant scope settled to tables-only,
+## plus query_parser.py fixes found by testing 16 realistic questions
+## against real Postgres
+
+Branch `query-parser-refusal-and-date-fixes`, off `main` at the Open
+Stubs cleanup merge point. The user tested `query_parser.py` against
+16 realistic OCC shift questions on real Postgres: 9 reporting
+questions routed correctly, but 5 decision-shaped ones resolved
+CONFIDENTLY to the wrong template and returned a plausible-looking
+table that didn't answer them, and testing surfaced several date-
+parsing gaps the same way. **Operator scope decision, off the back of
+that finding: the assistant generates tables only. It must never
+answer a legality or decision question — supersedes any earlier
+framing of this as a general OCC assistant** (the module docstring
+already said "not an advisor" from 2026-08-01, but this makes it an
+explicit, enforced boundary, not just a design rationale).
+
+**1. Decision-question refusal layer.** New `is_decision_question()`,
+checked in `parse()` before `score_templates()` runs at all —
+unconditionally, so a decision-shaped question that also happens to
+reference a D-section (`SECTION_RE`'s own regulation-lookup boost)
+still refuses rather than winning on that boost. Confirmed wrong-
+template cases, now refused instead:
+- "who can fly tonight's 786" (was `crew_duty_history`)
+- "is Waqar legal for tomorrow" (was `crew_duty_history`)
+- "the 802 is delayed 3 hours, who's still legal" (was `utilization`)
+- "Tahir called in sick, who can replace him Thursday" (was `crew_duty_history`)
+- "what happens if I swap Shahbaz onto Friday" (was `crew_duty_history`)
+
+Keywords (`can`, `could`, `should`, `legal`, `replace`, `swap`, `what
+if`) are matched with `\b...\b` word boundaries deliberately, not a
+plain substring check the way `score_templates()` itself works: a bare
+substring check on "can" would also match inside "cancelled" (a real,
+legitimate `flight_records` keyword — "which flights were cancelled in
+June" must not be refused), and a bare "legal" would match inside
+"illegal" (`audit_compliance`'s own real keyword). Verified directly in
+the interpreter against every existing test phrasing in this file
+before landing the list, then pinned as a permanent regression test
+(`test_reporting_questions_sharing_vocabulary_are_not_falsely_refused`)
+covering one phrasing from each of the 7 templates. The refusal message
+redirects to the Roster page ("it runs the real legality check") and
+sets `unmatched_text`, same as every other unresolved path — logged for
+tuning, not silently dropped.
+
+**2. Parser gaps, all found by the same real-question testing:**
+- **DD-MM-YYYY / DD/MM/YYYY date ranges** ("01-07-2026 to 31-07-2026",
+  "01/07/2026 - 31/07/2026") — the format the operator's own filename
+  spec uses; only ISO ranges parsed before. Structurally distinct from
+  the ISO regex (4-digit year LAST here, not first), so no ambiguity
+  between the two regardless of check order.
+- **Bare "N days"** ("expiring 60 days" / "expiring in 60 days", no
+  next/last/past qualifier) — direction now depends on the
+  already-resolved template (`parse_dates()` gained a `template`
+  parameter, passed from `parse()`'s own `best_name`, which is already
+  known by the time `parse_dates()` is called): forward for
+  `crew_qualifications`, since document expiry is inherently a future
+  concept; backward (rolling lookback, matching "last N days") for
+  every other template, matching the dominant N-day concept elsewhere
+  in this domain — D9.1.x/D9.2.x's own cumulative checks are rolling
+  LOOKBACK windows, not forward projections. Documented in
+  `parse_dates()`'s own docstring, per the "your call, but document
+  which" instruction.
+- **Plural role words** ("all captains" didn't set role; "all FO"
+  happened to work only because FO's own plural looks identical).
+  `parse_role()`'s `\b...\b` match required the exact singular form —
+  fixed generically with `s?` on every keyword, not a special case for
+  "captain" alone, since the same gap existed for loadmasters/engineers
+  too.
+- **Two wrong-semantics date bugs, both silently returning a confident
+  table for the wrong period** — the higher-severity class of bug here,
+  since neither failed honestly:
+  - `"since 1 july"` returned the FULL month (1-31 July) instead of
+    1 July -> today. The bare-month-name fallback matched "july" and
+    ignored both "since" and the day number entirely. Fixed with a
+    `since\s+(\d{1,2})\s+([a-z]+)` check placed before that fallback.
+  - `"before august"` returned August's own 1-31 range instead of
+    everything up to 31 July. Fixed with a `before\s+([a-z]+)` check
+    resolving to `(None, <end of the PRIOR month>, None)` — "everything,
+    no lower bound" through the day before the named month starts,
+    including December/January year-wraparound.
+- **`utilization` keyword gap**: "how close is Waqar to his 1000 hour
+  limit" resolved ambiguously — `utilization`'s own `"hours"` keyword
+  is plural and doesn't match this singular phrasing. Added `"hour
+  limit"` as a new positive keyword.
+
+**Files**: `services/assistant/query_parser.py` (all of the above;
+module docstring updated to record the tables-only scope decision
+explicitly). `tests/test_query_parser.py` (28 new tests: 5 for the
+refusal cases, 9 regression-checking existing template-routing
+phrasings aren't falsely refused, 2 for DD-MM-YYYY ranges, 4 for bare
+N-days, 3 for since/before — including both wrong-semantics cases
+pinned as permanent regressions, per the "add tests for each,
+including the two wrong-semantics cases specifically as regressions"
+instruction — 4 for plural roles, 1 for the hour-limit keyword).
+
+**Verification status**: full local suite — 443 total (was 415),
+191 passed (was 163), 252 skipped, zero import errors.
+`scripts/check_reachability.py` re-run: unchanged, no new files. Every
+fix verified directly in the interpreter against both the reported-
+broken phrasing and the existing "must still work" phrasings before
+being written up as a test, same discipline as every prior piece this
+session. Not yet run against real Postgres for this piece specifically
+— no `TEST_DATABASE_URL` in this sandbox. See `Current active task`
+near the top of this file for merge status, not this line.
