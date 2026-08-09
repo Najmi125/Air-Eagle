@@ -305,9 +305,22 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-08).
-  `query-parser-refusal-and-date-fixes` merged into `main`** —
-  operator scope decision (the OCC assistant generates tables only,
+- **One outstanding branch as of this snapshot (2026-08-08):
+  `assistant-page-ui`** — `pages/5_Assistant.py`, the OCC assistant's
+  UI, first page to call `query_parser.parse()`/`reports.run_report()`.
+  Presentation only, no new service logic. Interpretation always
+  renders before results (including on an empty result — a controller
+  most needs to see what was understood exactly when nothing came
+  back). Editable date range (session-state only, no DB, no
+  "persist to survive refresh" — this is a transient UI query result,
+  not operational data). `services/assistant/reports.py` confirmed no
+  longer flagged by `check_reachability.py`; `services/roster_
+  generator_service.py` stays flagged, unrelated. 12 new `AppTest`
+  tests, all correctly skipped locally (no `TEST_DATABASE_URL`). See
+  the dedicated log entry below. Do not merge until the user verifies.
+
+- **Merged into `main` before that**: `query-parser-refusal-and-date-fixes`
+  — operator scope decision (the OCC assistant generates tables only,
   never a legality/decision answer, superseding any earlier
   general-assistant framing) plus real-Postgres-tested
   `query_parser.py` fixes: a decision-question refusal layer (5
@@ -522,17 +535,17 @@ merge status, rather than repeating it here.
   for the bare-"N days" direction fix (2026-08-08) — the same
   "already-resolved template informs date parsing" mechanism would
   apply here too.
-- `scripts/check_reachability.py`, re-run on the
-  `roster-generator-phase7-final` branch (2026-08-04): now flags exactly
-  two files, `services/assistant/reports.py` (unchanged — still no
-  assistant UI page) and `services/roster_generator_service.py` (no
-  Phase 7 piece has UI yet, so nothing under `pages/` calls the
-  generator). `services/rotation_template_service.py` is NO LONGER
-  flagged, as expected — `services/roster_generator_service.py` is now
-  its first real caller (`get_instances()`/`get_promoted_flight_ids()`).
-  `core/roster_generation.py` was never flagged either, same one-hop
-  reachability reasoning already noted above for `core/duty_summary.py`/
-  `core/rotation_expansion.py` — its own importer doesn't need to be
+- `scripts/check_reachability.py`, re-run on the `assistant-page-ui`
+  branch (2026-08-08): now flags exactly ONE file,
+  `services/roster_generator_service.py` (no Phase 7 piece has UI yet,
+  so nothing under `pages/` calls the generator). `services/assistant/
+  reports.py` is NO LONGER flagged — `pages/5_Assistant.py` is now its
+  first real caller, closing a gap open since 2026-08-01. `services/
+  rotation_template_service.py` also stays unflagged (already fixed
+  2026-08-04, unrelated to this piece). `core/roster_generation.py`
+  was never flagged either, same one-hop reachability reasoning
+  already noted above for `core/duty_summary.py`/`core/rotation_
+  expansion.py` — its own importer doesn't need to be
   reachable-from-pages itself for it to count.
 - **RESOLVED 2026-08-08 — no `reactivate_crew()` in `services/
   crew_service.py`, and it stays that way.** Found 2026-08-08 tracing
@@ -4112,3 +4125,95 @@ rolling 365-day limit against.
 
 See `Current active task` near the top of this file for merge status,
 not this line.
+
+## 2026-08-08 (continued): pages/5_Assistant.py — the OCC assistant's
+## UI, the first page to call query_parser.py/reports.py
+
+Branch `assistant-page-ui`, off `main` at the query-parser fixes merge
+point. Plan-moded first (the user's own instruction). Presentation
+only, as scoped — no changes to `query_parser.py`/`reports.py`/
+`reporting.py`; everything the page needs already existed and was
+already tested.
+
+**The hard requirement, verified working, not just built**: the
+interpretation (template, crew resolved to real names, date range,
+role, status, route, flight number — extended slightly past the
+user's own named list, since a misread airport code is exactly as
+dangerous as a misread month) renders unconditionally before the
+results, INCLUDING when the result is empty — confirmed directly via
+`AppTest`, checking actual element order (`at.main`'s DOM order), not
+just presence, since ordering was the actual requirement, not
+existence.
+
+**Three additions from plan review, all implemented**:
+1. Interpretation shown before "no matching records," not only before
+   a populated table — pinned as its own test
+   (`test_empty_result_still_shows_interpretation_before_no_matching_records`).
+2. Editable date range — the shown range can be corrected without
+   retyping the whole question. Implemented with page-level
+   `st.session_state` only (this page's first use anywhere in the
+   repo): `dataclasses.replace()` on the resolved `ReportRequest`
+   swaps in the edited dates while leaving crew/role/route untouched,
+   clearing `window_days` deliberately (it's tied to the ORIGINAL
+   relative phrasing — "last 28 days" — and keeping it after the range
+   no longer matches that phrase would silently compute a rolling peak
+   against a window nobody asked for). A code comment at the
+   `session_state` initialization explicitly distinguishes this from
+   the project's own hard lesson ("session_state lost unassigned count
+   on refresh -> persist unassigned duties in DB, session state is
+   demo-only") — that lesson is about OPERATIONAL data the system is
+   responsible for; this holds a transient UI query result that costs
+   nothing to lose on refresh. Written in so a future session doesn't
+   "fix" this by persisting query results to the database.
+3. Not fixed, by design: `regulation` has no date dimension at all
+   (keyed by D-section only), so the editable-date section is skipped
+   for it specifically — confirmed via `at.date_input` count == 0 on a
+   regulation question.
+
+**A real Streamlit bug found and fixed during implementation, not
+assumed away**: `st.date_input`'s `value=` parameter is only honored
+the FIRST time a given `key` is rendered — confirmed directly via
+`AppTest` (a widget re-rendered with a NEW `value=` under the SAME key
+kept showing the OLD value). Without a fix, asking a second, different
+question would have silently left the date_input widgets showing the
+FIRST question's stale dates — which the "did the user edit this"
+diff check would then have mistaken for a manual edit and used to
+silently overwrite the SECOND question's correctly-parsed dates with
+the first question's. Fixed with a `assistant_generation` counter in
+`st.session_state`, incremented on every newly-submitted question and
+included in the date_input `key`s (`f"edit_date_from_{gen}"`) — a
+fresh generation forces fresh widgets (and therefore the real new
+default) on every new question, while edits WITHIN one question's
+result still persist normally via the same key. Verified directly:
+asking "last week" then "last month" now correctly shows July dates on
+the second question, not stale August dates from the first.
+
+**Files**: `pages/5_Assistant.py` (new). `tests/test_assistant_page.py`
+(new, 12 tests, `AppTest` pattern matching `test_roster_page.py`/
+`test_control_room_page.py` — real crew/flight/roster data seeded via
+the actual services, dates computed relative to the real "today" the
+test runs on rather than hardcoded, since the page has no injectable
+`today` the way `query_parser.parse()` itself does).
+
+**Verification status**: full local suite — 191 passed, 264 skipped
+(was 252 — +12, all new, all correctly skipped, no `TEST_DATABASE_URL`
+in this sandbox), zero import errors. Every branch (resolved/empty/
+refusal/ambiguous-crew/ambiguous-template/unparseable/regulation-
+passthrough/date-edit/generation-counter-fix) additionally verified
+directly via `AppTest` with mocked `crew_service.get_all_crew()`/
+`reports.run_report()` before being written up as a formal test — same
+"verify via direct execution before asserting" discipline used
+throughout this session, here necessarily via mocks rather than a real
+DB (this sandbox's real `DATABASE_URL` — separate from the
+test-only-gated `TEST_DATABASE_URL` — turned out to be genuinely
+configured and reachable, confirmed when an early ad-hoc, unmocked
+`AppTest` run made a real ~4s round-trip to it; every check after that
+discovery used mocks specifically to avoid further, unnecessary
+contact with a real database from ad-hoc scripts outside the
+`TEST_DATABASE_URL`-gated fixture path).
+`scripts/check_reachability.py` re-run: `services/assistant/reports.py`
+confirmed no longer flagged; `services/roster_generator_service.py`
+is the only file still flagged, unrelated to this piece. Not yet run
+against real Postgres — no `TEST_DATABASE_URL` here. See `Current
+active task` near the top of this file for merge status, not this
+line.
