@@ -71,6 +71,12 @@ _QUALIFICATION_DEFAULTS = {
     "sim_expiry": _FAR_FUTURE_EXPIRY, "route_check_expiry": _FAR_FUTURE_EXPIRY,
     "ir_expiry": _FAR_FUTURE_EXPIRY, "sep_expiry": _FAR_FUTURE_EXPIRY,
     "crm_expiry": _FAR_FUTURE_EXPIRY, "dg_expiry": _FAR_FUTURE_EXPIRY,
+    # Missing date_of_birth triggers AE-CREW-PAIR-AGE-001_DOB_MISSING ->
+    # NEEDS_MANUAL_REVIEW for every pairing, so no seat ever fills (found
+    # 2026-08-09 in real-Postgres verification). A fixed, clearly-under-65
+    # DOB keeps these tests exercising rest/FDP/coverage mechanics, not
+    # the age-pairing gate.
+    "date_of_birth": dt.date(1980, 1, 1),
 }
 
 

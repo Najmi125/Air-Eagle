@@ -337,10 +337,20 @@ forward.
   guaranteed no-candidates uncovered case and a real rest-math rejection
   reaching the page unaltered (distinct cases — one proves the section
   renders in the right place, the other proves the actionable string
-  itself survives to the UI). 191 non-DB tests passing locally; DB tests
-  skip in this sandbox (no `TEST_DATABASE_URL`) and need the user's own
-  real-Postgres run before this merges. See the dedicated log entry
-  below for full detail.
+  itself survives to the UI).
+
+  **First real-Postgres pass (2026-08-09): 459/464 passed, 5 failed —
+  all five one cause**, found and fixed by the user: the test file's
+  own `_QUALIFICATION_DEFAULTS` covered all eight expiry fields but
+  omitted `date_of_birth`, so every seeded pairing hit
+  `AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW` and no
+  seat ever filled — a test-fixture gap, not a page or service bug.
+  Fixed with a fixed, clearly-under-65 `date_of_birth` added to that
+  dict; 464/464 confirmed on the user's side after the fix.
+  `check_reachability.py`: **zero files flagged — "All files under
+  core/, services/, db/ are reachable from somewhere," the first clean
+  run since Phase 1.** Pushed; awaiting the user's re-verification pass
+  before merge. See the dedicated log entry below for full detail.
 
 - **Merged into `main` before that**: `assistant-page-ui` — `pages/5_Assistant.py`,
   the OCC assistant's UI, first page to call `query_parser.parse()`/
@@ -4364,9 +4374,24 @@ execution before asserting" discipline used throughout this session,
 via mocks rather than a real DB per this sandbox's now-established
 practice. `scripts/check_reachability.py` re-run: **zero files
 flagged** — `services/roster_generator_service.py` was the last one,
-now cleared. **NOT yet run against real Postgres — no
-`TEST_DATABASE_URL` here, and this branch does not merge until the
-user's own real-Postgres verification confirms it**, same standing
-discipline as every piece this session. See `Merge status as of this
-snapshot` near the top of this file for the authoritative merge state,
-not this line.
+now cleared.
+
+**Real-Postgres verification (2026-08-09), pass 1: 459/464, 5 failed
+— one cause, a test-fixture gap, not a page or service bug.** The
+test file's own `_QUALIFICATION_DEFAULTS` (all eight expiry fields)
+omitted `date_of_birth`; every seeded pairing therefore hit
+`AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW`, and no
+seat in any of the five affected tests ever filled — visible directly
+in the generator's own real reason string
+("CPT-01 (NEEDS_REVIEW): Cannot evaluate the age-pairing rule... date
+of birth is missing"), exactly the kind of actionable detail this
+page's `uncovered` section exists to surface, here surfacing a test
+bug instead of a production one. Fixed with a single added line — a
+fixed, clearly-under-65 `date_of_birth` in that dict — confirmed
+464/464 on the user's side after the fix. `check_reachability.py` on
+this same real-Postgres pass: **zero files flagged — "All files under
+core/, services/, db/ are reachable from somewhere," the first clean
+run since Phase 1.** Fix pushed; awaiting the user's re-verification
+pass before merge, same standing discipline as every piece this
+session. See `Merge status as of this snapshot` near the top of this
+file for the authoritative merge state, not this line.
