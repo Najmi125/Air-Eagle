@@ -305,19 +305,24 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **One outstanding branch as of this snapshot (2026-08-08):
-  `assistant-page-ui`** — `pages/5_Assistant.py`, the OCC assistant's
-  UI, first page to call `query_parser.parse()`/`reports.run_report()`.
-  Presentation only, no new service logic. Interpretation always
-  renders before results (including on an empty result — a controller
-  most needs to see what was understood exactly when nothing came
-  back). Editable date range (session-state only, no DB, no
-  "persist to survive refresh" — this is a transient UI query result,
-  not operational data). `services/assistant/reports.py` confirmed no
-  longer flagged by `check_reachability.py`; `services/roster_
-  generator_service.py` stays flagged, unrelated. 12 new `AppTest`
-  tests, all correctly skipped locally (no `TEST_DATABASE_URL`). See
-  the dedicated log entry below. Do not merge until the user verifies.
+- **No outstanding branches as of this snapshot (2026-08-08).
+  `assistant-page-ui` merged into `main`** — `pages/5_Assistant.py`,
+  the OCC assistant's UI, first page to call `query_parser.parse()`/
+  `reports.run_report()`. Presentation only, no new service logic.
+  Interpretation always renders before results (including on an empty
+  result — a controller most needs to see what was understood exactly
+  when nothing came back). Editable date range (session-state only, no
+  DB, no "persist to survive refresh" — this is a transient UI query
+  result, not operational data). A real Streamlit `date_input`
+  widget-key bug was found and fixed before the test suite existed —
+  see the dedicated log entry. 455/455 verified against real Postgres
+  16, zero failures; the user independently drove the page through
+  `AppTest` with real seeded crew beyond the test suite
+  (interpretation-before-table, the decision-refusal redirect, the
+  real two-Mahmood ambiguity). `services/assistant/reports.py`
+  confirmed no longer flagged by `check_reachability.py` — closes a
+  gap open since 2026-08-01; `services/roster_generator_service.py`
+  stays flagged, unrelated, no Phase 7 piece has UI yet.
 
 - **Merged into `main` before that**: `query-parser-refusal-and-date-fixes`
   — operator scope decision (the OCC assistant generates tables only,
