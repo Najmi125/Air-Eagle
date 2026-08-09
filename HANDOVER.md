@@ -305,10 +305,9 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Outstanding branch as of this snapshot (2026-08-09): `roster-generation-page`
-  pushed, NOT yet merged — awaiting the user's real-Postgres
-  verification.** `pages/6_Roster_Generation.py`, Phase 7's first UI —
-  presentation only over `roster_generator_service.generate_for_window()`/
+- **No outstanding branches as of this snapshot (2026-08-09).
+  `roster-generation-page` merged into `main`** — `pages/6_Roster_Generation.py`,
+  Phase 7's first UI — presentation only over `roster_generator_service.generate_for_window()`/
   `publish_window()` and `rotation_template_service.get_instances()`, no
   new service logic. One linear flow: pick a date window, see a live
   pre-generate preview (approved-rotation count, time estimate, a
@@ -339,18 +338,19 @@ forward.
   renders in the right place, the other proves the actionable string
   itself survives to the UI).
 
-  **First real-Postgres pass (2026-08-09): 459/464 passed, 5 failed —
-  all five one cause**, found and fixed by the user: the test file's
-  own `_QUALIFICATION_DEFAULTS` covered all eight expiry fields but
-  omitted `date_of_birth`, so every seeded pairing hit
-  `AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW` and no
-  seat ever filled — a test-fixture gap, not a page or service bug.
-  Fixed with a fixed, clearly-under-65 `date_of_birth` added to that
-  dict; 464/464 confirmed on the user's side after the fix.
-  `check_reachability.py`: **zero files flagged — "All files under
-  core/, services/, db/ are reachable from somewhere," the first clean
-  run since Phase 1.** Pushed; awaiting the user's re-verification pass
-  before merge. See the dedicated log entry below for full detail.
+  First real-Postgres pass found one real issue, in the test file, not
+  the page or service: `_QUALIFICATION_DEFAULTS` covered all eight
+  expiry fields but omitted `date_of_birth`, so every seeded pairing
+  hit `AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW` and
+  no seat ever filled (459/464, all 5 failures traced to this one
+  cause). Fixed with a single added line — a fixed, clearly-under-65
+  `date_of_birth`. **464/464 verified against real Postgres 16, zero
+  failures, on the re-verification pass.** `check_reachability.py`:
+  **"All files under core/, services/, db/ are reachable from
+  somewhere" — the first fully clean run since that checker was
+  written in Phase 1.** Every file in the repo is now genuinely wired
+  to something a user can reach. See the dedicated log entry below for
+  full detail.
 
 - **Merged into `main` before that**: `assistant-page-ui` — `pages/5_Assistant.py`,
   the OCC assistant's UI, first page to call `query_parser.parse()`/
@@ -4387,11 +4387,13 @@ in the generator's own real reason string
 of birth is missing"), exactly the kind of actionable detail this
 page's `uncovered` section exists to surface, here surfacing a test
 bug instead of a production one. Fixed with a single added line — a
-fixed, clearly-under-65 `date_of_birth` in that dict — confirmed
-464/464 on the user's side after the fix. `check_reachability.py` on
-this same real-Postgres pass: **zero files flagged — "All files under
-core/, services/, db/ are reachable from somewhere," the first clean
-run since Phase 1.** Fix pushed; awaiting the user's re-verification
-pass before merge, same standing discipline as every piece this
-session. See `Merge status as of this snapshot` near the top of this
+fixed, clearly-under-65 `date_of_birth` in that dict.
+
+**Pass 2 (2026-08-09), re-verification: 464/464, zero failures.**
+`check_reachability.py`: **"All files under core/, services/, db/ are
+reachable from somewhere" — the first fully clean run since that
+checker was written in Phase 1.** Every file in the repo is now
+genuinely wired to something a user can reach. Merged into `main`,
+pushed; branch `roster-generation-page` deleted, both remote and
+local. See `Merge status as of this snapshot` near the top of this
 file for the authoritative merge state, not this line.
