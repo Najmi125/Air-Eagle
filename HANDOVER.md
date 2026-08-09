@@ -305,8 +305,54 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-08).
-  `assistant-page-ui` merged into `main`** — `pages/5_Assistant.py`,
+- **Outstanding branch as of this snapshot (2026-08-09): `roster-generation-page`
+  pushed, NOT yet merged — awaiting the user's real-Postgres
+  verification.** `pages/6_Roster_Generation.py`, Phase 7's first UI —
+  presentation only over `roster_generator_service.generate_for_window()`/
+  `publish_window()` and `rotation_template_service.get_instances()`, no
+  new service logic. One linear flow: pick a date window, see a live
+  pre-generate preview (approved-rotation count, time estimate, a
+  non-blocking warning above ~35 days), Generate, see results, Publish.
+  `uncovered` renders first and most prominently, with the real
+  legality-gate rejection string verbatim; per-pilot duty counts derived
+  from `filled` (already duty-level, no dedup needed) show fairness at a
+  glance; `already_covered` shown de-emphasized. Publish is deliberately
+  independent of whether Generate ran in the current session — computed
+  fresh from the database every render, so a controller can publish a
+  window generated earlier without re-running Generate — and states the
+  unassign-to-reject workflow explicitly (`remove_assignment()` already
+  marks `CANCELLED`, `publish_window()`'s own `WHERE status = 'PROPOSED'`
+  already skips it; no new function needed). `st.session_state` used
+  here for the first time on this page too, holding only the
+  just-generated `GenerationSummary` for display across the Publish
+  rerun — explicitly NOT a repeat of this project's "session_state is
+  demo-only" lesson, since the real effect (the `PROPOSED` rows) is
+  already durably written the moment `generate_for_window()` returns and
+  that call is idempotent by design. `services/roster_generator_service.py`
+  now clears `check_reachability.py` for the first time since Phase 1 —
+  every file under `core/`, `services/`, `db/` is reachable. AppTest
+  coverage (`tests/test_roster_generation_page.py`) seeds through the
+  real chain (`create_template` -> `expand_and_persist` -> `approve_instance`),
+  the first page test to exercise all of Phase 7 end to end, including a
+  guaranteed no-candidates uncovered case and a real rest-math rejection
+  reaching the page unaltered (distinct cases — one proves the section
+  renders in the right place, the other proves the actionable string
+  itself survives to the UI).
+
+  **First real-Postgres pass (2026-08-09): 459/464 passed, 5 failed —
+  all five one cause**, found and fixed by the user: the test file's
+  own `_QUALIFICATION_DEFAULTS` covered all eight expiry fields but
+  omitted `date_of_birth`, so every seeded pairing hit
+  `AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW` and no
+  seat ever filled — a test-fixture gap, not a page or service bug.
+  Fixed with a fixed, clearly-under-65 `date_of_birth` added to that
+  dict; 464/464 confirmed on the user's side after the fix.
+  `check_reachability.py`: **zero files flagged — "All files under
+  core/, services/, db/ are reachable from somewhere," the first clean
+  run since Phase 1.** Pushed; awaiting the user's re-verification pass
+  before merge. See the dedicated log entry below for full detail.
+
+- **Merged into `main` before that**: `assistant-page-ui` — `pages/5_Assistant.py`,
   the OCC assistant's UI, first page to call `query_parser.parse()`/
   `reports.run_report()`. Presentation only, no new service logic.
   Interpretation always renders before results (including on an empty
@@ -540,18 +586,13 @@ merge status, rather than repeating it here.
   for the bare-"N days" direction fix (2026-08-08) — the same
   "already-resolved template informs date parsing" mechanism would
   apply here too.
-- `scripts/check_reachability.py`, re-run on the `assistant-page-ui`
-  branch (2026-08-08): now flags exactly ONE file,
-  `services/roster_generator_service.py` (no Phase 7 piece has UI yet,
-  so nothing under `pages/` calls the generator). `services/assistant/
-  reports.py` is NO LONGER flagged — `pages/5_Assistant.py` is now its
-  first real caller, closing a gap open since 2026-08-01. `services/
-  rotation_template_service.py` also stays unflagged (already fixed
-  2026-08-04, unrelated to this piece). `core/roster_generation.py`
-  was never flagged either, same one-hop reachability reasoning
-  already noted above for `core/duty_summary.py`/`core/rotation_
-  expansion.py` — its own importer doesn't need to be
-  reachable-from-pages itself for it to count.
+- RESOLVED 2026-08-09: `scripts/check_reachability.py` flags nothing —
+  `pages/6_Roster_Generation.py` now imports `services/roster_generator_
+  service.py` (see the dedicated log entry below), which was the last
+  file flagged since `assistant-page-ui` (2026-08-08). Every file under
+  `core/`, `services/`, `db/` is reachable from `app.py`/`pages/` for
+  the first time since Phase 1. Note this cleared on an unmerged branch
+  (`roster-generation-page`) — re-run this check after `main` catches up.
 - **RESOLVED 2026-08-08 — no `reactivate_crew()` in `services/
   crew_service.py`, and it stays that way.** Found 2026-08-08 tracing
   a test bug (see the dedicated log entry for that date). Operator
@@ -4222,3 +4263,135 @@ is the only file still flagged, unrelated to this piece. Not yet run
 against real Postgres — no `TEST_DATABASE_URL` here. See `Current
 active task` near the top of this file for merge status, not this
 line.
+
+## 2026-08-09: pages/6_Roster_Generation.py — Phase 7's first UI,
+## clears the last `check_reachability.py` flag. NOT YET MERGED.
+
+Requested via Plan Mode: pick a date window, generate, see results,
+publish. Everything needed already existed — `services/roster_
+generator_service.py`'s `generate_for_window()`/`publish_window()`,
+`services/rotation_template_service.py`'s `get_instances()` — so this
+piece is presentation only, no new service logic. Scoped to this page
+alone: it assumes approved rotations already exist; template
+management and draft review are a separate, not-yet-built page.
+
+**Layout, in the order the operator specified as non-negotiable**:
+a shared `date_from`/`date_to` pair (plain `st.date_input`s, not in a
+form — a form would block the live pre-generate preview from updating
+as dates change) drives both Generate and Publish. The preview applies
+`get_instances(status="APPROVED")` filtered to the window — the same
+filter `generate_for_window()` applies internally — to show a
+rotation count and a time estimate (`rotation_count * (120/36)`,
+scaled from the operator's own measured ~2min/36-rotation real-data
+run), or, if zero, to say so plainly and point at the Rotation
+Templates page by name (not built yet) instead of offering a Generate
+button that would fail obscurely on nothing. A window over ~35 days
+gets a non-blocking `st.warning` — 28 days is the operational
+horizon, but this deliberately doesn't hard-block a controller
+running two cycles together, matching the same "alert + suggest,
+human decides" philosophy already established elsewhere in this app
+(downstream-conflict swaps) rather than inventing a new, inconsistent
+paternalistic pattern here.
+
+**Results**, rendered from `st.session_state.generation_summary` in
+the operator's stated priority order: `uncovered` first and most
+prominent (a real dataframe with the actual legality-gate rejection
+string verbatim in the `Reason` column — e.g. "CPT-01 (REJECTED):
+needs 21.5h rest, only 13.25h available" — never summarized, since
+that string already is the actionable detail); then per-pilot duty
+counts derived from `filled` only (already duty-level — one
+`SeatResult` per seat filled this run, not per sector — so counting
+`crew_id` occurrences per role directly gives the fairness numbers, no
+`group_roster_rows_into_duties()` dedup needed), CPT and FO in
+side-by-side columns; then `already_covered` de-emphasized (a caption
+count, detail behind a collapsed expander) — confirmation the
+idempotency worked, not news.
+
+**Publish is deliberately independent of whether Generate ran in this
+session** — the PROPOSED row count and the Publish button are computed
+fresh from `assignment_service.search_roster(..., include_proposed=True)`
+on every render for the currently selected window, so a controller
+returning later to publish something generated earlier doesn't need to
+redundantly re-run the ~2-minute generation step first. The page states
+the review mechanism explicitly, since a controller has no way to infer
+it: unassigning a proposed seat on the Roster page marks it `CANCELLED`,
+and `publish_window()`'s own `WHERE status = 'PROPOSED'` clause already
+skips it — no new function needed, confirmed by direct reasoning against
+both functions' real code before writing a line of page logic, then
+proven by a dedicated test (see below).
+
+**`st.session_state`**, this page's own first use of it, holds only the
+just-generated `GenerationSummary` so it survives the rerun a later
+Publish click triggers — a code comment at the initialization explicitly
+distinguishes this from this project's own hard lesson ("session_state
+lost unassigned count on refresh -> persist to DB, session state is
+demo-only"): that lesson is about OPERATIONAL data the system is
+responsible for; here, the real effect of Generate (the `PROPOSED`
+rows) is already durably written to the database the instant
+`generate_for_window()` returns, so losing the in-memory summary on a
+refresh only loses the DISPLAY of what already happened, and
+`generate_for_window()` is idempotent by design — re-running to see the
+summary again is the intended recovery path, not a workaround.
+
+**Tests** — `tests/test_roster_generation_page.py`, the first page test
+to exercise Phase 7's whole chain end to end (`create_template()` ->
+`expand_and_persist()` -> `approve_instance()`, not synthetic
+shortcuts, reusing the real EPE 786/787 domestic and EPE 802/804/805
+international grounding data from `tests/test_roster_generator_
+service.py`). Dates computed relative to `dt.date.today()` via a
+`_next_weekday()` helper, never hardcoded. Nine tests: page load;
+zero-approved-rotations pointer message; a full fill with correct
+fairness counts; an uncovered case proven both structurally (a
+guaranteed no-candidates seat, checked via `AppTest` DOM order —
+`Error` before the fairness `Markdown`, same ordering-is-the-real-
+requirement check used on `pages/5_Assistant.py`) and substantively (a
+back-to-back-international rest-math rejection, the SAME real scenario
+`test_roster_generator_service.py` already established, proving the
+actual rule-derived string reaches the page unaltered rather than the
+"No candidates in pool" fallback — added after the user's own plan
+review specifically asked for this second, distinct case); idempotency
+across two Generate clicks; Publish showing the correct row count
+(4, not 2 — the domestic rotation's 2 legs x 2 crew, same sector-row
+unit `publish_window()` itself returns, not a duty count) and flipping
+PROPOSED to PLANNED; a reject-then-publish test calling
+`assignment_service.remove_assignment()` directly on both of a seat's
+sector rows (catching, in review before ever running the test, that
+`search_roster()`'s sector-level shape means a single-leg cancel would
+have left the duty half-cancelled) and confirming `publish_window()`
+correctly skips the cancelled row while still publishing the rest; and
+the window-size warning appearing above ~35 days but not at the 28-day
+default.
+
+**Verification status**: full local suite — 191 passed, 273 skipped
+(+9, all new, all correctly skipped — no `TEST_DATABASE_URL` in this
+sandbox), zero import errors. Every code path (empty state, full fill,
+both uncovered cases, idempotency, publish, reject-then-publish, the
+window warning) additionally verified directly via `AppTest` with
+mocked `crew_service.get_all_crew()`/`rotation_template_service.
+get_instances()`/`roster_generator_service.generate_for_window()`
+before being written up as a formal test — same "verify via direct
+execution before asserting" discipline used throughout this session,
+via mocks rather than a real DB per this sandbox's now-established
+practice. `scripts/check_reachability.py` re-run: **zero files
+flagged** — `services/roster_generator_service.py` was the last one,
+now cleared.
+
+**Real-Postgres verification (2026-08-09), pass 1: 459/464, 5 failed
+— one cause, a test-fixture gap, not a page or service bug.** The
+test file's own `_QUALIFICATION_DEFAULTS` (all eight expiry fields)
+omitted `date_of_birth`; every seeded pairing therefore hit
+`AE-CREW-PAIR-AGE-001_DOB_MISSING` -> `NEEDS_MANUAL_REVIEW`, and no
+seat in any of the five affected tests ever filled — visible directly
+in the generator's own real reason string
+("CPT-01 (NEEDS_REVIEW): Cannot evaluate the age-pairing rule... date
+of birth is missing"), exactly the kind of actionable detail this
+page's `uncovered` section exists to surface, here surfacing a test
+bug instead of a production one. Fixed with a single added line — a
+fixed, clearly-under-65 `date_of_birth` in that dict — confirmed
+464/464 on the user's side after the fix. `check_reachability.py` on
+this same real-Postgres pass: **zero files flagged — "All files under
+core/, services/, db/ are reachable from somewhere," the first clean
+run since Phase 1.** Fix pushed; awaiting the user's re-verification
+pass before merge, same standing discipline as every piece this
+session. See `Merge status as of this snapshot` near the top of this
+file for the authoritative merge state, not this line.
