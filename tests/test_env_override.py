@@ -80,3 +80,65 @@ def test_genuinely_empty_string_is_falsy_correctly_treated_as_unset():
     instead of attempting a connection."""
     empty = ""
     assert not empty  # `if not empty` DOES trigger — correct skip behavior
+
+
+# ------------------------------------------------------------------
+# st.secrets fallback (2026-08-10) — Streamlit Community Cloud has no
+# .env (gitignored, doesn't exist in the deployed container), so
+# db.py._resolve_database_url() falls back to st.secrets when the env
+# var is absent. These three protect the three things that actually
+# matter: the fallback works, it never shadows the existing .env/
+# environment precedence, and db.py stays importable with no Streamlit
+# runtime at all — which is what scripts/run_migrations.py,
+# scripts/import_crew_from_xlsx.py, and this whole test suite rely on.
+# ------------------------------------------------------------------
+
+def test_secrets_used_when_env_var_absent(monkeypatch):
+    from db.db import _resolve_database_url
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    secret_value = "postgresql://postgres:secret@db.supabase.co:5432/postgres"
+
+    class _FakeSecrets(dict):
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    fake_secrets = _FakeSecrets({"DATABASE_URL": secret_value})
+    import streamlit as st
+    monkeypatch.setattr(st, "secrets", fake_secrets)
+
+    assert _resolve_database_url() == secret_value
+
+
+def test_env_var_wins_over_secrets_when_both_present(monkeypatch):
+    """st.secrets must not even be CONSULTED when the env var is
+    present — proven with a spy, not just by checking the winning
+    value, so a future refactor can't accidentally start preferring
+    secrets while still returning the right value by coincidence."""
+    from db.db import _resolve_database_url
+
+    env_value = "postgresql://postgres:real@db.supabase.co:5432/postgres"
+    monkeypatch.setenv("DATABASE_URL", env_value)
+
+    class _SpySecrets(dict):
+        def get(self, key, default=None):
+            raise AssertionError("st.secrets.get() must not be called when the env var is present")
+
+    import streamlit as st
+    monkeypatch.setattr(st, "secrets", _SpySecrets())
+
+    assert _resolve_database_url() == env_value
+
+
+def test_resolve_database_url_works_with_no_streamlit_runtime_at_all(monkeypatch):
+    """No Streamlit runtime context AND no secrets.toml file — exactly
+    scripts/run_migrations.py's/the test suite's own situation. Must
+    return None (falling through to get_engine()'s existing
+    RuntimeError), never raise a different, unhandled exception from
+    inside _resolve_database_url() itself. Genuinely exercises the
+    real st.secrets, unmocked — this is the test that would fail if
+    the try/except guard were ever narrowed or removed."""
+    from db.db import _resolve_database_url
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert _resolve_database_url() is None

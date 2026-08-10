@@ -71,6 +71,23 @@ python scripts/check_reachability.py
 streamlit run app.py
 ```
 
+## Deploying to Streamlit Community Cloud
+
+`.env` is gitignored and doesn't exist in the deployed container, so
+`DATABASE_URL` must be added to the app's own secrets instead
+(Settings → Secrets on share.streamlit.io), as a flat top-level key
+matching `.env`'s own variable name:
+
+```toml
+DATABASE_URL = "postgresql://user:password@host:5432/dbname"
+```
+
+`db/db.py`'s `get_engine()` reads `.env`/the environment first and
+only falls back to `st.secrets` when `DATABASE_URL` is absent from
+both — so a local `.env` always keeps working exactly as before,
+unaffected by this. `TEST_DATABASE_URL` is deliberately NOT needed in
+the deployed app's secrets — the test suite doesn't run there.
+
 ## Before ending any session that touched core/, services/, or db/
 
 ```bash
