@@ -305,8 +305,70 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-09).
-  `roster-generation-page` merged into `main`** — `pages/6_Roster_Generation.py`,
+- **Outstanding branch as of this snapshot (2026-08-10): `schedule-templates-page`
+  pushed, NOT yet merged — awaiting the user's real-Postgres verification.**
+  `pages/7_Schedule_Templates.py`, Phase 7's SECOND AND LAST UI. Three
+  workflows in order: (1) view/create rotation templates and new
+  versions, (2) expand a window into DRAFT instances, (3) review
+  (approve/reject) drafts. One real, flagged addition to `services/
+  rotation_template_service.py`: `get_all_rotation_codes()` — nothing
+  existing could list what templates exist at all (`get_versions()`
+  requires already knowing the code), a pure read accessor, same idiom
+  as `get_versions()`/`get_instances()`. Leg entry is a fixed 5 blank
+  rows, not dynamic add/remove — real rotations are 2-3 legs, and
+  dynamic add/remove would need `session_state` + reruns inside what
+  should be one atomic submit for no real benefit at this leg count.
+  Client-side validation goes one step past `_validate_legs()` (which
+  only enforces `flight_no`): also checks `arr_time` is after
+  `dep_time` at creation time, closing a real gap confirmed directly —
+  a template with dep 20:00/arr 19:00 is accepted by `create_template()`
+  and only fails later, at `expand_and_persist()`, with "arr_time
+  19:00 is not after dep_time 20:00." Creating a new version shows the
+  least-obvious behaviour live, before confirmation: "this will end
+  version N on {effective_from - 1 day}," computed with the same
+  subtraction `create_new_version()` uses internally, via a date picker
+  kept outside any form so the preview updates on every change; the new
+  version's own days-of-week/legs pre-fill from the current version so
+  the common "same route, new dates" case needs no retyping. Bulk
+  review uses one `st.checkbox` per row (not `st.data_editor`, which
+  turned out to have no `AppTest` accessor at all — confirmed directly
+  before committing to the design, since an untestable design wasn't
+  acceptable here) inside a plain `st.columns` grid, with each row's
+  route/flights/report/debrief inlined as columns so "a draft must show
+  its legs before approval" is satisfied without a per-row expander
+  reintroducing the 36-click friction the checkbox/select-all design
+  exists to avoid. "Select all visible"/"Clear selection" use a
+  pending-flag pattern (`session_state` mutated *before* the checkboxes
+  instantiate, not after — confirmed directly that setting it after
+  raises `StreamlitAPIException`). Approve/reject each call
+  `approve_instance()`/`reject_instance()` individually per selected id
+  — batched is the clicking, not the decision or the audit record — and
+  `selected_ids` is always computed from the *currently visible* id
+  list, never scanned from all session keys, so a selection made under
+  one rotation_code filter can't get swept into an action taken after
+  switching filters (a dedicated test covers exactly this). Approve
+  reports the real resulting flight count (`sum(len(flight_ids))`
+  across every successful call) — the moment a draft becomes
+  operational. Reject requires a reason; the button is simply disabled
+  without one.
+
+  A real `AppTest` timing finding shaped the test file: a single
+  `at.run()` after a button click does NOT reliably surface a transient
+  `st.success()` banner when `st.rerun()` follows it AND more script
+  runs after that (every action here has later workflow sections
+  below it) — confirmed directly via ad-hoc scripts, not assumed.
+  Create/create-version/approve/reject are therefore tested via real
+  effects (querying the service directly) rather than the transient
+  banner text; Workflow 2 (expand) has no `st.rerun()` at all and IS
+  tested via its banner directly. Validation-error paths (no rerun
+  involved) are asserted via `at.error` text directly too. 191 non-DB
+  tests passing locally, 9 new tests (all correctly skipping — no
+  `TEST_DATABASE_URL` in this sandbox). `scripts/check_reachability.py`:
+  unchanged, still zero files flagged — `rotation_template_service.py`
+  was already reachable from elsewhere; this just adds a second caller.
+  See the dedicated log entry below for full detail.
+
+- **Merged into `main` before that**: `roster-generation-page` — `pages/6_Roster_Generation.py`,
   Phase 7's first UI — presentation only over `roster_generator_service.generate_for_window()`/
   `publish_window()` and `rotation_template_service.get_instances()`, no
   new service logic. One linear flow: pick a date window, see a live
@@ -4397,3 +4459,139 @@ genuinely wired to something a user can reach. Merged into `main`,
 pushed; branch `roster-generation-page` deleted, both remote and
 local. See `Merge status as of this snapshot` near the top of this
 file for the authoritative merge state, not this line.
+
+## 2026-08-10: pages/7_Schedule_Templates.py — Phase 7's second and
+## last UI. NOT YET MERGED.
+
+Requested via Plan Mode: three workflows in order — view/create
+templates, expand a window into drafts, review (approve/reject)
+drafts. Everything needed existed in `services/rotation_template_
+service.py` except one genuine gap, found during research and flagged
+before writing any page code: there was no way to list existing
+rotation codes at all (`get_versions(code)` requires already knowing
+the code). Added `get_all_rotation_codes()` — one pure read accessor
+(`SELECT DISTINCT rotation_code FROM rotation_templates ORDER BY
+rotation_code`), same idiom as `get_versions()`/`get_instances()`, the
+one deviation from "presentation only."
+
+**Leg entry**: fixed 5 blank rows, not dynamic add/remove — real
+rotations are 2-3 legs (EPE 786/787 has 2, EPE 802/804/805 has 3), and
+a dynamic add/remove form needs `session_state` + reruns inside what
+should be one atomic submit, real complexity for no benefit at this
+leg count. A row counts as "filled" if any of flight_no/origin/
+destination has content; filled rows get sequential `leg_order` in row
+order regardless of which of the 5 rows were used. Validation goes one
+step past `rotation_template_service._validate_legs()` (which only
+enforces `flight_no`): also checks `arr_time` is after `dep_time` at
+creation time — proven, not assumed, to be a real gap: a template with
+dep 20:00/arr 19:00 is accepted by `create_template()` and only fails
+later, at `expand_and_persist()` time, with "arr_time 19:00 is not
+after dep_time 20:00." Without the earlier check, a controller
+discovers a broken template only when expansion fails, possibly days
+after creating it.
+
+**Create a new version** shows the operator's own named "least obvious
+behaviour" live, before confirmation: "this will end version N on
+{effective_from - 1 day}," computed with the exact subtraction
+`create_new_version()` performs internally, via a date picker
+deliberately kept outside any `st.form` so the preview recomputes on
+every change (a form would batch it until submit, defeating the live
+preview — same reasoning already established on `pages/6_Roster_
+Generation.py`). The new version's days-of-week and legs pre-fill from
+the CURRENT version's own stored values, keyed by rotation_code
+(`cv_{code}_...`) so switching which rotation is being versioned always
+gets fresh, correct defaults — reusing the exact widget-key staleness
+fix already established on `pages/5_Assistant.py`/`pages/6_Roster_
+Generation.py` (a widget's `value=`/`default=`/`index=` is only
+honored the FIRST time a given key renders).
+
+**Bulk review — the real interaction question, and a real mid-build
+finding.** The obvious design, `st.data_editor` with a checkbox column,
+turned out to have NO `AppTest` accessor at all — confirmed directly
+(`dir(at)` lists every other input widget type but not `data_editor`)
+before committing to it, not discovered after building it. Redesigned
+around one `st.checkbox` per row (`key=f"select_{instance_id}"`) inside
+a plain `st.columns` grid instead — fully testable, and each row
+already carries its own route/flights/report/debrief inlined as
+columns (built from that instance's real `get_instance_legs()`), which
+is what actually satisfies "a draft must show its legs before
+approval, not just rotation code and date" — inlined rather than
+behind a per-row expander, since an expander per row would reintroduce
+the exact 36-click friction the checkbox/select-all design exists to
+avoid. "Select all visible"/"Clear selection" needed a second real
+finding to work at all: `st.session_state[key] = value` raises
+`StreamlitAPIException` once a widget with that key has already been
+instantiated THIS run — confirmed directly via a minimal `AppTest`
+repro before writing the real page code. Fixed with a pending-flag
+pattern (the button sets a flag and reruns; the flag is applied, and
+cleared, at the TOP of the script, before the checkboxes render).
+Approve and reject each call `approve_instance()`/`reject_instance()`
+individually per selected id, never batched into one call — batched is
+the clicking, not the decision or the per-instance audit record, per
+the operator's own framing. `selected_ids` is always computed by
+filtering the CURRENTLY VISIBLE id list against session state, never
+by scanning every session key — so a selection made under one
+rotation_code filter can't silently get swept into an action taken
+after switching to a different filter (a dedicated test proves this:
+select under filter A, switch to filter B, Select-all-visible there,
+Approve — A's instance stays DRAFT, only B's gets approved). Approve
+reports the real resulting flight count (summed `len(flight_ids)`
+across every successful call) — the moment a draft becomes
+operational, per the operator's explicit ask. Reject requires a reason
+via a `disabled=` gate on the button; there's no way to reject without
+one.
+
+**A third real finding shaped the test file itself**: confirmed
+directly, via ad-hoc `AppTest` scripts before writing any formal test,
+that a single `at.run()` after a button click does NOT reliably
+surface a transient `st.success()` banner when `st.rerun()` immediately
+follows it AND more script executes after that point — which every
+action on this page has (later workflow sections always follow).
+`AppTest`'s `.run()` appears to run the internal rerun through to a
+stabilized final state rather than stopping at the pre-rerun banner,
+confirmed by direct comparison against a minimal repro with nothing
+after the `rerun()` call (where the banner IS reliably visible — this
+is exactly why `pages/6_Roster_Generation.py`'s own Publish banner
+test works, since that success+rerun is the literal last code in that
+file). Rather than fight this timing, create/create-version/approve/
+reject are tested via real effects (querying `rotation_template_
+service` directly afterward) instead of the transient banner text —
+arguably a more robust test design regardless. Workflow 2 (expand) has
+no `st.rerun()` at all and IS tested via its banner directly, confirmed
+working the same way. Validation-error paths (no rerun involved) are
+asserted via `at.error` text directly too, unaffected by any of this.
+
+**Tests** — `tests/test_schedule_templates_page.py`, same `page_app`
+fixture pattern as `tests/test_roster_generation_page.py`. Nine tests:
+page load; create template via the real form (validates real rows via
+`get_versions()`/`get_template_legs()` afterward); a partially-filled
+leg row shows the exact error and writes nothing; create-new-version
+shows the live preview text before submit and the real `effective_until`
+after; expand creates the right count and is idempotent on a second
+click; the review table shows real route/flight data, not just id/date;
+select-all then approve promotes the right instances and reports the
+right flight count (2 instances x 2 legs = 4 flights); reject stays
+disabled until both a selection AND a reason exist, then writes the
+real reason; and the filter-scoping test described above.
+
+**Verification status**: full local suite — 191 passed, 282 skipped
+(+9, all new, all correctly skipped — no `TEST_DATABASE_URL` in this
+sandbox), zero import errors. Every flow (empty state, create template,
+partial-leg validation, create-version preview, expand + idempotency,
+review table content, select-all/approve, reject gating, filter
+scoping) additionally verified directly via `AppTest` with mocked
+`rotation_template_service` functions before being written up as a
+formal test — same "verify via direct execution before asserting"
+discipline used throughout this session, and the specific discipline
+that caught all three real findings above (the validation gap, the
+`data_editor`/`session_state` timing issues, and the success-banner
+timing issue) before they became either a shipped bug or a flaky test.
+`scripts/check_reachability.py` re-run: unchanged, zero files flagged
+— `rotation_template_service.py` was already reachable from
+`pages/6_Roster_Generation.py`; this page is a second caller, not a
+newly-reachable one. **NOT yet run against real Postgres — no
+`TEST_DATABASE_URL` here, and this branch does not merge until the
+user's own real-Postgres verification confirms it**, same standing
+discipline as every piece this session. See `Merge status as of this
+snapshot` near the top of this file for the authoritative merge state,
+not this line.

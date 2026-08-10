@@ -311,6 +311,18 @@ def get_versions(rotation_code: str) -> pd.DataFrame:
     """), engine, params={"rotation_code": rotation_code})
 
 
+def get_all_rotation_codes() -> List[str]:
+    """Distinct rotation_code values across every version — the one
+    discovery primitive get_versions()/get_template_legs() don't cover,
+    since both require already knowing rotation_code. Added for
+    pages/7_Schedule_Templates.py, which otherwise has no way to list
+    existing templates (2026-08-10)."""
+    engine = get_engine()
+    return pd.read_sql(text("""
+        SELECT DISTINCT rotation_code FROM rotation_templates ORDER BY rotation_code
+    """), engine)["rotation_code"].tolist()
+
+
 def _versions_covering_window(conn, rotation_code: str, date_from: dt.date, date_to: dt.date):
     """Every template version for rotation_code whose effective range
     overlaps [date_from, date_to] — the EXCLUDE constraint guarantees
