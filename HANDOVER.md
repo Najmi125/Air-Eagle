@@ -305,9 +305,9 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Outstanding branch as of this snapshot (2026-08-10): `schedule-templates-page`
-  pushed, NOT yet merged — awaiting the user's real-Postgres verification.**
-  `pages/7_Schedule_Templates.py`, Phase 7's SECOND AND LAST UI. Three
+- **No outstanding branches as of this snapshot (2026-08-10).
+  `schedule-templates-page` merged into `main`** — `pages/7_Schedule_Templates.py`,
+  Phase 7's SECOND AND LAST UI. Three
   workflows in order: (1) view/create rotation templates and new
   versions, (2) expand a window into DRAFT instances, (3) review
   (approve/reject) drafts. One real, flagged addition to `services/
@@ -361,12 +361,17 @@ forward.
   effects (querying the service directly) rather than the transient
   banner text; Workflow 2 (expand) has no `st.rerun()` at all and IS
   tested via its banner directly. Validation-error paths (no rerun
-  involved) are asserted via `at.error` text directly too. 191 non-DB
-  tests passing locally, 9 new tests (all correctly skipping — no
-  `TEST_DATABASE_URL` in this sandbox). `scripts/check_reachability.py`:
-  unchanged, still zero files flagged — `rotation_template_service.py`
-  was already reachable from elsewhere; this just adds a second caller.
-  See the dedicated log entry below for full detail.
+  involved) are asserted via `at.error` text directly too.
+
+  **473/473 verified against real Postgres 16, first run, zero
+  failures** — the user additionally drove the page directly beyond the
+  test suite (`get_all_rotation_codes()` correctly empty then
+  populated, the page rendering without exception both empty and
+  populated, a real expansion producing exactly 5 Mon-Fri drafts for
+  3-7 Aug with a checkbox each) and confirmed the `arr_time`/`dep_time`
+  validation gap empirically before ever approving the plan.
+  `scripts/check_reachability.py`: still zero files flagged. See the
+  dedicated log entry below for full detail.
 
 - **Merged into `main` before that**: `roster-generation-page` — `pages/6_Roster_Generation.py`,
   Phase 7's first UI — presentation only over `roster_generator_service.generate_for_window()`/
@@ -4589,9 +4594,21 @@ timing issue) before they became either a shipped bug or a flaky test.
 `scripts/check_reachability.py` re-run: unchanged, zero files flagged
 — `rotation_template_service.py` was already reachable from
 `pages/6_Roster_Generation.py`; this page is a second caller, not a
-newly-reachable one. **NOT yet run against real Postgres — no
-`TEST_DATABASE_URL` here, and this branch does not merge until the
-user's own real-Postgres verification confirms it**, same standing
-discipline as every piece this session. See `Merge status as of this
-snapshot` near the top of this file for the authoritative merge state,
-not this line.
+newly-reachable one.
+
+**Real-Postgres verification (2026-08-10): 473/473, first run, zero
+failures.** All three findings held up under real data — the user
+confirmed the `arr_time`/`dep_time` validation gap empirically before
+ever approving the plan (dep 20:00/arr 19:00 genuinely accepted by
+`create_template()`, genuinely only failing days later at expansion),
+and specifically endorsed testing real service-layer effects over
+transient banner text as "testing what actually happened beats testing
+what was displayed about it." The user additionally drove the page
+directly beyond the test suite: `get_all_rotation_codes()` correctly
+empty then populated, the page rendering without exception both empty
+and populated, and a real expansion through the full chain producing
+exactly 5 Mon-Fri drafts for 3-7 Aug with a checkbox each.
+`check_reachability.py` on this same pass: still clean. Merged into
+`main`, pushed; branch `schedule-templates-page` deleted, both remote
+and local. See `Merge status as of this snapshot` near the top of this
+file for the authoritative merge state, not this line.
