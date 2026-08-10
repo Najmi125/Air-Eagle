@@ -34,7 +34,6 @@ from services.assistant import query_parser, reports
 from services.reporting import AIR_EAGLE, dataset_to_xlsx, report_filename
 
 st.set_page_config(page_title="OCC Assistant", page_icon="🤖", layout="wide")
-st.logo("assets/logo.png", size="large")
 st.title("OCC Assistant")
 
 st.markdown(

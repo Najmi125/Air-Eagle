@@ -27,7 +27,6 @@ import streamlit as st
 from services import assignment_service, crew_service, roster_generator_service, rotation_template_service
 
 st.set_page_config(page_title="Roster Generation", page_icon="⚙️", layout="wide")
-st.logo("assets/logo.png", size="large")
 st.title("Roster Generation")
 
 st.markdown(

@@ -15,7 +15,6 @@ from services import crew_service, flight_service, assignment_service
 from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
-st.logo("assets/logo.png", size="large")
 st.title("Roster")
 
 ROLE_OPTIONS = ["CPT", "FO", "LM", "ENGR", "Other"]

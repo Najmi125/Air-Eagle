@@ -28,7 +28,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WATCHED_DIRS = ["core", "services", "db"]
-ENTRY_POINTS = ["app.py"] + [str(p) for p in (ROOT / "pages").glob("*.py")] if (ROOT / "pages").exists() else ["app.py"]
+# Root-level entry points ONLY, checked individually below in
+# app_reachable_source_files() — anything under pages/ is already
+# handled generically there via included_top, so it doesn't need
+# per-file listing here (the old version of this constant globbed
+# pages/*.py into ENTRY_POINTS too, as absolute paths, inconsistent
+# with "app.py"'s relative form — dead weight: nothing ever actually
+# read ENTRY_POINTS, so the inconsistency went unnoticed. Fixed
+# 2026-08-10 alongside the missing_entry_points() guard below, in the
+# same pass that finally wired this constant into real use).
+ENTRY_POINTS = ["app.py", "home.py"]
 
 # "from X import a, b, c" and "import X.Y.Z" need different handling.
 # IMPORT_FROM_RE's second group captures the whole import clause,
@@ -89,7 +98,7 @@ def all_source_files():
 def app_reachable_source_files():
     """
     Files whose imports actually count as "this is wired into the app":
-    app.py, pages/, and cross-references within core/services/db
+    ENTRY_POINTS, pages/, and cross-references within core/services/db
     themselves. Deliberately EXCLUDES tests/ and scripts/ — a file
     that's only ever imported by its own test is not connected to the
     running app, and counting test imports as reachability would mask
@@ -100,13 +109,33 @@ def app_reachable_source_files():
     for f in all_source_files():
         rel = f.relative_to(ROOT)
         top = rel.parts[0] if len(rel.parts) > 1 else None
-        if str(rel) == "app.py":
+        if str(rel) in ENTRY_POINTS:
             files.append(f)
         elif top in included_top:
             files.append(f)
         elif top in WATCHED_DIRS:
             files.append(f)
     return files
+
+
+def missing_entry_points(entry_points: list[str]) -> list[str]:
+    """Declared entry_points that don't exist on disk. Given
+    explicitly rather than reading the ENTRY_POINTS global directly —
+    same "no implicit dependency, easy to unit test" principle as
+    find_orphaned() below.
+
+    This checker cannot safely report anything while blind to a
+    declared entry point: app_reachable_source_files() only counts a
+    file's imports if str(rel) matches something in ENTRY_POINTS
+    exactly — a stale or typo'd entry silently drops that file from
+    the scan entirely, and the checker can still print a clean "all
+    reachable" pass, unaware it never looked at that entry point's own
+    imports at all. Confirmed as a real, reproduced failure mode
+    (2026-08-10): copying this branch, renaming app.py -> Home.py
+    without updating ENTRY_POINTS, and running this checker produced
+    exactly that — a clean, exit-0 pass with a declared entry point
+    that didn't exist on disk."""
+    return [ep for ep in entry_points if not (ROOT / ep).is_file()]
 
 
 def find_all_imports():
@@ -209,6 +238,19 @@ def find_orphaned(watched: list[Path], imported: set[str]) -> list[Path]:
 
 
 def main():
+    missing = missing_entry_points(ENTRY_POINTS)
+    if missing:
+        print(f"{len(missing)} declared ENTRY_POINTS file(s) do not exist on disk:\n")
+        for ep in missing:
+            print(f"  {ep}")
+        print(
+            "\nThis checker cannot safely report anything while blind to a "
+            "declared entry point — update ENTRY_POINTS in "
+            "scripts/check_reachability.py (or restore the missing file) "
+            "before trusting this checker's result."
+        )
+        return 1
+
     watched = all_watched_files()
     imported = find_all_imports()
     orphaned = find_orphaned(watched, imported)

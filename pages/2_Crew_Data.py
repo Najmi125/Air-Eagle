@@ -5,14 +5,14 @@ Collects input, calls services/crew_service.py, displays output.
 Does not write SQL directly (Section 17), does not create or alter
 the crew table (migrations/001_crew_table.sql owns that exclusively).
 
-Deliberately unstyled — matches app.py, UI work is parked for later.
+Deliberately unstyled — the home page (home.py) got its own branding
+pass (2026-08-10/11), this page hasn't; UI work here is parked for later.
 """
 import streamlit as st
 
 from services import crew_service
 
 st.set_page_config(page_title="Crew Data", page_icon="👨‍✈️", layout="wide")
-st.logo("assets/logo.png", size="large")
 st.title("Crew Data")
 
 # CPT/FO only, per the operator's 2026-08-02 decision: Air Eagle's

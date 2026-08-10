@@ -179,6 +179,59 @@ def test_non_ascii_content_in_a_watched_file_does_not_block_import_scanning(tmp_
     assert "services.crew_service" not in orphaned
 
 
+def test_missing_entry_point_is_flagged(tmp_path, monkeypatch):
+    """The real, reproduced failure mode this guard exists for
+    (2026-08-10): copying this branch, renaming app.py -> Home.py
+    without updating ENTRY_POINTS, and running the real checker
+    produced a clean, exit-0 'all reachable' pass with a declared
+    entry point that didn't exist on disk at all. missing_entry_points()
+    must catch exactly this — app.py deliberately not created here."""
+    _make_repo(tmp_path, {
+        "services/__init__.py": "",
+        "services/crew_service.py": "def foo(): pass\n",
+    })
+    monkeypatch.setattr(reachability, "ROOT", tmp_path)
+
+    missing = reachability.missing_entry_points(["app.py", "home.py"])
+
+    assert set(missing) == {"app.py", "home.py"}
+
+
+def test_all_entry_points_present_is_not_flagged(tmp_path, monkeypatch):
+    _make_repo(tmp_path, {
+        "app.py": "",
+        "home.py": "",
+        "services/__init__.py": "",
+    })
+    monkeypatch.setattr(reachability, "ROOT", tmp_path)
+
+    assert reachability.missing_entry_points(["app.py", "home.py"]) == []
+
+
+def test_main_refuses_to_report_a_clean_pass_when_blind_to_an_entry_point(tmp_path, monkeypatch, capsys):
+    """End-to-end, through main() itself: this checker must never be
+    able to print 'all reachable' while it silently never looked at a
+    declared entry point's own imports — exit code 1, not 0, and the
+    missing filename actually named in the output, not just a generic
+    failure."""
+    _make_repo(tmp_path, {
+        "services/__init__.py": "",
+        "services/orphan.py": "def foo(): pass\n",
+    })
+    monkeypatch.setattr(reachability, "ROOT", tmp_path)
+    monkeypatch.setattr(reachability, "ENTRY_POINTS", ["app.py"])
+
+    exit_code = reachability.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "app.py" in captured.out
+    assert "do not exist" in captured.out
+    # Must stop before ever claiming reachability -- the orphan-scan
+    # language should not appear when blind to a declared entry point.
+    assert "reachable" not in captured.out.lower()
+
+
 def test_unreadable_file_produces_a_warning_not_a_silent_skip(tmp_path, monkeypatch, capsys):
     """The second bug this session found: a file this checker can't
     decode must be loud about it, not quietly degrade the guardrail.

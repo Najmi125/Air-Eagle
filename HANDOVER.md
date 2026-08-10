@@ -305,41 +305,26 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Outstanding branch as of this snapshot (2026-08-10): `home-page-branding`
+- **Outstanding branch as of this snapshot (2026-08-11): `home-page-branding`
   pushed, NOT yet merged — awaiting the user's review (this piece is
   visual, not DB-behavior, so the gate is a manual `streamlit run
-  app.py` look, not real-Postgres verification).** A separate,
-  independent piece from `streamlit-cloud-secrets` (also outstanding,
-  see below) — different files, no sequencing dependency, deliberately
-  two branches so they can merge independently. `AE-image.jpg`/
-  `logo.png` moved from the repo root into `assets/` (root stays
-  config/entry-points only). Sidebar logo via `st.logo("assets/logo.png",
-  size="large")` — added to ALL EIGHT files (`app.py` + all seven
-  `pages/*.py`), not just `app.py`: read Streamlit 1.56/1.60's own
-  `st.logo()` source directly and confirmed it enqueues a per-script-run
-  message via the current run's context, with no app-wide/session
-  persistence, so a single call in `app.py` genuinely does not reach
-  the other six pages. Background image + dark overlay on `app.py`
-  only (`.stApp`, base64-embedded, scoped structurally — the CSS only
-  ever executes when `app.py` itself runs, nothing to guard). A
-  semi-opaque panel on Streamlit's own `.block-container` (not a
-  manually-opened `<div>` — an early draft tried that and was corrected
-  during plan review: a `<div>` opened in one `st.markdown()` call does
-  not wrap elements `st.title()`/`st.success()` render into separately)
-  protects the plain title/status/nav text for legibility during a
-  live disruption read at 0300; `st.success`/`st.error` already carry
-  their own backgrounds regardless. `.streamlit/config.toml` sets
-  `primaryColor` to the logo's own dominant navy (`#001A7B`, sampled
-  from a pixel-color histogram of the PNG, not eyeballed); the gold
-  (`#CDAF6F`) is used as the panel's accent border instead, since
-  `config.toml` has no separate accent-color slot. Neither image
-  needed resizing — 28KB/41KB, confirmed via `file`/`du`, nowhere near
-  a real Community Cloud memory concern. 192 passed (+1 locally
-  runnable — the DB-unreachable path needs no DB fixture),
-  `check_reachability.py` clean. Visual legibility itself isn't
-  something `pytest` can verify — say so plainly, verified by a manual
-  `streamlit run app.py` instead. See the dedicated log entry below
-  for full detail.
+  app.py` look, not real-Postgres verification).** Now two rounds:
+  round 1 (2026-08-10, logo/background/theming) and round 2
+  (2026-08-11, refinements from actually looking at round 1 running)
+  — see the two dated log entries below for full detail on each.
+  **Round 2's headline change: the app moved to `st.navigation()`**,
+  extracting the Home page's content into a new `home.py` (registered
+  as a page, `default=True`) and reducing `app.py` to a pure router.
+  `st.logo()` was removed entirely (round 1 added it to all 8 files;
+  round 2 reversed that, since the Home page's own large inline logo
+  plus its new page-link buttons made the sidebar logo redundant
+  everywhere). `check_reachability.py` also got a real, tested guard
+  this round (`missing_entry_points()`) after empirically reproducing
+  a false-clean pass — full detail in round 2's own entry. 475/475
+  verified against real Postgres 16 on round 1 specifically; round 2
+  not yet verified. Visual legibility remains something only a manual
+  `streamlit run app.py` can confirm, not `pytest` — said plainly both
+  rounds, not implied.
 
 - **Also outstanding as of this snapshot (2026-08-10): `streamlit-cloud-secrets`**
   — `db/db.py` falling back to `st.secrets` for Streamlit Community
@@ -4773,5 +4758,137 @@ zero import errors. `scripts/check_reachability.py`: unchanged, clean
 (no new `core`/`services`/`db` files). **Merge gate for this piece is
 a manual `streamlit run app.py` look, not real-Postgres verification**
 — this branch does not merge until the user has actually seen it
-render. See `Merge status as of this snapshot` near the top of this
-file for the authoritative merge state, not this line.
+render.
+
+**475/475 verified against real Postgres 16.** The user additionally
+confirmed, beyond the test suite, the specific thing the plan-review
+correction was about: `st.success`/`st.error` are still real
+Streamlit elements (checked directly at `app.py:63`), not hand-written
+HTML — the `.block-container`-styling fix over the manually-opened
+`<div>` approach held up. Assets confirmed moved, repo root clean,
+`st.logo()` present on all 8 files as built. **Not yet merged — Arif
+still needs to run `streamlit run app.py` and look at it himself; see
+the follow-up log entry below for a second round of changes made
+after doing exactly that.** See `Merge status as of this snapshot`
+near the top of this file for the authoritative merge state, not this
+line.
+
+## 2026-08-11: home page branding, round 2 — refinements from actually
+## looking at round 1 running, plus st.navigation(). NOT YET MERGED.
+
+Round 1 got 475/475 and looked right in the ways `pytest` could check;
+running it surfaced six real refinements, requested together: an
+inline double-size logo replacing "Air Eagle" in the title text (color
+matched to the logo), a green status circle on DB-connected, an inline
+UTC clock next to the nav text, removing the sidebar logo from all 8
+files, real navigation buttons for each page, and getting "app" in the
+sidebar nav to read "Home." One clarifying question asked and answered
+before planning: whether removing the sidebar logo should be
+everywhere or just the home page — everywhere, confirmed, since the
+new inline logo plus the page-link buttons make it redundant on every
+page, not just the landing one.
+
+**The `st.navigation()` decision — assessed properly, not guessed,
+per an explicit request to compare both options and recommend one.**
+The obvious path for "app" → "Home" was renaming `app.py` to
+`Home.py`: confirmed by reading `streamlit/source_util.py` directly
+that the classic `pages/`-directory pattern derives every nav label,
+including the entry script's, purely from the filename via regex, with
+no override short of a bigger architecture change. But a rename
+requires manually updating Streamlit Community Cloud's "Main file
+path" setting — outside this repo, in lockstep with the merge, with
+nothing in the codebase able to warn if it's missed, discovered only
+after an apparently-successful deploy. `st.Page(title=...)` sets the
+sidebar label directly, independent of filename, avoiding that risk
+entirely. The deciding question was whether it breaks any of the seven
+existing `AppTest.from_file("pages/...")` test files: confirmed,
+empirically and from source, that it doesn't — `AppTest.from_file()`
+execs a script directly with zero dependency on the entry point
+(confirmed by reading its own source), and a temporary `st.navigation()`
+router referencing a real page (`pages/1_Control_Room.py`, which calls
+its own `st.set_page_config()`, unmodified) ran clean via `pg.run()`
+with no "called twice" conflict. Recommended and built on
+`st.navigation()`: `app.py`'s content moved into a new `home.py`
+(registered via `st.Page("home.py", title="Home", icon="🏠",
+default=True)`, exactly like the other seven, just living at the repo
+root instead of under `pages/`); `app.py` itself is now a ~15-line
+router with no content of its own. `app.py` is never renamed, so the
+Streamlit Cloud "Main file path" setting needs no update at all — the
+external-action risk from the rename path is moot, not just mitigated.
+All seven `pages/*.py` files needed zero code changes beyond removing
+their `st.logo()` line (already planned) — confirmed, not assumed.
+
+**A real bug reproduced and fixed in `scripts/check_reachability.py`**,
+per explicit instruction to build it regardless of the navigation
+decision: copying this branch, renaming `app.py` → `Home.py` WITHOUT
+updating `ENTRY_POINTS`, and running the checker produced a clean,
+exit-0 "all reachable" pass — with its own declared entry point not
+existing on disk at all. Root cause, found while fixing it: `ENTRY_POINTS`
+was already dead code — nothing read it. The actual reachability scan
+(`app_reachable_source_files()`) independently hardcoded the string
+`"app.py"` and a separate `{"pages"}` check, so the constant's own
+staleness was invisible; it was also internally inconsistent (mixing
+absolute glob paths for `pages/` with one relative string for
+`app.py`). Fixed properly, not just guarded: `app_reachable_source_files()`
+now actually reads `ENTRY_POINTS` (`["app.py", "home.py"]`, both
+root-level entries — `pages/` is still handled generically, no
+per-file listing needed there), and a new `missing_entry_points()`
+check runs first in `main()`: any declared entry point that doesn't
+exist on disk stops the checker immediately with a named, non-zero-exit
+warning, before it ever attempts a scan it would otherwise report as
+clean. Three new tests in `tests/test_check_reachability.py` (now 10):
+the reproduced failure mode itself, the positive "nothing missing"
+case, and an end-to-end `main()` check confirming it exits 1 and never
+prints reachability language while blind to a declared entry point —
+all in the same synthetic-fixture style as the file's existing nine
+tests, none of which needed to change (they don't touch `ENTRY_POINTS`
+or call `main()` directly, so the fix doesn't affect them).
+
+**A real, non-obvious Streamlit behavior found while building the
+green circle**: `st.success("🟢 Database connected")` does NOT leave
+the emoji in the rendered body text. Streamlit's own `extract_leading_icon`
+pulls a leading emoji out of `body` into a separate, dedicated icon
+slot (shown "slightly enlarged" next to the alert) whenever `icon` is
+not explicitly passed — confirmed directly via `AppTest`, where
+`.value` showed only "Database connected" and the emoji turned up in
+`.icon`/`.proto.icon` instead. Arguably a nicer result than plain
+inline text (a real, enlarged icon rather than a character mixed into
+a sentence) — but the test had to be written against `.icon`, not
+`.value`, or it would have silently asserted the wrong thing.
+
+**Other changes**: the nav line now reads "Choose where to go below,
+or use the sidebar — {UTC timestamp}" (reworded per the operator's own
+suggestion to reconsider it now that page-link buttons are arguably
+the more prominent route, not just the sidebar) — a render-time
+snapshot, not a live tick, said plainly rather than implied (a real
+clock would need `streamlit-autorefresh`, not a current dependency).
+Seven `st.page_link()` buttons in a 4-then-3 grid, icon and label
+matching each page's own `st.set_page_config()` identity. Two stale
+docstring lines in `pages/2_Crew_Data.py`/`pages/3_Flight_Log.py`
+("Deliberately unstyled — matches app.py") were already inaccurate
+once `app.py` got styled in round 1 — corrected to point at `home.py`,
+the file that actually carries the styling now.
+
+**Tests**: `tests/test_home_page.py` rewritten — `AppTest.from_file("home.py")`
+is now the primary target (matching every other page's own test
+pattern, since `home.py` IS a page now, just one living at the repo
+root), plus a light `AppTest.from_file("app.py")` check confirming the
+router itself resolves every `st.Page()` path and renders the default
+page. `st.page_link()` renders as a generic `UnknownElement` in
+`AppTest` — no dedicated type, no `.click()` — said plainly: these
+tests confirm every page-link's label is present, not that clicking
+one actually navigates.
+
+**Verification status**: full local suite — 196 passed (+4: three
+`check_reachability` guard tests, one router test; the two DB-fixture-gated
+`test_home_page.py` tests correctly skip, no `TEST_DATABASE_URL` here),
+284 skipped, zero import errors. `scripts/check_reachability.py`:
+clean — both `ENTRY_POINTS` (`app.py`, `home.py`) exist on disk,
+confirmed by the very guard this round added. **NOT yet run against
+real Postgres, and not yet looked at by Arif — same gate as round 1,
+a manual `streamlit run app.py`, now specifically covering the
+`st.navigation()` migration too (does the sidebar genuinely say
+"Home"? do all seven page-link buttons actually navigate correctly?
+AppTest can't answer either question).** See `Merge status as of this
+snapshot` near the top of this file for the authoritative merge state,
+not this line.
