@@ -305,8 +305,39 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-10).
-  `schedule-templates-page` merged into `main`** — `pages/7_Schedule_Templates.py`,
+- **Outstanding branch as of this snapshot (2026-08-10): `streamlit-cloud-secrets`
+  pushed, NOT yet merged — awaiting the user's real-Postgres verification.**
+  `db/db.py`'s `get_engine()` raised `RuntimeError: DATABASE_URL not
+  set` on every page when deployed to Streamlit Community Cloud —
+  `.env` is gitignored and doesn't exist in the deployed container,
+  and nothing read `st.secrets` anywhere (confirmed via grep). Added
+  `_resolve_database_url()`: `.env`/environment still wins when
+  present (unchanged — every test/script depends on this), falls back
+  to `st.secrets` only when `DATABASE_URL` is absent from both.
+  `streamlit` is imported INSIDE the function, not at module level —
+  `db.py` is imported by `scripts/run_migrations.py`/
+  `scripts/import_crew_from_xlsx.py` outside any Streamlit runtime,
+  and shouldn't have to pull in the Streamlit runtime just to run a
+  migration. `st.secrets` genuinely raises
+  `StreamlitSecretNotFoundError` with no runtime context and no
+  `secrets.toml` (confirmed directly, not assumed) — guarded with a
+  broad `try/except Exception: return None`, falling through to the
+  existing `RuntimeError` rather than crashing with a different,
+  confusing exception. Three new tests in `tests/test_env_override.py`
+  (now 7, alongside the two original `override=True` regression
+  tests, unmodified and still passing): secrets used when the env var
+  is absent; env var wins when both are present — proven with a spy
+  that raises if `st.secrets.get()` is ever even called, not just by
+  checking the winning value; and `_resolve_database_url()` works with
+  NO Streamlit runtime at all (the real, unmocked `st.secrets` call,
+  exactly `scripts/run_migrations.py`'s own situation) — the test that
+  protects the migration script and the whole suite. `README.md` gets
+  a new "Deploying to Streamlit Community Cloud" section with the
+  exact secret TOML format. 194 passed (+3), 282 skipped (unchanged),
+  `check_reachability.py` clean. See the dedicated log entry below for
+  full detail.
+
+- **Merged into `main` before that**: `schedule-templates-page` — `pages/7_Schedule_Templates.py`,
   Phase 7's SECOND AND LAST UI. Three
   workflows in order: (1) view/create rotation templates and new
   versions, (2) expand a window into DRAFT instances, (3) review
@@ -4612,3 +4643,87 @@ exactly 5 Mon-Fri drafts for 3-7 Aug with a checkbox each.
 `main`, pushed; branch `schedule-templates-page` deleted, both remote
 and local. See `Merge status as of this snapshot` near the top of this
 file for the authoritative merge state, not this line.
+
+## 2026-08-10 (continued): Streamlit Community Cloud deployment fix —
+## db/db.py falls back to st.secrets. NOT YET MERGED.
+
+Requested via Plan Mode, alongside home-page branding (a separate,
+independent piece — see the next log entry — deliberately pushed to
+its own branch, `home-page-branding`, since the two touch unrelated
+files and have no sequencing dependency). The blocker: `.env` is
+gitignored, so it doesn't exist in a deployed Streamlit Cloud
+container, and nothing anywhere read `st.secrets` — confirmed via
+grep, zero matches — so every page raised `RuntimeError: DATABASE_URL
+not set` on deploy.
+
+**Precedence, exactly as specified**: `.env`/environment wins when
+present — unchanged, every test and script already depends on this —
+`st.secrets` consulted only when `DATABASE_URL` is still absent after
+`load_dotenv(override=True)` runs. Purely additive: the existing
+`override=True` fix (a real, already-regression-tested bug — a stale
+shell `DATABASE_URL` silently shadowing `.env`, `tests/
+test_env_override.py`'s two original tests) is completely untouched,
+confirmed by those two tests still passing unmodified.
+
+`db/db.py` gets one new function:
+```python
+def _resolve_database_url() -> str | None:
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        return db_url
+    try:
+        import streamlit as st
+        return st.secrets.get("DATABASE_URL")
+    except Exception:
+        return None
+```
+`streamlit` is imported INSIDE the function, not at module level —
+`db.py` is imported by `scripts/run_migrations.py` and `scripts/
+import_crew_from_xlsx.py` specifically outside any Streamlit runtime,
+and a plain migration run shouldn't have to pull in the whole
+Streamlit runtime for no reason. Confirmed directly (not assumed):
+`st.secrets.get(...)` raises `StreamlitSecretNotFoundError` with no
+Streamlit runtime context and no `secrets.toml` file present —
+exactly `scripts/run_migrations.py`'s and the test suite's own
+situation — so the broad `except Exception: return None` is what lets
+this fall through cleanly to `get_engine()`'s own existing
+`RuntimeError`, rather than crashing with a different, confusing
+exception from inside `_resolve_database_url()` itself.
+`get_engine()` changes from reading `os.environ` directly to calling
+this function; its `RuntimeError` message now mentions both `.env`
+and Streamlit Cloud's secrets.
+
+**Tests** — three added to `tests/test_env_override.py` (now 7 total,
+alongside the two original regression tests, run unmodified to prove
+`override=True` itself is untouched): `st.secrets` used when the env
+var is absent; the env var wins when both are present — proven with a
+spy `st.secrets` that raises `AssertionError` if `.get()` is ever even
+called, not just by checking which value won, so a future refactor
+can't accidentally start preferring secrets while happening to still
+return the right value; and `_resolve_database_url()` works with NO
+Streamlit runtime at all and no `DATABASE_URL` set, using the REAL,
+unmocked `st.secrets` (not a mock standing in for "no runtime") —
+returns `None` rather than raising, the exact test that protects
+`scripts/run_migrations.py` and the whole test suite's own ability to
+import `db.py`.
+
+`README.md` gets a new "Deploying to Streamlit Community Cloud"
+section: the exact secret TOML format (a flat top-level
+`DATABASE_URL` key, matching `.env`'s own variable name — no
+`[section]` needed), a note that `.env` keeps working locally
+unaffected, and that `TEST_DATABASE_URL` is deliberately NOT needed in
+the deployed app's secrets since the test suite never runs there.
+
+**Verification status**: full local suite — 194 passed (+3, the three
+new tests; the 282 skipped DB-dependent tests are unchanged, since
+none of this touches anything DB-fixture-dependent), zero import
+errors. `scripts/check_reachability.py`: unchanged, clean.
+`st.secrets`'s actual raised-exception behavior (`StreamlitSecretNotFoundError`
+with no runtime/no secrets file) confirmed directly via a real,
+unmocked call in this sandbox before writing the guard, not assumed
+from documentation. **NOT yet run against real Postgres — no
+`TEST_DATABASE_URL` here, and this branch does not merge until the
+user's own real-Postgres verification confirms it**, same standing
+discipline as every piece this session. See `Merge status as of this
+snapshot` near the top of this file for the authoritative merge state,
+not this line.

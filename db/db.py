@@ -25,12 +25,41 @@ load_dotenv(override=True)
 # configured in .env, with no error or warning of any kind.
 
 
+def _resolve_database_url() -> str | None:
+    """.env/environment wins when present (unchanged — every test and
+    script already depends on this); st.secrets is consulted only when
+    DATABASE_URL is still absent, for Streamlit Community Cloud (2026-08-10)
+    — .env is gitignored and doesn't exist in the deployed container.
+
+    streamlit is imported INSIDE this function, not at module level:
+    db.py is imported by scripts/run_migrations.py and
+    scripts/import_crew_from_xlsx.py specifically outside any Streamlit
+    runtime, and it shouldn't have to pull in the Streamlit runtime
+    just to run a migration. st.secrets itself raises
+    StreamlitSecretNotFoundError with no Streamlit runtime context and
+    no secrets.toml file present (confirmed directly) — the broad
+    except is what lets this function stay silent and fall through to
+    get_engine()'s own RuntimeError in that case, rather than crashing
+    with a different, confusing exception from in here.
+    """
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        return db_url
+    try:
+        import streamlit as st
+        return st.secrets.get("DATABASE_URL")
+    except Exception:
+        return None
+
+
 @lru_cache(maxsize=1)
 def get_engine():
-    db_url = os.environ.get("DATABASE_URL")
+    db_url = _resolve_database_url()
     if not db_url:
         raise RuntimeError(
-            "DATABASE_URL not set. Copy .env.example to .env and fill it in."
+            "DATABASE_URL not set. Copy .env.example to .env and fill it "
+            "in, or (on Streamlit Community Cloud) add DATABASE_URL to "
+            "the app's secrets."
         )
     # Small pool size — this app runs on a small managed Postgres
     # instance (Neon/Supabase free or low tier), not a large dedicated
