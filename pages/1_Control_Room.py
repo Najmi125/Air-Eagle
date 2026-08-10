@@ -21,6 +21,7 @@ from services import crew_service, assignment_service
 from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Control Room", page_icon="🛫", layout="wide")
+st.logo("assets/logo.png", size="large")
 st.title("Control Room — Ad-hoc / Charter")
 
 ROLE_OPTIONS = ["CPT", "FO", "LM", "ENGR", "Other"]

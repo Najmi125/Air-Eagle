@@ -1,0 +1,10 @@
+# Air Eagle brand theming (2026-08-10). primaryColor sampled directly
+# from assets/logo.png's own pixel data (a histogram of the most
+# common opaque, non-white colors) — the dominant navy fill of the
+# roundel and wordmark, not eyeballed. backgroundColor/
+# secondaryBackgroundColor/textColor deliberately left at Streamlit's
+# defaults: every page's st.dataframe()/st.error()/st.success() output
+# already depends on those defaults staying legible, and this piece is
+# scoped to the additive, low-risk part of theming only.
+[theme]
+primaryColor = "#001A7B"

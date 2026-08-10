@@ -12,6 +12,7 @@ import streamlit as st
 from services import crew_service
 
 st.set_page_config(page_title="Crew Data", page_icon="👨‍✈️", layout="wide")
+st.logo("assets/logo.png", size="large")
 st.title("Crew Data")
 
 # CPT/FO only, per the operator's 2026-08-02 decision: Air Eagle's

@@ -22,6 +22,7 @@ import streamlit as st
 from services import rotation_template_service as rts
 
 st.set_page_config(page_title="Schedule Templates", page_icon="📋", layout="wide")
+st.logo("assets/logo.png", size="large")
 st.title("Schedule Templates")
 
 WEEKDAY_OPTIONS = [("Mon", 1), ("Tue", 2), ("Wed", 3), ("Thu", 4), ("Fri", 5), ("Sat", 6), ("Sun", 7)]

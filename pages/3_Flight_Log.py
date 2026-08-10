@@ -15,6 +15,7 @@ from services import flight_service, assignment_service
 from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Flight Log", page_icon="📘", layout="wide")
+st.logo("assets/logo.png", size="large")
 st.title("Flight Log")
 
 STATUS_OPTIONS = ["All", "PLANNED", "OPERATED", "CANCELLED", "DISRUPTED"]

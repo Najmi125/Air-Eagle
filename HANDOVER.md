@@ -305,8 +305,51 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-10).
-  `schedule-templates-page` merged into `main`** — `pages/7_Schedule_Templates.py`,
+- **Outstanding branch as of this snapshot (2026-08-10): `home-page-branding`
+  pushed, NOT yet merged — awaiting the user's review (this piece is
+  visual, not DB-behavior, so the gate is a manual `streamlit run
+  app.py` look, not real-Postgres verification).** A separate,
+  independent piece from `streamlit-cloud-secrets` (also outstanding,
+  see below) — different files, no sequencing dependency, deliberately
+  two branches so they can merge independently. `AE-image.jpg`/
+  `logo.png` moved from the repo root into `assets/` (root stays
+  config/entry-points only). Sidebar logo via `st.logo("assets/logo.png",
+  size="large")` — added to ALL EIGHT files (`app.py` + all seven
+  `pages/*.py`), not just `app.py`: read Streamlit 1.56/1.60's own
+  `st.logo()` source directly and confirmed it enqueues a per-script-run
+  message via the current run's context, with no app-wide/session
+  persistence, so a single call in `app.py` genuinely does not reach
+  the other six pages. Background image + dark overlay on `app.py`
+  only (`.stApp`, base64-embedded, scoped structurally — the CSS only
+  ever executes when `app.py` itself runs, nothing to guard). A
+  semi-opaque panel on Streamlit's own `.block-container` (not a
+  manually-opened `<div>` — an early draft tried that and was corrected
+  during plan review: a `<div>` opened in one `st.markdown()` call does
+  not wrap elements `st.title()`/`st.success()` render into separately)
+  protects the plain title/status/nav text for legibility during a
+  live disruption read at 0300; `st.success`/`st.error` already carry
+  their own backgrounds regardless. `.streamlit/config.toml` sets
+  `primaryColor` to the logo's own dominant navy (`#001A7B`, sampled
+  from a pixel-color histogram of the PNG, not eyeballed); the gold
+  (`#CDAF6F`) is used as the panel's accent border instead, since
+  `config.toml` has no separate accent-color slot. Neither image
+  needed resizing — 28KB/41KB, confirmed via `file`/`du`, nowhere near
+  a real Community Cloud memory concern. 192 passed (+1 locally
+  runnable — the DB-unreachable path needs no DB fixture),
+  `check_reachability.py` clean. Visual legibility itself isn't
+  something `pytest` can verify — say so plainly, verified by a manual
+  `streamlit run app.py` instead. See the dedicated log entry below
+  for full detail.
+
+- **Also outstanding as of this snapshot (2026-08-10): `streamlit-cloud-secrets`**
+  — `db/db.py` falling back to `st.secrets` for Streamlit Community
+  Cloud deployment, pushed separately (independent of the branding
+  piece above, different files, no ordering dependency). Built and
+  documented on its own branch; its own dated log entry lives there
+  until it merges — not duplicated here to avoid the two copies
+  drifting.
+
+- **Merged into `main` before both**: `schedule-templates-page` — `pages/7_Schedule_Templates.py`,
   Phase 7's SECOND AND LAST UI. Three
   workflows in order: (1) view/create rotation templates and new
   versions, (2) expand a window into DRAFT instances, (3) review
@@ -4611,4 +4654,124 @@ exactly 5 Mon-Fri drafts for 3-7 Aug with a checkbox each.
 `check_reachability.py` on this same pass: still clean. Merged into
 `main`, pushed; branch `schedule-templates-page` deleted, both remote
 and local. See `Merge status as of this snapshot` near the top of this
+file for the authoritative merge state, not this line.
+
+## 2026-08-10 (continued): home page branding — logo, background,
+## theming. NOT YET MERGED.
+
+Requested via Plan Mode, alongside the `st.secrets` deployment fix (a
+separate, independent piece on its own branch — see `Merge status`
+above). `AE-image.jpg`/`logo.png` were sitting untracked in the repo
+root; moved into `assets/` via `git mv` (well, `mv` — they were never
+committed, so there was no history to preserve) so the root stays
+config/entry-points only. Checked file sizes before anything else, per
+the operator's own instruction: 28KB JPEG (640x480) and 41KB PNG
+(540x462), confirmed via `file`/`du`, not assumed — **neither needs
+resizing**, nowhere near a real concern against Community Cloud's
+~1GB memory budget. Operator confirmed the aircraft photo (an ordinary
+promotional ramp shot — tail art, nose art, blue sky) is fine to be
+publicly visible in this public repo.
+
+**`st.logo()` — a real finding that changed the file list.** The
+request assumed one call in `app.py` would reach all seven pages;
+read Streamlit's own installed source (`streamlit/commands/logo.py`,
+confirmed independently by the operator against 1.60.0 too) instead of
+trusting the docstring alone — `logo()` builds a `ForwardMsg` and calls
+`ctx.enqueue(fwd_msg)` on the CURRENT script run's context, no
+app-wide or session-persisted state. Since Streamlit's multipage
+navigation only re-executes the target page's own script, a single
+call in `app.py` does not reach the other six. Added
+`st.logo("assets/logo.png", size="large")` to all eight files
+(`app.py` + all seven `pages/*.py`) instead, placed right after each
+file's existing `st.set_page_config(...)` — matching this repo's own
+existing precedent of repeating `st.set_page_config(...)` per-page
+rather than factoring it into a shared helper; the same treatment for
+one added line with no per-page variation is consistent, not a new
+pattern. `size="large"` (32px max height, not the 24px default) since
+the logo is a compact roundel+wordmark, not a wide banner — more of
+the roundel detail stays legible at 32px. Confirmed directly, not
+assumed: a relative path (`"assets/logo.png"`) resolves against the
+Streamlit PROCESS's working directory (Python's own `open()`/
+`os.path.isfile()` semantics inside `image_to_url()`), not the calling
+script's own directory — meaning the SAME relative path is correct
+uniformly across `app.py` and every `pages/*.py` file, as long as
+`streamlit run app.py` is invoked from the repo root (already this
+project's documented convention). Verified via `AppTest` across all
+eight files with mocked services before writing the formal test file.
+
+**Background image, `app.py` only, base64-embedded** into a `<style>`
+block (`.stApp`, `background-size: cover`, `background-attachment:
+fixed`) injected via `st.markdown(..., unsafe_allow_html=True)`.
+Scoping to the home page is structural, not a guard that had to be
+written: this CSS only ever executes when `app.py` itself runs, and
+Streamlit's page navigation never re-executes `app.py`'s script body
+while another page is open — the seven working pages stay clean by
+construction, exactly the operator's own requirement (a background
+behind a roster table or a legality alert would actively harm the
+screens where real decisions get made).
+
+**Legibility — two layers, and a real correction during plan review.**
+The FIRST draft proposed wrapping the title/DB-status/nav text in a
+manually-opened `<div>` panel via `st.markdown(unsafe_allow_html=True)`.
+Caught before any code was written: a `<div>` opened in one
+`st.markdown()` call does not contain elements later, separate
+`st.title()`/`st.success()`/`st.error()` calls render — each `st.*`
+call gets its own Streamlit-managed container, and there's no reliable
+way to open a container in one call and close it in a later one. Fixed
+by styling Streamlit's OWN existing container instead of replacing the
+elements with raw HTML: `.block-container` — the real element every
+`st.*` call in `app.py` already renders inside — gets `background:
+rgba(255,255,255,0.92)`, rounded corners, padding, and a gold
+(`#CDAF6F`) left border accent. Same visual result, zero markup
+changes, `st.success`/`st.error` keep their real semantics and stay
+assertable in `AppTest`. Layer two, baked into the background image's
+own CSS: `linear-gradient(rgba(10,15,35,0.6), rgba(10,15,35,0.6))`
+composited under the photo, dimming it everywhere, not just behind
+text. Two layers because this is a screen read at 0300 during a live
+disruption — a single dim gradient alone is a reasonable bet, not a
+guarantee, and the second layer costs a few lines of CSS against an
+already-existing container.
+
+**`.streamlit/config.toml`**: `primaryColor = "#001A7B"` — sampled
+directly from `logo.png`'s own pixel data (a histogram of the most
+common opaque, non-white colors: navy `#001A7B` at ~43k pixels, the
+dominant roundel/wordmark fill; gold `#CDAF6F` at ~7k, the eagle icon)
+rather than eyeballed, per the operator's own preference.
+`backgroundColor`/`secondaryBackgroundColor`/`textColor` deliberately
+left at Streamlit's defaults — every page's `st.dataframe()`/
+`st.error()`/`st.success()` output already depends on those staying
+legible, and overriding them risks a clash this piece has no reason to
+introduce. Gold has no dedicated slot in `config.toml`'s theme keys,
+so it's used as the panel's accent border in `app.py`'s own CSS
+instead — both sampled brand colors end up genuinely used, not just
+one.
+
+**Tests** — `tests/test_home_page.py` (new), same fixture pattern as
+every other page test: the page loads without exception with a real,
+reachable DB (the real `assets/logo.png` path resolves, the real
+`assets/AE-image.jpg` base64-encodes into the CSS, no exception from
+any of it) and shows "Database connected"; a second test (needs no DB
+fixture at all, runs locally) exercises the DB-down path via a mocked
+`test_connection()`, confirming the error message stays present and
+the background/logo additions don't break that branch either. All
+seven OTHER pages additionally verified via `AppTest` with mocked
+services (not formal tests — a lighter touch, since the only change
+to those files is the one added `st.logo()` line) to confirm the logo
+addition doesn't raise anywhere.
+
+**What pytest can't verify, said plainly rather than implied**:
+whether the background/overlay/panel/logo actually look right and
+stay legible is a visual judgment call, not something `pytest` or
+`AppTest`'s element-tree assertions can make. The real check is a
+manual `streamlit run app.py`, not this test file — noted here so
+"192 passed" is never read as "confirmed to look right."
+
+**Verification status**: full local suite — 192 passed (+1 locally
+runnable, the DB-down `test_home_page.py` test; the DB-connected one
+correctly skips, no `TEST_DATABASE_URL` in this sandbox), 283 skipped,
+zero import errors. `scripts/check_reachability.py`: unchanged, clean
+(no new `core`/`services`/`db` files). **Merge gate for this piece is
+a manual `streamlit run app.py` look, not real-Postgres verification**
+— this branch does not merge until the user has actually seen it
+render. See `Merge status as of this snapshot` near the top of this
 file for the authoritative merge state, not this line.
