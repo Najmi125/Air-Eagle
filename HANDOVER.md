@@ -305,9 +305,18 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **Outstanding branch as of this snapshot (2026-08-10): `streamlit-cloud-secrets`
-  pushed, NOT yet merged — awaiting the user's real-Postgres verification.**
-  `db/db.py`'s `get_engine()` raised `RuntimeError: DATABASE_URL not
+- **Outstanding branch as of this snapshot (2026-08-10): `home-page-branding`
+  pushed, NOT yet merged — holding on a manual visual review (`streamlit
+  run app.py`), not real-Postgres verification. 475/475 verified against
+  real Postgres 16, but that only covers behavior, not whether the
+  logo/background/panel actually look right — the real gate for this
+  piece is Arif looking at it.** Own dedicated log entry lives on that
+  branch until it merges (built before this session's HANDOVER.md on
+  `main` had this paragraph's current shape, so not duplicated here).
+
+- **No outstanding branches beyond that as of this snapshot (2026-08-10).
+  `streamlit-cloud-secrets` merged into `main`** — `db/db.py`'s
+  `get_engine()` raised `RuntimeError: DATABASE_URL not
   set` on every page when deployed to Streamlit Community Cloud —
   `.env` is gitignored and doesn't exist in the deployed container,
   and nothing read `st.secrets` anywhere (confirmed via grep). Added
@@ -333,9 +342,18 @@ forward.
   exactly `scripts/run_migrations.py`'s own situation) — the test that
   protects the migration script and the whole suite. `README.md` gets
   a new "Deploying to Streamlit Community Cloud" section with the
-  exact secret TOML format. 194 passed (+3), 282 skipped (unchanged),
-  `check_reachability.py` clean. See the dedicated log entry below for
-  full detail.
+  exact secret TOML format.
+
+  **476/476 verified against real Postgres 16.** The user additionally
+  confirmed, beyond the test suite, the three things that actually
+  protect the non-Streamlit callers: `_resolve_database_url()` returns
+  `None` with no runtime and no env var (so `get_engine()` raises the
+  correct `RuntimeError` rather than leaking a Streamlit-specific
+  exception); `scripts/run_migrations.py` runs clean; and `db.py`
+  genuinely does not pull `streamlit` into `sys.modules` on import —
+  confirming the in-function-import design decision held. Merged into
+  `main`, pushed; branch `streamlit-cloud-secrets` deleted, both remote
+  and local. See the dedicated log entry below for full detail.
 
 - **Merged into `main` before that**: `schedule-templates-page` — `pages/7_Schedule_Templates.py`,
   Phase 7's SECOND AND LAST UI. Three
@@ -4721,9 +4739,19 @@ errors. `scripts/check_reachability.py`: unchanged, clean.
 `st.secrets`'s actual raised-exception behavior (`StreamlitSecretNotFoundError`
 with no runtime/no secrets file) confirmed directly via a real,
 unmocked call in this sandbox before writing the guard, not assumed
-from documentation. **NOT yet run against real Postgres — no
-`TEST_DATABASE_URL` here, and this branch does not merge until the
-user's own real-Postgres verification confirms it**, same standing
-discipline as every piece this session. See `Merge status as of this
-snapshot` near the top of this file for the authoritative merge state,
-not this line.
+from documentation.
+
+**476/476 verified against real Postgres 16.** The user additionally
+confirmed, beyond the test suite, the three things that actually
+protect the non-Streamlit callers this whole piece exists for:
+`_resolve_database_url()` returns `None` with no runtime and no env
+var set (so `get_engine()` raises the correct, existing `RuntimeError`
+rather than leaking a different, Streamlit-specific exception up to
+`scripts/run_migrations.py`); `scripts/run_migrations.py` itself runs
+clean end to end; and `db.py` genuinely does not pull `streamlit` into
+`sys.modules` on import — confirming the in-function `import streamlit`
+(rather than a module-level one) actually achieves what it was
+designed for. Merged into `main`, pushed; branch
+`streamlit-cloud-secrets` deleted, both remote and local. See `Merge
+status as of this snapshot` near the top of this file for the
+authoritative merge state, not this line.
