@@ -5093,7 +5093,27 @@ weakens legibility: it doesn't — the title/status/nav text sits inside
 underlying photo is; the dim overlay was a second, largely redundant
 layer. `.stApp`'s `background-image` is now just the photo, no
 gradient. Re-verified after the change: 199 passed, `check_reachability.py`
-clean, `home.py` still loads without exception via `AppTest`. Pushed to
+clean, `home.py` still loads without exception via `AppTest`.
+
+**Second follow-up, same branch, same day**: looking at the rendered
+page surfaced two more real fixes, from the operator's own description
+of what was actually showing. (1) The seven `st.page_link()` buttons,
+laid out in a `st.columns(4)` grid, wrapped icon and label onto
+separate lines for the longer labels ("Roster Generation", "Schedule
+Templates") — each column was too narrow, producing tall, awkwardly
+stacked boxes instead of compact links. Fixed by dropping the grid
+entirely: a plain sequential list, one `st.page_link(..., use_container_width=True)`
+per row, each getting the full page width. (2) The UTC clock moved
+from its own separate line ("Choose where to go below, or use the
+sidebar — {timestamp}") to sit inline with the DB-status message
+itself (`🟢 Database connected — 🕐 {ddmmyyyy HHMM} UTC`), with a clock
+emoji and the format changed to compact `ddmmyyyy HHMM` (no
+separators) per the operator's own spec — the leading 🟢 still gets
+extracted into `st.success()`'s own icon slot as before; the clock
+emoji further into the string stays as literal text, confirmed
+directly rather than assumed. `tests/test_home_page.py` updated to
+match: the UTC assertion now checks `at.success`, not `at.markdown`.
+Re-verified: 199 passed, `check_reachability.py` clean. Pushed to
 `background-image-update`; **still not merged — the operator wants to
 look at the rendered page again before merging**, same standing
 discipline as every visual piece this session.

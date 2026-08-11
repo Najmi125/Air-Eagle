@@ -76,18 +76,22 @@ def _title_html() -> str:
 
 st.markdown(_title_html(), unsafe_allow_html=True)
 
-db_status = test_connection()
-if db_status is True:
-    st.success("🟢 Database connected")
-else:
-    st.error(f"Database error: {db_status}")
-
-now_utc = dt.datetime.now(dt.timezone.utc)
-st.write(f"Choose where to go below, or use the sidebar — {now_utc:%Y-%m-%d %H:%M} UTC")
 # A render-time snapshot, not a live-ticking clock: Streamlit only
 # re-renders on interaction, and a real tick would need an
 # auto-refresh dependency (streamlit-autorefresh, not currently in
 # requirements.txt) this isn't a live-monitoring screen enough to need.
+now_utc = dt.datetime.now(dt.timezone.utc)
+
+db_status = test_connection()
+if db_status is True:
+    # The leading emoji (only) gets extracted into st.success()'s own
+    # icon slot, not left in the body -- confirmed directly (2026-08-11).
+    # The clock emoji further into the string stays as literal text.
+    st.success(f"🟢 Database connected — 🕐 {now_utc:%d%m%Y %H%M} UTC")
+else:
+    st.error(f"Database error: {db_status}")
+
+st.write("Choose where to go below, or use the sidebar.")
 
 PAGES = [
     ("pages/1_Control_Room.py", "Control Room", "🛫"),
@@ -98,6 +102,11 @@ PAGES = [
     ("pages/6_Roster_Generation.py", "Roster Generation", "⚙️"),
     ("pages/7_Schedule_Templates.py", "Schedule Templates", "📋"),
 ]
-cols = st.columns(4)
-for i, (path, label, icon) in enumerate(PAGES):
-    cols[i % 4].page_link(path, label=label, icon=icon)
+# Plain sequential list, not a st.columns() grid -- the grid squeezed
+# each link into a narrow fixed-width column, which wrapped icon and
+# label onto separate lines for the longer labels ("Roster Generation",
+# "Schedule Templates") and read as tall, awkwardly-stacked boxes
+# (2026-08-12, operator feedback from the rendered page). Each link
+# gets the full page width instead, one per row.
+for path, label, icon in PAGES:
+    st.page_link(path, label=label, icon=icon, use_container_width=True)

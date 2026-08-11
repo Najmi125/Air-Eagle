@@ -67,9 +67,11 @@ def test_page_loads_without_exception_and_shows_db_connected(page_app):
     assert any("Operations Control Centre" in m.value for m in at.markdown)
 
 
-def test_nav_line_shows_utc_and_page_links_are_all_present(page_app):
+def test_utc_clock_is_inline_with_db_status_and_page_links_are_all_present(page_app):
+    """UTC lives in the DB-status success message itself (2026-08-12,
+    moved there per operator feedback), not a separate markdown line."""
     at = page_app.run()
-    assert any("UTC" in w.value for w in at.markdown)
+    assert any("UTC" in s.value for s in at.success)
     labels = _page_link_labels(at)
     for expected in PAGE_LINK_LABELS:
         assert expected in labels
