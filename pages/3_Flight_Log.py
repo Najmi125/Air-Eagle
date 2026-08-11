@@ -6,7 +6,8 @@ Permanent log — cancelled flights stay visible, never hidden or
 deleted, per the explicit "Flight Log ... a permanent log of all
 flights" requirement.
 
-Deliberately unstyled, matches app.py and pages/2_Crew_Data.py.
+Deliberately unstyled, matches pages/2_Crew_Data.py — the home page
+(home.py) got its own branding pass (2026-08-10/11), this one hasn't.
 """
 import datetime as dt
 import streamlit as st
