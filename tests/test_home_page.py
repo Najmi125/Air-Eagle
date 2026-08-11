@@ -21,6 +21,7 @@ dedicated element type, no .click(). These tests can only confirm each
 page-link's label is present in the element tree, not that clicking
 one actually navigates -- said plainly, not left implied.
 """
+import datetime as dt
 import os
 import sys
 from pathlib import Path
@@ -69,12 +70,20 @@ def test_page_loads_without_exception_and_shows_db_connected(page_app):
 
 def test_utc_clock_is_inline_with_db_status_and_page_links_are_all_present(page_app):
     """UTC lives in the DB-status success message itself (2026-08-12,
-    moved there per operator feedback), not a separate markdown line."""
+    moved there per operator feedback), not a separate markdown line.
+
+    Page-link labels are checked by substring, not exact match: the
+    icon is folded into the label text itself now (f"{icon} {label}"),
+    not passed via page_link's own icon= parameter -- see home.py's
+    own comment for why."""
     at = page_app.run()
     assert any("UTC" in s.value for s in at.success)
+    # dd-mm-yyyy, dashed -- computed relative to "today", never hardcoded.
+    today_dashed = dt.datetime.now(dt.timezone.utc).strftime("%d-%m-%Y")
+    assert any(today_dashed in s.value for s in at.success)
     labels = _page_link_labels(at)
     for expected in PAGE_LINK_LABELS:
-        assert expected in labels
+        assert any(expected in label for label in labels)
 
 
 def test_page_loads_without_exception_when_db_unreachable():

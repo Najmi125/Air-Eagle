@@ -87,7 +87,7 @@ if db_status is True:
     # The leading emoji (only) gets extracted into st.success()'s own
     # icon slot, not left in the body -- confirmed directly (2026-08-11).
     # The clock emoji further into the string stays as literal text.
-    st.success(f"🟢 Database connected — 🕐 {now_utc:%d%m%Y %H%M} UTC")
+    st.success(f"🟢 Database connected — 🕐 {now_utc:%d-%m-%Y %H%M} UTC")
 else:
     st.error(f"Database error: {db_status}")
 
@@ -102,11 +102,17 @@ PAGES = [
     ("pages/6_Roster_Generation.py", "Roster Generation", "⚙️"),
     ("pages/7_Schedule_Templates.py", "Schedule Templates", "📋"),
 ]
-# Plain sequential list, not a st.columns() grid -- the grid squeezed
-# each link into a narrow fixed-width column, which wrapped icon and
-# label onto separate lines for the longer labels ("Roster Generation",
-# "Schedule Templates") and read as tall, awkwardly-stacked boxes
-# (2026-08-12, operator feedback from the rendered page). Each link
-# gets the full page width instead, one per row.
+# Icon embedded directly in the label string, NOT passed via
+# page_link's own icon= parameter. Dropping st.columns() (2026-08-12,
+# first attempt) did not fix the icon-stacks-above-label problem the
+# operator reported -- confirming it isn't a column-width wrapping
+# issue. page_link's icon= layout is decided in Streamlit's compiled
+# frontend, not visible from the Python source, so this couldn't be
+# verified directly the way most other fixes in this file were. Best
+# available reasoning: label text has no special icon-slot behavior
+# (confirmed separately for st.success()'s leading-emoji extraction in
+# this same file), so folding the icon into plain label text sidesteps
+# whatever icon= does on its own. Needs the operator's own eyes on the
+# rendered page to actually confirm -- said plainly, not assumed fixed.
 for path, label, icon in PAGES:
-    st.page_link(path, label=label, icon=icon, use_container_width=True)
+    st.page_link(path, label=f"{icon} {label}", use_container_width=True)

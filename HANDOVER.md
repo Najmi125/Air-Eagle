@@ -5113,7 +5113,37 @@ extracted into `st.success()`'s own icon slot as before; the clock
 emoji further into the string stays as literal text, confirmed
 directly rather than assumed. `tests/test_home_page.py` updated to
 match: the UTC assertion now checks `at.success`, not `at.markdown`.
-Re-verified: 199 passed, `check_reachability.py` clean. Pushed to
-`background-image-update`; **still not merged — the operator wants to
-look at the rendered page again before merging**, same standing
-discipline as every visual piece this session.
+Re-verified: 199 passed, `check_reachability.py` clean.
+
+**Third follow-up, same branch, same day — a fix reported as not
+working, handled honestly rather than guessed at again.** The
+icon-above-label stacking on the page-link buttons was STILL present
+after dropping the `st.columns()` grid, reported directly from the
+rendered page — proving the previous fix's premise (narrow columns
+causing wrap) was wrong; the stacking wasn't a width issue at all.
+Also fixed: the UTC date format, `ddmmyyyy` → `dd-mm-yyyy`
+(`%d-%m-%Y`), a one-line change.
+
+For the stacking: `st.page_link()`'s actual icon-vs-label layout is
+decided in Streamlit's compiled frontend, not visible from the Python
+source (`streamlit/elements/widgets/button.py`'s `_page_link()` only
+sets protobuf fields — `icon`, `label`, `icon_position` — with no
+layout logic of its own to read). Genuinely could not verify this one
+directly the way nearly everything else in this file was verified, and
+said so explicitly rather than asserting a third confident fix. Best
+available reasoning, given two things already confirmed in this exact
+file: (1) `st.success()`'s leading-emoji extraction shows Streamlit
+alert bodies treat a leading emoji as a special, separately-laid-out
+icon; (2) `page_link`'s own `icon=` parameter is plausibly the same
+mechanism. Changed to fold the icon directly into the label string
+(`label=f"{icon} {label}"`, no `icon=` parameter) — plain text has no
+special icon-slot behavior, sidestepping whatever `icon=` does on its
+own, regardless of whether that specific mechanism was the actual
+cause. `tests/test_home_page.py` updated for the new label shape
+(substring match, `"Control Room" in "🛫 Control Room"`, not exact
+match) and for the date format (computed relative to the real
+`datetime.now()` at test time, never hardcoded). Re-verified: 199
+passed, `check_reachability.py` clean. **This one is explicitly
+unconfirmed visually — flagged as the operator's own next check, not
+claimed fixed.** Pushed to `background-image-update`; still not
+merged.
