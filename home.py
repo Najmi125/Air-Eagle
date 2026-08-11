@@ -91,28 +91,9 @@ if db_status is True:
 else:
     st.error(f"Database error: {db_status}")
 
-st.write("Choose where to go below, or use the sidebar.")
-
-PAGES = [
-    ("pages/1_Control_Room.py", "Control Room", "🛫"),
-    ("pages/2_Crew_Data.py", "Crew Data", "👨‍✈️"),
-    ("pages/3_Flight_Log.py", "Flight Log", "📘"),
-    ("pages/4_Roster.py", "Roster", "🗓️"),
-    ("pages/5_Assistant.py", "OCC Assistant", "🤖"),
-    ("pages/6_Roster_Generation.py", "Roster Generation", "⚙️"),
-    ("pages/7_Schedule_Templates.py", "Schedule Templates", "📋"),
-]
-# Icon embedded directly in the label string, NOT passed via
-# page_link's own icon= parameter. Dropping st.columns() (2026-08-12,
-# first attempt) did not fix the icon-stacks-above-label problem the
-# operator reported -- confirming it isn't a column-width wrapping
-# issue. page_link's icon= layout is decided in Streamlit's compiled
-# frontend, not visible from the Python source, so this couldn't be
-# verified directly the way most other fixes in this file were. Best
-# available reasoning: label text has no special icon-slot behavior
-# (confirmed separately for st.success()'s leading-emoji extraction in
-# this same file), so folding the icon into plain label text sidesteps
-# whatever icon= does on its own. Needs the operator's own eyes on the
-# rendered page to actually confirm -- said plainly, not assumed fixed.
-for path, label, icon in PAGES:
-    st.page_link(path, label=f"{icon} {label}", use_container_width=True)
+st.write("Use the sidebar to navigate.")
+# Page-link buttons (2026-08-12: added, then removed same day) were
+# genuinely redundant with the sidebar's own automatic page list --
+# st.navigation() renders that regardless of anything on this page, so
+# this text was never inaccurate even while the buttons existed. Per
+# the operator's own call: one navigation surface, not two.

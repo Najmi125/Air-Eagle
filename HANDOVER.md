@@ -5145,5 +5145,37 @@ match) and for the date format (computed relative to the real
 `datetime.now()` at test time, never hardcoded). Re-verified: 199
 passed, `check_reachability.py` clean. **This one is explicitly
 unconfirmed visually — flagged as the operator's own next check, not
-claimed fixed.** Pushed to `background-image-update`; still not
-merged.
+claimed fixed.**
+
+**Fourth follow-up, same branch, same day — a real screenshot,
+confirming the icon fix and settling the buttons question.** The
+operator sent an actual screenshot of the rendered page (not just a
+text description) — first time this piece had genuine visual
+verification rather than reasoning from source alone. Confirmed: the
+icon-in-label-text fix from the previous entry worked, every page-link
+showed icon and label correctly inline, no more stacking. Also
+visible: a faint "Air Eagle" cursive watermark ghosting through
+`.block-container`'s 92%-opaque panel, from the photo's own painted
+fuselage script showing through the 8% transparency where the panel
+happens to overlap that part of the image — flagged to the operator as
+an emergent, not necessarily unwanted, effect rather than silently
+left unmentioned.
+
+Operator's actual call, having seen it working: remove the page-link
+buttons entirely — `st.navigation()` already renders the sidebar's own
+automatic page list regardless of anything on this page, making the
+buttons a genuinely redundant second navigation surface, not a needed
+one. `home.py`'s `PAGES` list and the `st.page_link()` loop removed;
+the nav text reverts to "Use the sidebar to navigate." (accurate again
+without "below" pointing at buttons that no longer exist).
+`tests/test_home_page.py`: the page-link-label test and its
+`_page_link_labels()` helper removed; a new test confirms zero
+`UnknownElement`s remain in the tree (page_link was the only source of
+that element type on this page) and the nav text reads exactly "Use
+the sidebar to navigate." One combined test
+(`test_utc_clock_is_inline_with_db_status_and_page_links_are_all_present`)
+replaced by two narrower ones (`test_utc_clock_is_inline_with_db_status`,
+`test_nav_text_points_to_sidebar_only`) — net one more test file-wide,
+DB-gated like the one it replaced, so the locally-passing count stays
+199; skipped goes 284 → 285. `check_reachability.py` clean. Pushed to
+`background-image-update`; still not merged.
