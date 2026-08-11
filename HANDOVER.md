@@ -328,13 +328,16 @@ forward.
   nonexistent file now exits 1 with a named warning, where the
   identical scenario previously exited 0 reporting "all reachable" —
   and confirmed the sidebar genuinely reads "Home" with the page
-  rendering correctly. **One open item, not blocking this merge**: the
-  background image (`assets/AE-image.jpg`, 640x480) still reads as
-  poor quality once stretched across a full-page background — no
-  higher-resolution source was available at the time; flagged here for
-  a future round rather than silently left unaddressed. Merged into
-  `main`, pushed; branch `home-page-branding` deleted, both remote and
-  local. See the two dated log entries below for full detail.
+  rendering correctly. Merged into `main`, pushed; branch
+  `home-page-branding` deleted, both remote and local. **The
+  background-image resolution open item (below) was partially resolved
+  afterward, on its own branch (`background-image-update`,
+  2026-08-11): 640x480 → 910x672.** Still not fully resolved — a
+  3000px+ original (likely available if this came from a phone camera)
+  would still be worth swapping in later, same path, same approach. See
+  the two dated log entries below for full detail on the original
+  merge, and the newest entry at the end of the file for the image
+  update.
 
 - **Merged into `main` before that**: `streamlit-cloud-secrets` —
   `db/db.py`'s `get_engine()` raised `RuntimeError: DATABASE_URL not
@@ -5039,3 +5042,45 @@ in a future round. Merged into `main`, pushed; branch
 `home-page-branding` deleted, both remote and local. See `Merge status
 as of this snapshot` near the top of this file for the authoritative
 merge state, not this line.
+
+## 2026-08-11 (continued): background image swap — 640x480 to 910x672.
+## NOT YET MERGED.
+
+Follow-up to the open item above. A new source photo arrived at
+910x672 (up from 640x480) — real progress, but a first attempt to
+land it on disk didn't go as described: the operator reported it as
+already converted to JPEG quality 85 at ~80KB, but what was actually
+found at `assets/AE-image.jpg` on the first check was unchanged (still
+the old 640x480 file), and on a second check the new file had landed
+as `assets/AE-image.png` instead — the original, unconverted 820KB
+PNG, not the described JPEG. Verified directly rather than trusting
+either description, per this session's own standing practice — caught
+both mismatches before touching git.
+
+Converted it here instead of bouncing it back again: `Image.open(...).convert("RGB")`
+(PNG is RGBA; JPEG has no alpha channel) saved as JPEG quality 85,
+replacing `assets/AE-image.jpg` in place (910x672, 84293 bytes ≈
+82KB, matching the operator's own ~80KB target closely), the leftover
+`assets/AE-image.png` removed. Same filename as before, so `home.py`
+needed no code change — the base64-embedding and dim-overlay CSS
+treatment are both untouched, deliberately: at 910px the image is
+still upscaled roughly 2x on a typical desktop, and the existing dim
+overlay is what makes that read as deliberate atmosphere rather than a
+blurry photo, per the operator's own instruction to keep it as-is
+rather than compensate further.
+
+**Still not fully resolved, said plainly rather than closed out**: a
+3000px+ original — likely available if this photo came from a phone
+camera — would still be worth swapping in later. Same path
+(`assets/AE-image.jpg`), same JPEG-quality-85 conversion approach, same
+"verify actual dimensions/format on disk before committing" discipline
+that caught this round's two mismatches.
+
+**Verification status**: full local suite — 199 passed, 284 skipped,
+zero import errors (unchanged counts — an asset swap, no code touched
+beyond the one-off conversion script run directly, not committed).
+`scripts/check_reachability.py`: clean. `home.py` re-run via `AppTest`
+with the new file in place: no exception. Pushed to
+`background-image-update`; **not merged — the operator wants to look
+at the rendered page again before merging**, same standing discipline
+as every visual piece this session.
