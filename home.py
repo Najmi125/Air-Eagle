@@ -9,11 +9,17 @@ AppTest.from_file("home.py"), exactly like every other page in
 pages/ — this file IS a page, just one that happens to live at the
 repo root instead of under pages/.
 
-Background image + dark overlay stay scoped to this page only, same
-as before: this CSS only ever executes when THIS script runs, and
-st.navigation() only ever executes the one selected page's script —
-so the seven working pages stay clean by construction, unchanged from
-the original reasoning.
+Background image stays scoped to this page only: this CSS only ever
+executes when THIS script runs, and st.navigation() only ever executes
+the one selected page's script — so the seven working pages stay clean
+by construction, unchanged from the original reasoning.
+
+No dark overlay on the photo itself (removed 2026-08-11, operator
+request — the original dim treatment made the image read too dark).
+Legibility doesn't depend on it: the actual title/status/nav text sits
+inside .block-container's own near-opaque white panel below, which is
+what protects readability regardless of how bright the underlying
+photo is.
 """
 import base64
 import datetime as dt
@@ -30,8 +36,7 @@ def _background_css() -> str:
     return f"""
     <style>
     .stApp {{
-        background-image: linear-gradient(rgba(10, 15, 35, 0.6), rgba(10, 15, 35, 0.6)),
-                           url("data:image/jpeg;base64,{encoded}");
+        background-image: url("data:image/jpeg;base64,{encoded}");
         background-size: cover;
         background-position: center;
         background-attachment: fixed;
@@ -71,28 +76,24 @@ def _title_html() -> str:
 
 st.markdown(_title_html(), unsafe_allow_html=True)
 
-db_status = test_connection()
-if db_status is True:
-    st.success("🟢 Database connected")
-else:
-    st.error(f"Database error: {db_status}")
-
-now_utc = dt.datetime.now(dt.timezone.utc)
-st.write(f"Choose where to go below, or use the sidebar — {now_utc:%Y-%m-%d %H:%M} UTC")
 # A render-time snapshot, not a live-ticking clock: Streamlit only
 # re-renders on interaction, and a real tick would need an
 # auto-refresh dependency (streamlit-autorefresh, not currently in
 # requirements.txt) this isn't a live-monitoring screen enough to need.
+now_utc = dt.datetime.now(dt.timezone.utc)
 
-PAGES = [
-    ("pages/1_Control_Room.py", "Control Room", "🛫"),
-    ("pages/2_Crew_Data.py", "Crew Data", "👨‍✈️"),
-    ("pages/3_Flight_Log.py", "Flight Log", "📘"),
-    ("pages/4_Roster.py", "Roster", "🗓️"),
-    ("pages/5_Assistant.py", "OCC Assistant", "🤖"),
-    ("pages/6_Roster_Generation.py", "Roster Generation", "⚙️"),
-    ("pages/7_Schedule_Templates.py", "Schedule Templates", "📋"),
-]
-cols = st.columns(4)
-for i, (path, label, icon) in enumerate(PAGES):
-    cols[i % 4].page_link(path, label=label, icon=icon)
+db_status = test_connection()
+if db_status is True:
+    # The leading emoji (only) gets extracted into st.success()'s own
+    # icon slot, not left in the body -- confirmed directly (2026-08-11).
+    # The clock emoji further into the string stays as literal text.
+    st.success(f"🟢 Database connected — 🕐 {now_utc:%d-%m-%Y %H%M} UTC")
+else:
+    st.error(f"Database error: {db_status}")
+
+st.write("Use the sidebar to navigate.")
+# Page-link buttons (2026-08-12: added, then removed same day) were
+# genuinely redundant with the sidebar's own automatic page list --
+# st.navigation() renders that regardless of anything on this page, so
+# this text was never inaccurate even while the buttons existed. Per
+# the operator's own call: one navigation surface, not two.

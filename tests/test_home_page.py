@@ -16,11 +16,12 @@ Asserted against .icon here, not .value, since that's what the code
 actually produces and what a naive .value check would have silently
 gotten wrong.
 
-st.page_link() renders as a generic UnknownElement in AppTest -- no
-dedicated element type, no .click(). These tests can only confirm each
-page-link's label is present in the element tree, not that clicking
-one actually navigates -- said plainly, not left implied.
+Page-link buttons (added 2026-08-12, removed same day per operator
+request -- genuinely redundant with the sidebar's own automatic page
+list from st.navigation()) are no longer part of this page; no test
+coverage for them here.
 """
+import datetime as dt
 import os
 import sys
 from pathlib import Path
@@ -32,11 +33,6 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from db.db import get_engine
-
-PAGE_LINK_LABELS = [
-    "Control Room", "Crew Data", "Flight Log", "Roster",
-    "OCC Assistant", "Roster Generation", "Schedule Templates",
-]
 
 
 @pytest.fixture
@@ -51,13 +47,6 @@ def page_app(migrated_db, monkeypatch):
     get_engine.cache_clear()
 
 
-def _page_link_labels(at):
-    return [
-        el.label for el in at.main
-        if type(el).__name__ == "UnknownElement" and el.label
-    ]
-
-
 def test_page_loads_without_exception_and_shows_db_connected(page_app):
     at = page_app.run()
     assert not at.exception
@@ -67,12 +56,23 @@ def test_page_loads_without_exception_and_shows_db_connected(page_app):
     assert any("Operations Control Centre" in m.value for m in at.markdown)
 
 
-def test_nav_line_shows_utc_and_page_links_are_all_present(page_app):
+def test_utc_clock_is_inline_with_db_status(page_app):
+    """UTC lives in the DB-status success message itself (2026-08-12,
+    moved there per operator feedback), not a separate markdown line."""
     at = page_app.run()
-    assert any("UTC" in w.value for w in at.markdown)
-    labels = _page_link_labels(at)
-    for expected in PAGE_LINK_LABELS:
-        assert expected in labels
+    assert any("UTC" in s.value for s in at.success)
+    # dd-mm-yyyy, dashed -- computed relative to "today", never hardcoded.
+    today_dashed = dt.datetime.now(dt.timezone.utc).strftime("%d-%m-%Y")
+    assert any(today_dashed in s.value for s in at.success)
+
+
+def test_nav_text_points_to_sidebar_only(page_app):
+    """No page-link buttons on this page (removed 2026-08-12) -- the
+    sidebar's own automatic page list is the only navigation surface,
+    per the operator's own call."""
+    at = page_app.run()
+    assert any(w.value == "Use the sidebar to navigate." for w in at.markdown)
+    assert not any(type(el).__name__ == "UnknownElement" for el in at.main)
 
 
 def test_page_loads_without_exception_when_db_unreachable():
