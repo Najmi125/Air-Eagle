@@ -9,11 +9,17 @@ AppTest.from_file("home.py"), exactly like every other page in
 pages/ — this file IS a page, just one that happens to live at the
 repo root instead of under pages/.
 
-Background image + dark overlay stay scoped to this page only, same
-as before: this CSS only ever executes when THIS script runs, and
-st.navigation() only ever executes the one selected page's script —
-so the seven working pages stay clean by construction, unchanged from
-the original reasoning.
+Background image stays scoped to this page only: this CSS only ever
+executes when THIS script runs, and st.navigation() only ever executes
+the one selected page's script — so the seven working pages stay clean
+by construction, unchanged from the original reasoning.
+
+No dark overlay on the photo itself (removed 2026-08-11, operator
+request — the original dim treatment made the image read too dark).
+Legibility doesn't depend on it: the actual title/status/nav text sits
+inside .block-container's own near-opaque white panel below, which is
+what protects readability regardless of how bright the underlying
+photo is.
 """
 import base64
 import datetime as dt
@@ -30,8 +36,7 @@ def _background_css() -> str:
     return f"""
     <style>
     .stApp {{
-        background-image: linear-gradient(rgba(10, 15, 35, 0.6), rgba(10, 15, 35, 0.6)),
-                           url("data:image/jpeg;base64,{encoded}");
+        background-image: url("data:image/jpeg;base64,{encoded}");
         background-size: cover;
         background-position: center;
         background-attachment: fixed;

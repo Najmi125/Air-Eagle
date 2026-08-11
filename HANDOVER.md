@@ -5080,7 +5080,20 @@ that caught this round's two mismatches.
 zero import errors (unchanged counts — an asset swap, no code touched
 beyond the one-off conversion script run directly, not committed).
 `scripts/check_reachability.py`: clean. `home.py` re-run via `AppTest`
-with the new file in place: no exception. Pushed to
-`background-image-update`; **not merged — the operator wants to look
-at the rendered page again before merging**, same standing discipline
-as every visual piece this session.
+with the new file in place: no exception.
+
+**Follow-up on the same branch, same day**: looking at the rendered
+page, the dim overlay (`linear-gradient(rgba(10, 15, 35, 0.6), ...)`
+composited under the photo, added in round 2 for the "screen read at
+0300" legibility argument) made the image read as too dark — removed
+per the operator's own request. Re-examined whether this actually
+weakens legibility: it doesn't — the title/status/nav text sits inside
+`.block-container`'s own near-opaque white panel (`rgba(255, 255, 255,
+0.92)`), which is the real protection regardless of how bright the
+underlying photo is; the dim overlay was a second, largely redundant
+layer. `.stApp`'s `background-image` is now just the photo, no
+gradient. Re-verified after the change: 199 passed, `check_reachability.py`
+clean, `home.py` still loads without exception via `AppTest`. Pushed to
+`background-image-update`; **still not merged — the operator wants to
+look at the rendered page again before merging**, same standing
+discipline as every visual piece this session.
