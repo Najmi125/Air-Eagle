@@ -446,6 +446,34 @@ def test_validate_pair_writes_nothing(_patch_engine):
     assert len(assignment_service.get_roster_for_crew(fo)) == 0
 
 
+def test_validate_pair_on_an_already_written_pair_does_not_double_count_itself_as_history(_patch_engine):
+    """Real bug, found via the operator's own real-Postgres run of
+    publish_window()'s per-rotation re-validation (2026-08-14): calling
+    validate_pair() again for a pair that's ALREADY been written (the
+    exact scenario publish_window() needs — re-validate a PROPOSED
+    pair fresh before flipping it to PLANNED) used to see each pilot's
+    own already-committed row for these same flight_ids as "existing
+    history" alongside the freshly-built candidate duty being validated
+    — two duties covering the identical report/debrief window, which
+    the FDP/rest validator correctly (from ITS perspective) flagged as
+    a zero-rest violation. _validate_new_duty() now excludes any
+    existing duty whose flight_ids exactly match the one being
+    validated — real history stays intact, but a duty can't collide
+    with its own already-written self."""
+    cpt = _add_crew("CPT", date_of_birth=_dob_for_age(50))
+    fo = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45))
+
+    written = assignment_service.assign_pair_to_duty(cpt, fo, [flight_id])
+    assert written.status == "ALLOWED"
+
+    revalidated = assignment_service.validate_pair(cpt, fo, [flight_id])
+
+    assert revalidated.status == "LEGAL"
+    assert not any(a.rule_code.startswith("D21") for a in revalidated.commander_alerts)
+    assert not any(a.rule_code.startswith("D21") for a in revalidated.second_pilot_alerts)
+
+
 def test_validate_pair_domestic_both_65_plus_is_illegal(_patch_engine):
     cpt = _add_crew("CPT", date_of_birth=_dob_for_age(70))
     fo = _add_crew("FO", date_of_birth=_dob_for_age(65))
@@ -607,21 +635,30 @@ def test_fill_remaining_seat_after_manual_unassign_uses_current_partner(_patch_e
     from_duty()) and refilled with a NEW pilot via assign_crew_to_duty()
     (the "fill the remaining seat of an already-real pair" case) — the
     pairing check must evaluate against whoever is CURRENTLY active on
-    the other seat, not the removed one. fo_old (65) would make the
-    pair illegal if it were still active; it isn't."""
+    the other seat, using their REAL age, not skip the check or use a
+    stale/cached value.
+
+    cpt is 65+ throughout. fo_first (under 65) makes the INITIAL pair
+    legal, so it can actually get written. After fo_first is removed
+    and fo_second (also 65+) is refilled against the still-active cpt,
+    the pair must be REJECTED (domestic: illegal once BOTH are 65+) —
+    proving the refill's pairing check found the real, current cpt
+    (not e.g. silently treating the seat as still-unpaired and letting
+    a genuinely illegal pairing through)."""
     cpt = _add_crew("CPT", date_of_birth=_dob_for_age(70))
-    fo_old = _add_crew("FO", date_of_birth=_dob_for_age(65))
-    fo_new = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    fo_first = _add_crew("FO", date_of_birth=_dob_for_age(40))
+    fo_second = _add_crew("FO", date_of_birth=_dob_for_age(67))
     flight_id = _add_flight(dt.datetime(2026, 7, 20, 5, 45), dt.datetime(2026, 7, 20, 7, 45), domestic=True)
 
-    first = assignment_service.assign_pair_to_duty(cpt, fo_old, [flight_id])
+    first = assignment_service.assign_pair_to_duty(cpt, fo_first, [flight_id])
     assert first.status == "ALLOWED"
-    assignment_service.remove_assignment_from_duty(fo_old, first.second_pilot_duty_id)
+    assignment_service.remove_assignment_from_duty(fo_first, first.second_pilot_duty_id)
 
-    second = assignment_service.assign_crew_to_duty(fo_new, [flight_id], "FO", operating_position="SECOND_PILOT")
+    second = assignment_service.assign_crew_to_duty(fo_second, [flight_id], "FO", operating_position="SECOND_PILOT")
 
-    assert second.status == "ALLOWED"
+    assert second.status == "REJECTED"
     assert second.paired_crew_id == cpt
+    assert len(assignment_service.get_roster_for_crew(fo_second)) == 0
 
 
 def test_assign_crew_to_duty_rejects_pilot_with_no_operating_position(_patch_engine):
@@ -1221,14 +1258,16 @@ def test_find_legal_candidates_includes_65_plus_when_other_seat_uncovered(_patch
     assert old_candidate in ids
 
 
-def test_find_legal_candidates_includes_candidate_when_other_seats_dob_missing(_patch_engine):
+def test_find_legal_candidates_excludes_candidate_when_other_seats_dob_missing(_patch_engine):
     """The real other-seat occupant has no recorded date_of_birth --
-    AE-CREW-PAIR-AGE-001_DOB_MISSING (NEEDS_MANUAL_REVIEW), not
-    ILLEGAL, so the candidate stays included in the LEGAL/WARNING
-    selectable set. Recorded as a known limitation of DownstreamConflict.
-    candidates being a bare List[str] (no room to flag "this candidate
-    is fine, but their would-be partner's data is incomplete") in
-    HANDOVER.md, not a claim the two cases are equivalent."""
+    AE-CREW-PAIR-AGE-001_DOB_MISSING (NEEDS_MANUAL_REVIEW). This is
+    the exact defect find_legal_candidates_for_seat() (2026-08-12)
+    fixes over the old bare-List[str] find_legal_candidates_for_duty():
+    a NEEDS_MANUAL_REVIEW candidate must NOT be indistinguishable from
+    a genuinely LEGAL one — it's correctly excluded from the
+    LEGAL/WARNING selectable set, but still returned (not silently
+    dropped), carrying its real reason so a caller can show it
+    separately rather than mislabel it "legal"."""
     candidate = _add_crew("CPT", date_of_birth=dt.date(1986, 1, 1))
 
     target_flight = _add_flight(dt.datetime(2026, 8, 3, 5, 45), dt.datetime(2026, 8, 3, 7, 45))
@@ -1239,7 +1278,12 @@ def test_find_legal_candidates_includes_candidate_when_other_seats_dob_missing(_
         [target_flight], "CPT", operating_position="COMMANDER")
     ids = _legal_ids(candidates)
 
-    assert candidate in ids
+    assert candidate not in ids  # excluded from the selectable set
+
+    candidate_status = next(c for c in candidates if c.crew_id == candidate)
+    assert candidate_status.status == "NEEDS_MANUAL_REVIEW"
+    assert candidate_status.blocking_reasons  # a real reason, not silently empty
+    assert "DOB" in candidate_status.blocking_reasons[0] or "date of birth" in candidate_status.blocking_reasons[0].lower()
 
 
 def test_downstream_conflict_candidates_exclude_age_illegal_pairing(_patch_engine):

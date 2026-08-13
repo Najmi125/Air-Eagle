@@ -5331,11 +5331,65 @@ scoped exactly to what the plan named: `services/assignment_service.py`,
 `pages/4_Roster.py`, `pages/6_Roster_Generation.py`, their tests, the
 two new migrations, and this file — no other page or service touched.
 
-**Not yet done**: the operator's own real-Postgres run of the full
-suite (migration 017 specifically has not been independently verified
-the way migration 016 was before this piece started) and the manual
-click-through this session's UI pieces normally get before merging.
-One branch (`flight-deck-crew-package`), merged as one unit once that
-verification is in — a half-migrated state would leave the app
-genuinely broken against a shared `roster` table. No merge without it,
-same standing discipline as every piece this session.
+**Not yet done**: the manual click-through this session's UI pieces
+normally get before merging. One branch (`flight-deck-crew-package`),
+merged as one unit once that's in — a half-migrated state would leave
+the app genuinely broken against a shared `roster` table.
+
+**First real-Postgres verification round (2026-08-14): 517 passed, 9
+failed.** Diff scope confirmed exactly the 14 files the plan named;
+`check_reachability.py` clean; migration 017 confirmed alongside 016.
+All nine failures were investigated individually rather than patched
+by adjusting expected numbers — eight were genuinely test-side, one
+was a real, previously-undiscovered bug:
+
+- **Real bug, fixed**: `publish_window()`'s per-rotation re-validation
+  (the whole reason this piece exists — re-checking a PROPOSED pair
+  fresh before flipping it to PLANNED) called `validate_pair()` on a
+  pair that was ALREADY written. `_validate_new_duty()`'s history
+  lookup had no way to know the candidate duty it was about to build
+  WAS the same duty already sitting in the pilot's own roster history
+  for those exact flight_ids — so the validator saw two duties
+  covering the identical report/debrief window and correctly (from its
+  own perspective) flagged a zero-rest violation, rejecting a pair
+  that was actually still perfectly legal. `_recompute_one_duty_after_
+  delay()` (pre-existing, unrelated to this piece) already had the
+  right pattern for this — exclude the duty being re-validated from
+  its own history before re-adding it — but `_validate_new_duty()`
+  always mints a fresh synthetic duty_id, so it had no duty_id to
+  exclude by. Fixed by excluding, from history, any existing duty
+  whose OWN flight_ids exactly match the ones being validated — a
+  correct proxy for "this is the same physical duty," safe for every
+  other caller (a genuinely new assignment never has an existing duty
+  for flight_ids it hasn't been assigned to yet, so the exclusion is a
+  no-op there). New targeted test: `test_validate_pair_on_an_already_
+  written_pair_does_not_double_count_itself_as_history` in `tests/
+  test_assignment_service.py`, alongside the two integration-level
+  publish tests that originally surfaced it.
+- **Test-side, `tests/test_assignment_service.py` (2 fixed)**:
+  `test_fill_remaining_seat_after_manual_unassign_uses_current_partner`
+  had a fixture that contradicted its own stated intent (both pilots
+  65+, asserted the initial pair ALLOWED when domestic rules correctly
+  reject it) — rebuilt so the initial pair is genuinely legal and the
+  refill scenario now proves something real: refilling against a 65+
+  candidate correctly gets REJECTED against the still-active, real
+  65+ Commander, not silently allowed. `test_find_legal_candidates_
+  includes_candidate_when_other_seats_dob_missing` asserted the
+  superseded pre-this-piece behavior (DOB-missing treated as
+  "legal") — rewritten (and renamed to `..._excludes_...`) to assert
+  the actual, correct, intended behavior: NEEDS_MANUAL_REVIEW, a real
+  reason, excluded from the selectable set.
+- **Test-side, un-reworked callers outside this piece's own test files
+  (5 fixed)**: `tests/test_assistant_page.py`'s `_seed_duty_yesterday()`
+  (used by 4 tests) and `tests/test_rotation_template_service.py`'s
+  `test_expand_approve_then_assign_crew_reproduces_hand_verified_
+  numbers` both called `assign_crew_to_duty(..., "CPT")` directly,
+  which the new pilot guard now correctly rejects. The Assistant page
+  tests aren't about pairing at all — switched to seeding the roster
+  row directly via SQL, same pattern `test_assignment_service.py`'s
+  own `_seed_duty()` already uses. The rotation-template test IS about
+  proving the real gate computes correct numbers for a template-sourced
+  flight — kept on the real API, switched to `assign_pair_to_duty()`.
+
+Pushed for re-verification; still awaiting the operator's own
+real-Postgres confirmation and manual click-through before merge.

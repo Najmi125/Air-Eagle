@@ -516,13 +516,21 @@ def test_create_template_rejects_leg_with_missing_flight_no(_patch_engine):
 # ------------------------------------------------------------------
 
 def test_expand_approve_then_assign_crew_reproduces_hand_verified_numbers(_patch_engine):
+    """CPT can no longer be assigned solo (2026-08-12, flight-deck crew
+    package) — assign_pair_to_duty() through the real gate, same as
+    every other pilot assignment now. The point of this test is
+    unchanged: a template-sourced flight must be indistinguishable from
+    a manually-entered one to the real legality/FDP computation, so
+    this deliberately stays on the real pair-assignment API rather than
+    seeding via SQL."""
     instance_id = _one_instance_id()
     flight_ids = rts.approve_instance(instance_id)
 
     cpt = _add_crew("CPT")
-    result = assignment_service.assign_crew_to_duty(cpt, sorted(flight_ids), "CPT")
+    fo = _add_crew("FO")
+    result = assignment_service.assign_pair_to_duty(cpt, fo, sorted(flight_ids))
 
     assert result.status == "ALLOWED"
-    assert result.computed_report_time == dt.datetime(2026, 8, 3, 18, 15)
-    assert result.computed_debrief_time == dt.datetime(2026, 8, 4, 0, 0)
-    assert result.computed_fdp_hours == pytest.approx(5.75)
+    assert result.validation.commander_computed_report_time == dt.datetime(2026, 8, 3, 18, 15)
+    assert result.validation.commander_computed_debrief_time == dt.datetime(2026, 8, 4, 0, 0)
+    assert result.validation.commander_computed_fdp_hours == pytest.approx(5.75)

@@ -690,6 +690,22 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
         lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
         existing_records = _load_duty_records_for_crew(
             engine, crew_id, crew_row["base"], start=lookback_start, end=duty_result.debrief_time)
+        # Exclude any existing record covering the EXACT SAME flight_ids
+        # as the duty being validated here -- that's not real history,
+        # it's this same duty already written (publish_window()
+        # re-validating an already-PROPOSED pair is the one real caller
+        # that hits this: without this filter, the pilot's own
+        # already-committed row for these flights would sit alongside
+        # the freshly-built candidate `new_duty` for the identical
+        # report/debrief window, and the validator would see two
+        # simultaneous duties with zero rest between them -- a
+        # self-inflicted rest violation, not a genuine one. Fresh
+        # assignments (assign_crew_to_duty()/assign_pair_to_duty() at
+        # write time) never have an existing duty for these exact
+        # flight_ids yet, so this is a no-op for them.
+        if flight_ids:
+            target_flight_set = set(flight_ids)
+            existing_records = [r for r in existing_records if set(r["flight_ids"]) != target_flight_set]
         existing_duties = [r["duty"] for r in existing_records]
 
         all_duties = sorted(existing_duties + [new_duty], key=lambda d: d.start_utc)
