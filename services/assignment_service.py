@@ -88,6 +88,17 @@ FTL_EXEMPT_ROLES = {"LM", "ENGR"}
 # currently holds a valid license/medical/currency at all. Every
 # role, exempt or not, needs this check, which is exactly why it's
 # a separate set/function rather than folded into FTL_EXEMPT_ROLES.
+
+# Flight-deck crew package (2026-08-12) — the composition rule as
+# data, one place. Grade (crew.role: CPT/FO) and operating position
+# (roster.operating_position: COMMANDER/SECOND_PILOT — what a pilot
+# DOES on this specific flight) are two different things; this maps
+# which grades are eligible for which seat. Commander must be
+# CPT-graded; Second Pilot may be CPT or FO graded — operator
+# confirmed no separate right-seat qualification exists, any current
+# Captain may fly Second Pilot.
+SEAT_ELIGIBLE_GRADES = {"COMMANDER": {"CPT"}, "SECOND_PILOT": {"CPT", "FO"}}
+
 QUALIFICATION_EXPIRY_FIELDS = {
     "license_expiry": "LICENSE",
     "medical_expiry": "MEDICAL",
@@ -185,6 +196,23 @@ def _check_crew_qualifications(crew_row: pd.Series, duty_date) -> List[RuleAlert
 
 
 @dataclass
+class CandidateStatus:
+    """Replaces the old bare List[str] find_legal_candidates_for_duty()
+    returned (2026-08-12) — that shape let a NEEDS_REVIEW candidate
+    (e.g. a missing DG expiry) show up indistinguishable from a
+    genuinely LEGAL one, only for the real gate to refuse them at
+    actual assignment time. Every evaluated candidate is returned now,
+    not just the passing ones — callers filter to LEGAL + permitted
+    WARNING for "selectable," and can still show NEEDS_REVIEW/ILLEGAL
+    candidates separately with their real reason, never mislabeled
+    "legal"."""
+    crew_id: str
+    status: str  # AlertStatus values: "LEGAL", "WARNING", "ILLEGAL", "NEEDS_MANUAL_REVIEW"
+    blocking_reasons: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
 class DownstreamConflict:
     duty_id: str
     flight_ids: List[int]
@@ -234,6 +262,47 @@ class AssignmentResult:
     pairing_constraint: Optional[str] = None
 
 
+@dataclass
+class PairValidationResult:
+    """validate_pair()'s dry-run result — both seats evaluated
+    together, nothing written. status is the worst of: either pilot's
+    own individual FDP/rest/qualification result, or the direct
+    age-pairing check between the two proposed candidates (computed
+    here, not via _check_crew_pairing_age()'s DB-lookup path — see
+    validate_pair()'s own docstring for why)."""
+    status: str  # AlertStatus values: "LEGAL", "WARNING", "ILLEGAL", "NEEDS_MANUAL_REVIEW"
+    commander_crew_id: str
+    second_pilot_crew_id: str
+    commander_status: str
+    second_pilot_status: str
+    commander_alerts: list = field(default_factory=list)
+    second_pilot_alerts: list = field(default_factory=list)
+    pair_alerts: list = field(default_factory=list)
+    commander_alert_summary: Optional["AlertSummary"] = None
+    second_pilot_alert_summary: Optional["AlertSummary"] = None
+    commander_computed_report_time: Optional[object] = None
+    commander_computed_debrief_time: Optional[object] = None
+    commander_computed_fdp_hours: Optional[float] = None
+    second_pilot_computed_report_time: Optional[object] = None
+    second_pilot_computed_debrief_time: Optional[object] = None
+    second_pilot_computed_fdp_hours: Optional[float] = None
+
+
+@dataclass
+class PairAssignmentResult:
+    """assign_pair_to_duty()'s result — both-or-neither, matching
+    validation.status: REJECTED/NEEDS_REVIEW writes nothing for either
+    seat; ALLOWED writes both."""
+    status: str  # "ALLOWED", "REJECTED", or "NEEDS_REVIEW"
+    validation: PairValidationResult
+    commander_roster_ids: List[int] = field(default_factory=list)
+    second_pilot_roster_ids: List[int] = field(default_factory=list)
+    commander_duty_id: Optional[str] = None
+    second_pilot_duty_id: Optional[str] = None
+    commander_downstream_conflicts: List["DownstreamConflict"] = field(default_factory=list)
+    second_pilot_downstream_conflicts: List["DownstreamConflict"] = field(default_factory=list)
+
+
 # ------------------------------------------------------------------
 # Internal: reconstruct Duty objects (and their underlying roster
 # records) from the roster+flights tables for one crew member.
@@ -252,7 +321,7 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
     """
     query = """
         SELECT r.roster_id, r.duty_id, r.report_time, r.debrief_time,
-               r.role_assigned, f.flight_id,
+               r.role_assigned, r.operating_position, f.flight_id,
                COALESCE(f.dep_time_actual, f.dep_time_planned) AS dep_time,
                COALESCE(f.arr_time_actual, f.arr_time_planned) AS arr_time,
                f.origin, f.destination, f.meal_provided, f.snack_provided
@@ -305,6 +374,7 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
             "duty": duty,
             "flight_ids": list(group["flight_id"]),
             "role_assigned": first["role_assigned"],
+            "operating_position": first["operating_position"],
             "roster_ids": list(group["roster_id"]),
         })
 
@@ -379,16 +449,22 @@ def _pairing_constraint_message(crew_id: str, age: int, domestic: bool) -> str:
     )
 
 
-def _find_paired_pilot(engine, flight_ids: Optional[List[int]], role_assigned: str,
+def _find_paired_pilot(engine, flight_ids: Optional[List[int]], operating_position: str,
                         crew_id: str) -> Optional[dict]:
     """
-    Looks for another ACTIVE CPT/FO assignment covering the EXACT SAME
-    set of flight_ids as this duty — an exact set match, not just any
-    overlap. Two pilots can each legitimately have a roster row
-    referencing the same single flight_id while actually flying
-    different, unrelated duties (one shared sector between two
-    otherwise-distinct multi-sector rotations); overlap alone would
-    wrongly pair them.
+    Looks for another ACTIVE pilot holding the OTHER operating_position
+    (COMMANDER/SECOND_PILOT) covering the EXACT SAME set of flight_ids
+    as this duty — an exact set match, not just any overlap. Two
+    pilots can each legitimately have a roster row referencing the
+    same single flight_id while actually flying different, unrelated
+    duties (one shared sector between two otherwise-distinct
+    multi-sector rotations); overlap alone would wrongly pair them.
+
+    Re-keyed 2026-08-12 (flight-deck crew package) from grade
+    (role_assigned CPT/FO) to seat (operating_position COMMANDER/
+    SECOND_PILOT) — a CPT+CPT pair means grade can no longer tell you
+    who "the other seat" is; operating_position always can, regardless
+    of grade.
 
     Returns None (nobody on the other seat yet) whenever flight_ids is
     empty/None — the Control Room path calls this BEFORE the new
@@ -398,21 +474,21 @@ def _find_paired_pilot(engine, flight_ids: Optional[List[int]], role_assigned: s
     if not flight_ids:
         return None
 
-    other_role = "FO" if role_assigned == "CPT" else "CPT"
+    other_position = "SECOND_PILOT" if operating_position == "COMMANDER" else "COMMANDER"
     candidates = pd.read_sql(text("""
         SELECT r.crew_id, r.duty_id, r.flight_id, c.date_of_birth
         FROM roster r
         JOIN crew c ON c.crew_id = r.crew_id
-        WHERE r.role_assigned = :other_role
+        WHERE r.operating_position = :other_position
           AND r.status != 'CANCELLED'
           AND r.crew_id != :crew_id
           AND r.duty_id IN (
               SELECT DISTINCT duty_id FROM roster
-              WHERE role_assigned = :other_role AND status != 'CANCELLED'
+              WHERE operating_position = :other_position AND status != 'CANCELLED'
                 AND crew_id != :crew_id AND flight_id = ANY(:flight_ids)
           )
     """), engine, params={
-        "other_role": other_role, "crew_id": crew_id, "flight_ids": list(flight_ids),
+        "other_position": other_position, "crew_id": crew_id, "flight_ids": list(flight_ids),
     })
 
     if candidates.empty:
@@ -425,12 +501,31 @@ def _find_paired_pilot(engine, flight_ids: Optional[List[int]], role_assigned: s
     return None
 
 
-def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[List[int]],
+def _check_crew_pairing_age(engine, operating_position: Optional[str], crew_row: pd.Series,
+                             flight_ids: Optional[List[int]],
                              domestic: bool, reference_date) -> tuple:
     """
-    Returns (alerts, PairingCheckResult). Scoped to CPT/FO only — LM/AME
-    return immediately with no alerts and a default (not-applicable)
-    PairingCheckResult.
+    Returns (alerts, PairingCheckResult). Scoped to an actual pilot
+    seat only — operating_position=None (LM/ENGR, or any caller not
+    part of a flight-deck pair) returns immediately with no alerts and
+    a default (not-applicable) PairingCheckResult.
+
+    Re-keyed 2026-08-12 from "crew_row['role'] in ('CPT','FO')" to
+    "operating_position is not None" — the rule now applies to the
+    OPERATING PAIR regardless of grade (a CPT+CPT pair is checked
+    exactly like CPT+FO always was), per explicit operator instruction
+    that _evaluate_pair_age()'s own math stays byte-for-byte unchanged.
+
+    This function finds the pair via a REAL, ALREADY-ASSIGNED partner
+    in the database (_find_paired_pilot()) — the right tool when one
+    seat is already committed (a solo/first-pilot assignment, or
+    filling the second seat of an existing pair) and the question is
+    "does the other seat's real occupant make this legal." It is NOT
+    used to compare two freshly-PROPOSED candidates against each other
+    before either is written — validate_pair() does that age check
+    directly, since _find_paired_pilot()'s DB lookup would find nothing
+    for either brand-new candidate and silently skip the check the
+    pair most needs.
 
     Deliberately does NOT emit a RuleAlert for the "nobody on the other
     seat yet" case: a WARNING-severity alert would elevate
@@ -444,10 +539,10 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
     pairing_pending/paired_crew_id/pairing_constraint fields — visible
     without touching legality status at all.
     """
-    if crew_row["role"] not in ("CPT", "FO"):
+    if operating_position is None:
         return [], PairingCheckResult()
 
-    paired = _find_paired_pilot(engine, flight_ids, crew_row["role"], crew_row["crew_id"])
+    paired = _find_paired_pilot(engine, flight_ids, operating_position, crew_row["crew_id"])
 
     if paired is None:
         constraint = None
@@ -495,12 +590,29 @@ def _check_crew_pairing_age(engine, crew_row: pd.Series, flight_ids: Optional[Li
 
 def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str,
                         meal_provided: bool, snack_provided: bool,
-                        flight_ids: Optional[List[int]] = None):
+                        flight_ids: Optional[List[int]] = None,
+                        operating_position: Optional[str] = None):
     """
-    Shared validation core for both assign_crew_to_duty() (assigning
-    to flights that already exist) and assign_crew_to_new_flights()
-    (Control Room's atomic flight+assignment). Builds the duty, loads
-    the crew member's existing history, validates — writes nothing.
+    Shared validation core for assign_crew_to_duty() (LM/ENGR, or a
+    pilot filling the remaining seat of an already-real pair),
+    assign_crew_to_new_flights() (Control Room's atomic flight+
+    assignment, LM/ENGR only), and validate_pair() (each pilot's own
+    individual FDP/rest/qualification check, called once per seat).
+    Builds the duty, loads the crew member's existing history,
+    validates — writes nothing.
+
+    operating_position (2026-08-12, flight-deck crew package): None
+    for LM/ENGR (not part of any pair) or when the pairing question is
+    being handled entirely by the caller (validate_pair() does its own
+    direct age check between two fresh candidates — see
+    _check_crew_pairing_age()'s docstring for why that's not the same
+    question this function's own pairing call answers).
+    'COMMANDER'/'SECOND_PILOT' when this individual check needs to
+    also ask "does a REAL, already-assigned partner make this legal" —
+    _find_paired_pilot() looks up an actual committed row for the
+    other seat, so this is only meaningful when one seat is already
+    real, not when validating two brand-new candidates against each
+    other.
 
     meal_provided/snack_provided: required, no default, same footing as
     the existing `domestic` parameter — both callers compute them the
@@ -603,7 +715,7 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
     # reference dates for different reasons).
     reference_date = min(l.dep_time for l in legs).date()
     pairing_alerts, pairing_info = _check_crew_pairing_age(
-        engine, crew_row, flight_ids, domestic, reference_date)
+        engine, operating_position, crew_row, flight_ids, domestic, reference_date)
     for alert in pairing_alerts:
         validation_result.add_alert(alert)
 
@@ -616,7 +728,8 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
 
 def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                          app_user: Optional[str] = None,
-                         roster_status: str = "PLANNED") -> AssignmentResult:
+                         roster_status: str = "PLANNED",
+                         operating_position: Optional[str] = None) -> AssignmentResult:
     """
     Assigns crew_id to the duty formed by flight_ids (in chronological
     order — the caller's decision which flights form one duty).
@@ -628,6 +741,19 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     AssignmentResult.status="ALLOWED", along with any downstream
     conflicts found on the crew member's other already-scheduled
     future duties.
+
+    operating_position (2026-08-12, flight-deck crew package): LM/ENGR
+    ignore this entirely (stays None, unchanged behavior). For CPT/FO,
+    operating_position is REQUIRED, and a REAL, already-active pilot
+    must currently hold the OTHER seat on these exact flight_ids — this
+    function fills the REMAINING seat of an already-real pair (the
+    pairing question has a real, committed answer to check against).
+    It is NOT how a fresh pair gets its first two seats — that always
+    goes through assign_pair_to_duty(), which validates and commits
+    both together in one transaction, closing the defect where a
+    solo pilot could previously commit as PLANNED before any partner
+    was known. Raises ValueError for CPT/FO with no operating_position
+    given, or with no real partner found on the other seat.
 
     roster_status: the value written to the new roster row's own
     status column (migrations/003, 009, 013 — currently 'PLANNED',
@@ -643,6 +769,23 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     sees only published."
     """
     engine = get_engine()
+
+    normalized_role = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
+    if normalized_role in ("CPT", "FO"):
+        if operating_position not in ("COMMANDER", "SECOND_PILOT"):
+            raise ValueError(
+                "Pilots (CPT/FO) require operating_position ('COMMANDER' or "
+                "'SECOND_PILOT') and a real partner already on the other seat — "
+                "assigning a fresh pair goes through assign_pair_to_duty() instead, "
+                "which validates and commits both seats together."
+            )
+        partner = _find_paired_pilot(engine, flight_ids, operating_position, crew_id)
+        if partner is None:
+            raise ValueError(
+                f"No active pilot currently holds the other seat on these flights — "
+                f"a fresh pair must be assigned together via assign_pair_to_duty(), "
+                f"not assign_crew_to_duty()."
+            )
 
     flights = [flight_service.get_flight(fid) for fid in flight_ids]
     missing = [fid for fid, f in zip(flight_ids, flights) if f is None]
@@ -677,7 +820,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
 
     validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
         engine, crew_id, legs, domestic, role_assigned, meal_provided, snack_provided,
-        flight_ids=flight_ids)
+        flight_ids=flight_ids, operating_position=operating_position)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -746,12 +889,13 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     # here to orphan. See audit_service.log_audit()'s conn parameter.
     roster_ids = []
     with engine.begin() as conn:
+        _resolve_uncovered_seat(conn, flight_ids[0], operating_position)
         for fid in flight_ids:
             result = conn.execute(text("""
                 INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
-                    report_time, debrief_time, fdp_hours, role_assigned, status)
+                    report_time, debrief_time, fdp_hours, role_assigned, status, operating_position)
                 VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
-                    :report_time, :debrief_time, :fdp_hours, :role_assigned, :roster_status)
+                    :report_time, :debrief_time, :fdp_hours, :role_assigned, :roster_status, :operating_position)
                 RETURNING roster_id
             """), {
                 "crew_id": crew_id, "flight_id": fid, "duty_id": new_duty.duty_id,
@@ -759,6 +903,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                 "duty_date": duty_result.report_time.date(),
                 "report_time": duty_result.report_time, "debrief_time": duty_result.debrief_time,
                 "fdp_hours": duty_result.fdp_hours, "role_assigned": role_assigned,
+                "operating_position": operating_position,
             })
             roster_ids.append(result.scalar())
 
@@ -812,6 +957,14 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     uncrewed flight sitting in Flight Log. Either both the flight(s)
     and the assignment are saved, or neither is.
 
+    LM/ENGR only (2026-08-12, flight-deck crew package) — raises
+    ValueError for CPT/FO. Unlike assign_crew_to_duty(), there is no
+    "fill the remaining seat of an already-real pair" case here: the
+    flights don't exist yet, so a real partner could never already be
+    on the other seat. A fresh ad-hoc pair goes through
+    assign_pair_to_new_flights() instead, which creates the flight(s)
+    and both seats together, atomically.
+
     flights_data: list of dicts with the same shape add_flight()
     expects (origin, destination, dep_time_planned, arr_time_planned,
     domestic, and optionally flight_no/aircraft/cargo_dg/remarks) —
@@ -822,6 +975,14 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     REJECTED.
     """
     engine = get_engine()
+
+    normalized_role = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
+    if normalized_role in ("CPT", "FO"):
+        raise ValueError(
+            "Pilots (CPT/FO) must be assigned via assign_pair_to_new_flights(), not "
+            "assign_crew_to_new_flights() — a solo ad-hoc pilot assignment bypasses "
+            "pair-atomicity the same way a solo scheduled-flight assignment would."
+        )
 
     # Same duty-level classification rule as assign_crew_to_duty() —
     # see the comment there. Any international sector makes the
@@ -981,6 +1142,487 @@ def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assi
     ), flight_ids
 
 
+# ------------------------------------------------------------------
+# Flight-deck pair assignment (2026-08-12) — the atomic Commander +
+# Second Pilot path. Closes the defect where a solo pilot could
+# commit as PLANNED before any partner was known: both seats are
+# validated together and written together, in one transaction, or
+# neither is.
+# ------------------------------------------------------------------
+
+_STATUS_PRECEDENCE = {
+    AlertStatus.LEGAL: 0, AlertStatus.WARNING: 1,
+    AlertStatus.NEEDS_MANUAL_REVIEW: 2, AlertStatus.ILLEGAL: 3,
+}
+
+
+def _validate_pair_internal(engine, commander_crew_id: str, second_pilot_crew_id: str,
+                             flight_ids: List[int]):
+    """
+    Shared core for validate_pair() (read-only) and
+    assign_pair_to_duty()/assign_pair_to_new_flights() (write path) —
+    the write path needs the SAME Duty/duty_result objects (same
+    duty_ids) this produces, not just a pass/fail summary, so it's
+    factored out here rather than having the write path re-derive
+    them separately (which would generate different duty_ids than
+    whatever a caller's own prior validate_pair() dry-run showed).
+
+    Returns a dict with everything either caller needs. Raises
+    ValueError for the same caller-error conditions validate_pair()
+    documents (same crew_id twice, missing crew_id, wrong grade for
+    seat, missing flight_id).
+    """
+    if commander_crew_id == second_pilot_crew_id:
+        raise ValueError("Commander and Second Pilot must be different crew members")
+
+    commander_row = crew_service.get_crew(commander_crew_id)
+    if commander_row is None:
+        raise ValueError(f"No crew member with crew_id={commander_crew_id}")
+    second_pilot_row = crew_service.get_crew(second_pilot_crew_id)
+    if second_pilot_row is None:
+        raise ValueError(f"No crew member with crew_id={second_pilot_crew_id}")
+
+    if commander_row["role"] not in SEAT_ELIGIBLE_GRADES["COMMANDER"]:
+        raise ValueError(
+            f"{commander_crew_id} is graded {commander_row['role']}, not eligible for "
+            f"Commander (must be CPT)"
+        )
+    if second_pilot_row["role"] not in SEAT_ELIGIBLE_GRADES["SECOND_PILOT"]:
+        raise ValueError(
+            f"{second_pilot_crew_id} is graded {second_pilot_row['role']}, not eligible "
+            f"for Second Pilot (must be CPT or FO)"
+        )
+
+    flights = [flight_service.get_flight(fid) for fid in flight_ids]
+    missing = [fid for fid, f in zip(flight_ids, flights) if f is None]
+    if missing:
+        raise ValueError(f"Flight_id(s) not found: {missing}")
+
+    domestic = all(bool(f["domestic"]) for f in flights)
+    meal_provided = all(bool(f["meal_provided"]) for f in flights)
+    snack_provided = all(bool(f["snack_provided"]) for f in flights)
+    legs = [
+        FlightLeg(
+            dep_time=f["dep_time_actual"] if pd.notna(f["dep_time_actual"]) else f["dep_time_planned"],
+            arr_time=f["arr_time_actual"] if pd.notna(f["arr_time_actual"]) else f["arr_time_planned"],
+            origin=f["origin"], destination=f["destination"],
+        )
+        for f in flights
+    ]
+
+    # operating_position=None on both individual checks, deliberately:
+    # neither pilot is written yet, so _check_crew_pairing_age()'s own
+    # DB lookup would find nothing for either and silently skip the
+    # check this pair most needs. The age-pairing check between these
+    # two ACTUAL proposed candidates is done directly below instead,
+    # using the same unchanged age_on()/_evaluate_pair_age() the
+    # DB-lookup path itself uses internally — same math, just applied
+    # to the two real candidates instead of a database lookup.
+    commander_result, commander_duty, _, _, commander_duty_result, _ = _validate_new_duty(
+        engine, commander_crew_id, legs, domestic, "CPT", meal_provided, snack_provided,
+        flight_ids=flight_ids, operating_position=None)
+    second_pilot_result, second_pilot_duty, _, _, second_pilot_duty_result, _ = _validate_new_duty(
+        engine, second_pilot_crew_id, legs, domestic, second_pilot_row["role"], meal_provided, snack_provided,
+        flight_ids=flight_ids, operating_position=None)
+
+    reference_date = min(l.dep_time for l in legs).date()
+    pair_alerts: List[RuleAlert] = []
+    if pd.isna(commander_row["date_of_birth"]) or pd.isna(second_pilot_row["date_of_birth"]):
+        pair_alerts.append(RuleAlert(
+            rule_code="AE-CREW-PAIR-AGE-001_DOB_MISSING",
+            status=AlertStatus.NEEDS_MANUAL_REVIEW,
+            severity="YELLOW",
+            message=(
+                f"Cannot evaluate the age-pairing rule for {commander_crew_id} + "
+                f"{second_pilot_crew_id}: date of birth is missing for at least one pilot."
+            ),
+            calculated_value="DOB missing",
+            required_limit="Both pilots' date_of_birth required",
+        ))
+    else:
+        age_commander = age_on(commander_row["date_of_birth"], reference_date)
+        age_second_pilot = age_on(second_pilot_row["date_of_birth"], reference_date)
+        if _evaluate_pair_age(age_commander, age_second_pilot, domestic):
+            pair_alerts.append(RuleAlert(
+                rule_code="AE-CREW-PAIR-AGE-001_AGE_LIMIT",
+                status=AlertStatus.ILLEGAL,
+                severity="RED",
+                message=(
+                    f"Age-pairing rule violated ({'domestic' if domestic else 'international'}): "
+                    f"{commander_crew_id} is {age_commander}, {second_pilot_crew_id} is {age_second_pilot}. "
+                    + ("Both pilots are 65 or older." if domestic
+                       else "At least one pilot is 65 or older.")
+                ),
+                calculated_value=f"{age_commander}/{age_second_pilot}",
+                required_limit="Domestic: >=1 pilot under 65. International: both pilots under 65.",
+            ))
+
+    pair_status = AlertStatus.LEGAL
+    for alert in pair_alerts:
+        if _STATUS_PRECEDENCE[alert.status] > _STATUS_PRECEDENCE[pair_status]:
+            pair_status = alert.status
+
+    overall_status = max(
+        [commander_result.status, second_pilot_result.status, pair_status],
+        key=lambda s: _STATUS_PRECEDENCE[s],
+    )
+
+    return {
+        "overall_status": overall_status,
+        "commander_row": commander_row, "second_pilot_row": second_pilot_row,
+        "commander_result": commander_result, "second_pilot_result": second_pilot_result,
+        "commander_duty": commander_duty, "second_pilot_duty": second_pilot_duty,
+        "commander_duty_result": commander_duty_result, "second_pilot_duty_result": second_pilot_duty_result,
+        "pair_alerts": pair_alerts, "domestic": domestic,
+    }
+
+
+def validate_pair(commander_crew_id: str, second_pilot_crew_id: str,
+                   flight_ids: List[int]) -> PairValidationResult:
+    """
+    Dry-run: validates both seats of a flight-deck pair together,
+    writes nothing. The one choke point both assign_pair_to_duty()/
+    assign_pair_to_new_flights() and the roster generator's own pair
+    search go through before ever committing — see
+    _validate_pair_internal()'s own docstring for the shared core, and
+    that function's inline comment for why the age-pairing check here
+    is direct (comparing the two actual candidates) rather than
+    delegated to _check_crew_pairing_age()'s DB-lookup path.
+    """
+    engine = get_engine()
+    core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids)
+
+    commander_summary = summarize_alerts(
+        core["commander_result"], target_duty_id=core["commander_duty"].duty_id)
+    second_pilot_summary = summarize_alerts(
+        core["second_pilot_result"], target_duty_id=core["second_pilot_duty"].duty_id)
+
+    return PairValidationResult(
+        status=core["overall_status"].value,
+        commander_crew_id=commander_crew_id,
+        second_pilot_crew_id=second_pilot_crew_id,
+        commander_status=core["commander_result"].status.value,
+        second_pilot_status=core["second_pilot_result"].status.value,
+        commander_alerts=core["commander_result"].alerts,
+        second_pilot_alerts=core["second_pilot_result"].alerts,
+        pair_alerts=core["pair_alerts"],
+        commander_alert_summary=commander_summary,
+        second_pilot_alert_summary=second_pilot_summary,
+        commander_computed_report_time=core["commander_duty_result"].report_time,
+        commander_computed_debrief_time=core["commander_duty_result"].debrief_time,
+        commander_computed_fdp_hours=core["commander_duty_result"].fdp_hours,
+        second_pilot_computed_report_time=core["second_pilot_duty_result"].report_time,
+        second_pilot_computed_debrief_time=core["second_pilot_duty_result"].debrief_time,
+        second_pilot_computed_fdp_hours=core["second_pilot_duty_result"].fdp_hours,
+    )
+
+
+def _resolve_uncovered_seat(conn, flight_id: int, operating_position: Optional[str]) -> None:
+    """Marks any open uncovered_seats row for this seat resolved, now
+    that a real roster row fills it — keeps the table from showing a
+    seat as still-uncovered after it's genuinely been filled (by the
+    generator's own retry, or a controller assigning a replacement).
+    No-op for LM/ENGR (operating_position None) or ad-hoc Control Room
+    flights (rotation_instance_id NULL — uncovered_seats never had a
+    row for those in the first place, nothing to resolve)."""
+    if operating_position is None:
+        return
+    conn.execute(text("""
+        UPDATE uncovered_seats SET resolved_at = NOW()
+        WHERE resolved_at IS NULL AND operating_position = :operating_position
+          AND rotation_instance_id = (SELECT rotation_instance_id FROM flights WHERE flight_id = :flight_id)
+    """), {"operating_position": operating_position, "flight_id": flight_id})
+
+
+def _write_pair_rows(conn, crew_id, role_assigned, operating_position, duty, duty_result,
+                      flight_ids, roster_status, app_user):
+    roster_ids = []
+    _resolve_uncovered_seat(conn, flight_ids[0], operating_position)
+    for fid in flight_ids:
+        result = conn.execute(text("""
+            INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
+                report_time, debrief_time, fdp_hours, role_assigned, status, operating_position)
+            VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
+                :report_time, :debrief_time, :fdp_hours, :role_assigned, :roster_status, :operating_position)
+            RETURNING roster_id
+        """), {
+            "crew_id": crew_id, "flight_id": fid, "duty_id": duty.duty_id,
+            "roster_status": roster_status,
+            "duty_date": duty_result.report_time.date(),
+            "report_time": duty_result.report_time, "debrief_time": duty_result.debrief_time,
+            "fdp_hours": duty_result.fdp_hours, "role_assigned": role_assigned,
+            "operating_position": operating_position,
+        })
+        roster_ids.append(result.scalar())
+    log_audit(
+        action_type="ASSIGNMENT_CREATED",
+        affected_crew=crew_id, affected_flight=flight_ids[0], affected_duty=duty.duty_id,
+        app_user=app_user, conn=conn,
+    )
+    return roster_ids
+
+
+def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, flight_ids: List[int],
+                         app_user: Optional[str] = None,
+                         roster_status: str = "PLANNED") -> PairAssignmentResult:
+    """
+    Assigns BOTH seats of a flight-deck pair to flight_ids (flights
+    that already exist — Roster page / roster generator), atomically:
+    validate_pair()'s underlying check runs for both pilots together,
+    and either both are written (all sectors, both pilots, one
+    transaction) or neither is — closing the defect where a solo pilot
+    previously committed as PLANNED before any partner was validated.
+
+    roster_status: same meaning as assign_crew_to_duty()'s own
+    parameter — the roster row's own lifecycle state, not this
+    function's outcome. Phase 7's roster generator passes 'PROPOSED'.
+    """
+    engine = get_engine()
+    core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids)
+    overall_status = core["overall_status"]
+
+    commander_summary = summarize_alerts(core["commander_result"], target_duty_id=core["commander_duty"].duty_id)
+    second_pilot_summary = summarize_alerts(
+        core["second_pilot_result"], target_duty_id=core["second_pilot_duty"].duty_id)
+
+    if overall_status == AlertStatus.ILLEGAL:
+        commander_reason = build_audit_reason(commander_summary, frozenset({AlertStatus.ILLEGAL}))
+        second_pilot_reason = build_audit_reason(second_pilot_summary, frozenset({AlertStatus.ILLEGAL}))
+        log_audit(
+            action_type="PAIR_ASSIGNMENT_REJECTED",
+            affected_crew=commander_crew_id, affected_flight=flight_ids[0],
+            legality_result=overall_status.value,
+            warning_or_failure_reason="; ".join(r for r in (commander_reason, second_pilot_reason) if r),
+            app_user=app_user,
+        )
+    elif overall_status == AlertStatus.NEEDS_MANUAL_REVIEW:
+        log_audit(
+            action_type="PAIR_ASSIGNMENT_HELD_FOR_REVIEW",
+            affected_crew=commander_crew_id, affected_flight=flight_ids[0],
+            legality_result=overall_status.value,
+            app_user=app_user,
+        )
+
+    validation = PairValidationResult(
+        status=overall_status.value,
+        commander_crew_id=commander_crew_id, second_pilot_crew_id=second_pilot_crew_id,
+        commander_status=core["commander_result"].status.value,
+        second_pilot_status=core["second_pilot_result"].status.value,
+        commander_alerts=core["commander_result"].alerts,
+        second_pilot_alerts=core["second_pilot_result"].alerts,
+        pair_alerts=core["pair_alerts"],
+        commander_alert_summary=commander_summary,
+        second_pilot_alert_summary=second_pilot_summary,
+        commander_computed_report_time=core["commander_duty_result"].report_time,
+        commander_computed_debrief_time=core["commander_duty_result"].debrief_time,
+        commander_computed_fdp_hours=core["commander_duty_result"].fdp_hours,
+        second_pilot_computed_report_time=core["second_pilot_duty_result"].report_time,
+        second_pilot_computed_debrief_time=core["second_pilot_duty_result"].debrief_time,
+        second_pilot_computed_fdp_hours=core["second_pilot_duty_result"].fdp_hours,
+    )
+
+    if overall_status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW):
+        return PairAssignmentResult(
+            status="REJECTED" if overall_status == AlertStatus.ILLEGAL else "NEEDS_REVIEW",
+            validation=validation,
+            commander_duty_id=core["commander_duty"].duty_id,
+            second_pilot_duty_id=core["second_pilot_duty"].duty_id,
+        )
+
+    # LEGAL or WARNING — both seats, all sectors, one transaction.
+    with engine.begin() as conn:
+        commander_roster_ids = _write_pair_rows(
+            conn, commander_crew_id, "CPT", "COMMANDER",
+            core["commander_duty"], core["commander_duty_result"], flight_ids, roster_status, app_user)
+        second_pilot_roster_ids = _write_pair_rows(
+            conn, second_pilot_crew_id, core["second_pilot_row"]["role"], "SECOND_PILOT",
+            core["second_pilot_duty"], core["second_pilot_duty_result"], flight_ids, roster_status, app_user)
+
+    commander_conflicts = _check_downstream_impact(
+        engine, commander_crew_id, core["commander_row"]["base"],
+        _crew_member(core["commander_row"]), core["commander_duty"])
+    second_pilot_conflicts = _check_downstream_impact(
+        engine, second_pilot_crew_id, core["second_pilot_row"]["base"],
+        _crew_member(core["second_pilot_row"]), core["second_pilot_duty"])
+
+    return PairAssignmentResult(
+        status="ALLOWED",
+        validation=validation,
+        commander_roster_ids=commander_roster_ids,
+        second_pilot_roster_ids=second_pilot_roster_ids,
+        commander_duty_id=core["commander_duty"].duty_id,
+        second_pilot_duty_id=core["second_pilot_duty"].duty_id,
+        commander_downstream_conflicts=commander_conflicts,
+        second_pilot_downstream_conflicts=second_pilot_conflicts,
+    )
+
+
+def assign_pair_to_new_flights(commander_crew_id: str, second_pilot_crew_id: str,
+                                flights_data: List[dict],
+                                app_user: Optional[str] = None) -> tuple:
+    """
+    Control Room's pair-aware ad-hoc path: creates flight(s) AND both
+    seats together, gated by legality BEFORE anything is written —
+    same atomicity guarantee assign_crew_to_new_flights() already
+    gives LM/ENGR, extended to a real flight-deck pair. There is no
+    "fill the remaining seat of an already-real pair" case here (the
+    flights don't exist yet, so a real partner could never already be
+    on the other seat) — every ad-hoc pilot pairing is a fresh pair.
+
+    Returns (PairAssignmentResult, flight_ids). flight_ids is empty on
+    REJECTED/NEEDS_REVIEW.
+    """
+    engine = get_engine()
+
+    commander_row = crew_service.get_crew(commander_crew_id)
+    if commander_row is None:
+        raise ValueError(f"No crew member with crew_id={commander_crew_id}")
+    second_pilot_row = crew_service.get_crew(second_pilot_crew_id)
+    if second_pilot_row is None:
+        raise ValueError(f"No crew member with crew_id={second_pilot_crew_id}")
+    if commander_crew_id == second_pilot_crew_id:
+        raise ValueError("Commander and Second Pilot must be different crew members")
+    if commander_row["role"] not in SEAT_ELIGIBLE_GRADES["COMMANDER"]:
+        raise ValueError(f"{commander_crew_id} is graded {commander_row['role']}, not eligible for Commander")
+    if second_pilot_row["role"] not in SEAT_ELIGIBLE_GRADES["SECOND_PILOT"]:
+        raise ValueError(f"{second_pilot_crew_id} is graded {second_pilot_row['role']}, not eligible for Second Pilot")
+
+    domestic = all(bool(f["domestic"]) for f in flights_data)
+    meal_provided = all(bool(f.get("meal_provided", True)) for f in flights_data)
+    snack_provided = all(bool(f.get("snack_provided", True)) for f in flights_data)
+    legs = [
+        FlightLeg(dep_time=f["dep_time_planned"], arr_time=f["arr_time_planned"],
+                  origin=f["origin"], destination=f["destination"])
+        for f in flights_data
+    ]
+
+    commander_result, commander_duty, _, _, commander_duty_result, _ = _validate_new_duty(
+        engine, commander_crew_id, legs, domestic, "CPT", meal_provided, snack_provided,
+        flight_ids=None, operating_position=None)
+    second_pilot_result, second_pilot_duty, _, _, second_pilot_duty_result, _ = _validate_new_duty(
+        engine, second_pilot_crew_id, legs, domestic, second_pilot_row["role"], meal_provided, snack_provided,
+        flight_ids=None, operating_position=None)
+
+    reference_date = min(l.dep_time for l in legs).date()
+    pair_alerts: List[RuleAlert] = []
+    if pd.isna(commander_row["date_of_birth"]) or pd.isna(second_pilot_row["date_of_birth"]):
+        pair_alerts.append(RuleAlert(
+            rule_code="AE-CREW-PAIR-AGE-001_DOB_MISSING", status=AlertStatus.NEEDS_MANUAL_REVIEW,
+            severity="YELLOW",
+            message=(f"Cannot evaluate the age-pairing rule for {commander_crew_id} + "
+                      f"{second_pilot_crew_id}: date of birth is missing for at least one pilot."),
+            calculated_value="DOB missing", required_limit="Both pilots' date_of_birth required",
+        ))
+    else:
+        age_commander = age_on(commander_row["date_of_birth"], reference_date)
+        age_second_pilot = age_on(second_pilot_row["date_of_birth"], reference_date)
+        if _evaluate_pair_age(age_commander, age_second_pilot, domestic):
+            pair_alerts.append(RuleAlert(
+                rule_code="AE-CREW-PAIR-AGE-001_AGE_LIMIT", status=AlertStatus.ILLEGAL, severity="RED",
+                message=(
+                    f"Age-pairing rule violated ({'domestic' if domestic else 'international'}): "
+                    f"{commander_crew_id} is {age_commander}, {second_pilot_crew_id} is {age_second_pilot}. "
+                    + ("Both pilots are 65 or older." if domestic else "At least one pilot is 65 or older.")
+                ),
+                calculated_value=f"{age_commander}/{age_second_pilot}",
+                required_limit="Domestic: >=1 pilot under 65. International: both pilots under 65.",
+            ))
+
+    pair_status = AlertStatus.LEGAL
+    for alert in pair_alerts:
+        if _STATUS_PRECEDENCE[alert.status] > _STATUS_PRECEDENCE[pair_status]:
+            pair_status = alert.status
+    overall_status = max(
+        [commander_result.status, second_pilot_result.status, pair_status],
+        key=lambda s: _STATUS_PRECEDENCE[s],
+    )
+
+    commander_summary = summarize_alerts(commander_result, target_duty_id=commander_duty.duty_id)
+    second_pilot_summary = summarize_alerts(second_pilot_result, target_duty_id=second_pilot_duty.duty_id)
+
+    validation = PairValidationResult(
+        status=overall_status.value,
+        commander_crew_id=commander_crew_id, second_pilot_crew_id=second_pilot_crew_id,
+        commander_status=commander_result.status.value, second_pilot_status=second_pilot_result.status.value,
+        commander_alerts=commander_result.alerts, second_pilot_alerts=second_pilot_result.alerts,
+        pair_alerts=pair_alerts,
+        commander_alert_summary=commander_summary, second_pilot_alert_summary=second_pilot_summary,
+        commander_computed_report_time=commander_duty_result.report_time,
+        commander_computed_debrief_time=commander_duty_result.debrief_time,
+        commander_computed_fdp_hours=commander_duty_result.fdp_hours,
+        second_pilot_computed_report_time=second_pilot_duty_result.report_time,
+        second_pilot_computed_debrief_time=second_pilot_duty_result.debrief_time,
+        second_pilot_computed_fdp_hours=second_pilot_duty_result.fdp_hours,
+    )
+
+    if overall_status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW):
+        # Same "every legality outcome gets an audit record, even when
+        # nothing is saved" guarantee assign_pair_to_duty() and the
+        # LM/ENGR ad-hoc path (assign_crew_to_new_flights()) already
+        # both provide — ADHOC_PAIR_* naming mirrors ADHOC_FLIGHT_*'s
+        # existing convention for the non-seat ad-hoc path.
+        if overall_status == AlertStatus.ILLEGAL:
+            commander_reason = build_audit_reason(commander_summary, frozenset({AlertStatus.ILLEGAL}))
+            second_pilot_reason = build_audit_reason(second_pilot_summary, frozenset({AlertStatus.ILLEGAL}))
+            log_audit(
+                action_type="ADHOC_PAIR_REJECTED",
+                affected_crew=commander_crew_id,
+                legality_result=overall_status.value,
+                warning_or_failure_reason="; ".join(r for r in (commander_reason, second_pilot_reason) if r),
+                app_user=app_user,
+            )
+        else:
+            log_audit(
+                action_type="ADHOC_PAIR_HELD_FOR_REVIEW",
+                affected_crew=commander_crew_id,
+                legality_result=overall_status.value,
+                app_user=app_user,
+            )
+        return PairAssignmentResult(
+            status="REJECTED" if overall_status == AlertStatus.ILLEGAL else "NEEDS_REVIEW",
+            validation=validation,
+            commander_duty_id=commander_duty.duty_id, second_pilot_duty_id=second_pilot_duty.duty_id,
+        ), []
+
+    # LEGAL or WARNING — create the flight(s) AND both seats together,
+    # one transaction, same "all four writes commit together or none
+    # do" guarantee assign_crew_to_new_flights() already established.
+    flight_ids = []
+    with engine.begin() as conn:
+        for f in flights_data:
+            fields = {k: v for k, v in f.items() if k in flight_service.UPDATABLE_FIELDS}
+            columns = ", ".join(fields.keys())
+            placeholders = ", ".join(f":{k}" for k in fields.keys())
+            result = conn.execute(text(
+                f"INSERT INTO flights ({columns}) VALUES ({placeholders}) RETURNING flight_id"
+            ), fields)
+            flight_ids.append(result.scalar())
+
+        log_audit(action_type="FLIGHT_ADDED", affected_flight=flight_ids[0],
+                   changed_state=str(flights_data), data_source="control_room",
+                   app_user=app_user, conn=conn)
+
+        commander_roster_ids = _write_pair_rows(
+            conn, commander_crew_id, "CPT", "COMMANDER",
+            commander_duty, commander_duty_result, flight_ids, "PLANNED", app_user)
+        second_pilot_roster_ids = _write_pair_rows(
+            conn, second_pilot_crew_id, second_pilot_row["role"], "SECOND_PILOT",
+            second_pilot_duty, second_pilot_duty_result, flight_ids, "PLANNED", app_user)
+
+    commander_conflicts = _check_downstream_impact(
+        engine, commander_crew_id, commander_row["base"], _crew_member(commander_row), commander_duty)
+    second_pilot_conflicts = _check_downstream_impact(
+        engine, second_pilot_crew_id, second_pilot_row["base"], _crew_member(second_pilot_row), second_pilot_duty)
+
+    return PairAssignmentResult(
+        status="ALLOWED", validation=validation,
+        commander_roster_ids=commander_roster_ids, second_pilot_roster_ids=second_pilot_roster_ids,
+        commander_duty_id=commander_duty.duty_id, second_pilot_duty_id=second_pilot_duty.duty_id,
+        commander_downstream_conflicts=commander_conflicts,
+        second_pilot_downstream_conflicts=second_pilot_conflicts,
+    ), flight_ids
+
+
 def _check_downstream_impact(engine, crew_id, home_base, crew_member, new_duty):
     """
     For every duty already scheduled AFTER the new duty ends: was it
@@ -1024,8 +1666,19 @@ def _check_downstream_impact(engine, crew_id, home_base, crew_member, new_duty):
         still_legal = after_result.status != AlertStatus.ILLEGAL
 
         if was_legal and not still_legal:
-            candidates = find_legal_candidates_for_duty(
-                record["flight_ids"], record["role_assigned"], exclude_crew_id=crew_id)
+            # find_legal_candidates_for_seat() now returns a richer
+            # CandidateStatus per candidate (2026-08-12) — DownstreamConflict.
+            # candidates keeps its existing List[str] shape (not part
+            # of this piece's requirements; minimal-risk pass-through
+            # rather than a speculative redesign), taking only the
+            # LEGAL/WARNING crew_ids, same "selectable" bar
+            # find_legal_candidates_for_seat()'s own docstring
+            # describes for its callers generally.
+            candidate_statuses = find_legal_candidates_for_seat(
+                record["flight_ids"], record["role_assigned"],
+                operating_position=record["operating_position"], exclude_crew_id=crew_id)
+            candidates = [c.crew_id for c in candidate_statuses
+                          if c.status in (AlertStatus.LEGAL.value, AlertStatus.WARNING.value)]
             conflicts.append(DownstreamConflict(
                 duty_id=future_duty.duty_id,
                 flight_ids=record["flight_ids"],
@@ -1038,13 +1691,37 @@ def _check_downstream_impact(engine, crew_id, home_base, crew_member, new_duty):
     return conflicts
 
 
-def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
-                                    exclude_crew_id: Optional[str] = None) -> List[str]:
+def find_legal_candidates_for_seat(flight_ids: List[int], role_assigned: str,
+                                    operating_position: Optional[str] = None,
+                                    exclude_crew_id: Optional[str] = None) -> List[CandidateStatus]:
     """
-    Searches all active crew holding role_assigned and returns the
-    crew_ids who WOULD be legal if assigned to this duty, given their
-    own existing duty history. Does not check location (not tracked —
-    see HANDOVER.md) or write anything; read-only candidate search.
+    Searches all active, seat-eligible crew and returns a
+    CandidateStatus per candidate — replaces find_legal_candidates_
+    for_duty() (2026-08-12, flight-deck crew package), whose bare
+    List[str] let a NEEDS_MANUAL_REVIEW candidate (e.g. missing DG
+    expiry) show up indistinguishable from a genuinely LEGAL one, only
+    for the real gate to refuse them at actual assignment time —
+    confirmed as a real, reproduced defect, not hypothetical. Every
+    evaluated candidate is returned now, not just the passing ones —
+    callers filter to LEGAL + permitted WARNING for "selectable," and
+    can still show NEEDS_MANUAL_REVIEW/ILLEGAL candidates separately
+    with their real reason, never mislabeled "legal." Does not check
+    location (not tracked — see HANDOVER.md) or write anything;
+    read-only candidate search.
+
+    operating_position (None for LM/ENGR, 'COMMANDER'/'SECOND_PILOT'
+    for a pilot seat search): when given, the candidate pool is
+    SEAT_ELIGIBLE_GRADES[operating_position] (Commander: CPT only;
+    Second Pilot: CPT or FO) rather than an exact role_assigned match,
+    and the age-pairing check is asked against operating_position (via
+    _check_crew_pairing_age()'s real-partner DB lookup — this searches
+    for who could legally fill ONE seat given whoever REALLY holds the
+    other, e.g. downstream-conflict replacement search or the
+    generator's own retry — never two brand-new candidates against
+    each other; that's validate_pair()'s job). When None (LM/ENGR),
+    behavior is unchanged from before: exact role_assigned match, no
+    pairing check (_check_crew_pairing_age() no-ops on
+    operating_position=None).
 
     For FTL-exempt roles (LM, ENGR), every active crew member holding
     that role is trivially a legal candidate from an FTL standpoint —
@@ -1059,7 +1736,10 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     role_assigned = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
 
     all_crew = crew_service.get_all_crew(active_only=True)
-    candidates_pool = all_crew[all_crew["role"] == role_assigned]
+    if operating_position is not None:
+        candidates_pool = all_crew[all_crew["role"].isin(SEAT_ELIGIBLE_GRADES[operating_position])]
+    else:
+        candidates_pool = all_crew[all_crew["role"] == role_assigned]
 
     engine = get_engine()
     flights = [flight_service.get_flight(fid) for fid in flight_ids]
@@ -1090,16 +1770,25 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
     reference_date = min(l.dep_time for l in legs).date()
 
     if role_assigned in FTL_EXEMPT_ROLES:
-        legal_candidates = []
+        statuses = []
         for _, crew_row in candidates_pool.iterrows():
             if exclude_crew_id and crew_row["crew_id"] == exclude_crew_id:
                 continue
             qualification_alerts = _check_crew_qualifications(crew_row, duty_date)
-            if not any(a.status == AlertStatus.ILLEGAL for a in qualification_alerts):
-                legal_candidates.append(crew_row["crew_id"])
-        return legal_candidates
+            worst = AlertStatus.LEGAL
+            for a in qualification_alerts:
+                if _STATUS_PRECEDENCE[a.status] > _STATUS_PRECEDENCE[worst]:
+                    worst = a.status
+            blocking = [a.message for a in qualification_alerts
+                        if a.status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)]
+            warnings = [a.message for a in qualification_alerts if a.status == AlertStatus.WARNING]
+            statuses.append(CandidateStatus(
+                crew_id=crew_row["crew_id"], status=worst.value,
+                blocking_reasons=blocking, warnings=warnings,
+            ))
+        return statuses
 
-    legal_candidates = []
+    statuses = []
     for _, crew_row in candidates_pool.iterrows():
         if exclude_crew_id and crew_row["crew_id"] == exclude_crew_id:
             continue
@@ -1132,55 +1821,104 @@ def find_legal_candidates_for_duty(flight_ids: List[int], role_assigned: str,
         for alert in _check_crew_qualifications(crew_row, duty_date):
             result.add_alert(alert)
 
-        # Age-pairing (AE-CREW-PAIR-AGE-001, 2026-08-08): would this
-        # candidate legally pair with whoever REALLY holds the other
-        # seat of this future duty? Reuses _check_crew_pairing_age()
-        # wholesale — the exact call _validate_new_duty() already
-        # makes for a real assignment — rather than re-deriving
-        # anything: it already takes a plain crew_row and never
-        # assumes its own assignment is real, so asking it about a
-        # hypothetical candidate is the same question it already
-        # answers for a real one. AGE_LIMIT (ILLEGAL) excludes the
-        # candidate below, same as any other ILLEGAL finding here;
-        # DOB_MISSING (NEEDS_MANUAL_REVIEW) does not exclude — same
-        # threshold _check_crew_qualifications()'s own missing-expiry
-        # case already gets, not a new asymmetry. "Pending" (nobody on
-        # the other seat yet) emits no alert at all, by design — see
-        # _check_crew_pairing_age()'s own docstring.
+        # Age-pairing: would this candidate legally pair with whoever
+        # REALLY holds the other seat of this duty? Reuses
+        # _check_crew_pairing_age() wholesale, keyed on
+        # operating_position now (2026-08-12) rather than grade — see
+        # that function's own docstring for why this DB-lookup path is
+        # the right one here (one seat is real) and not the same
+        # question validate_pair() answers (two fresh candidates).
+        # AGE_LIMIT (ILLEGAL) excludes the candidate below, same as
+        # any other ILLEGAL finding here; DOB_MISSING (NEEDS_MANUAL_
+        # REVIEW) does not exclude — same threshold _check_crew_
+        # qualifications()'s own missing-expiry case already gets.
+        # "Pending" (nobody on the other seat yet) emits no alert at
+        # all, by design — see _check_crew_pairing_age()'s own
+        # docstring.
         pairing_alerts, _ = _check_crew_pairing_age(
-            engine, crew_row, flight_ids, domestic, reference_date)
+            engine, operating_position, crew_row, flight_ids, domestic, reference_date)
         for alert in pairing_alerts:
             result.add_alert(alert)
 
-        if result.status != AlertStatus.ILLEGAL:
-            legal_candidates.append(crew_row["crew_id"])
+        summary = summarize_alerts(result, target_duty_id=candidate_duty_id)
+        blocking_reason = build_audit_reason(summary, frozenset({AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW}))
+        warning_reason = build_audit_reason(summary, frozenset({AlertStatus.WARNING}))
+        statuses.append(CandidateStatus(
+            crew_id=crew_row["crew_id"], status=result.status.value,
+            blocking_reasons=[blocking_reason] if blocking_reason else [],
+            warnings=[warning_reason] if warning_reason else [],
+        ))
 
-    return legal_candidates
+    return statuses
 
 
-def remove_assignment(crew_id: str, flight_id: int, role_assigned: str,
-                       reason: Optional[str] = None, app_user: Optional[str] = None) -> None:
-    """Marks the roster row CANCELLED — never deletes, same permanent-
-    record pattern as flights. The partial unique index
-    (005_roster_partial_unique_index.sql) is what allows the same
-    (crew, flight, role) to be assigned again afterward."""
+def remove_assignment_from_duty(crew_id: str, duty_id: str, reason: Optional[str] = None,
+                                 app_user: Optional[str] = None) -> None:
+    """
+    Cancels EVERY active roster row for (crew_id, duty_id) in one
+    transaction — replaces remove_assignment() (2026-08-12, flight-deck
+    crew package), which operated on a single (crew_id, flight_id,
+    role_assigned) row: for a multi-sector duty, that left every OTHER
+    sector still active, still carrying the original duty-level
+    report_time/debrief_time/fdp_hours — a real, reproduced defect,
+    not hypothetical. This predates the pair work — LM/ENGR were just
+    as exposed, since assign_crew_to_duty() always wrote a whole
+    duty's sectors together but remove_assignment() was never
+    duty-scoped to match. The old function is removed, not left
+    alongside this one — keeping both would invite exactly the misuse
+    that caused the defect. Marks CANCELLED, never deletes, same
+    permanent-record pattern as before; the partial unique index
+    (migrations/005) still allows the same (crew, flight, role) to be
+    assigned again afterward.
+
+    If the cancelled crew_id held a rotation-linked
+    (flights.rotation_instance_id IS NOT NULL) COMMANDER/SECOND_PILOT
+    seat, this also opens (or reopens) an uncovered_seats row for that
+    seat. uncovered_seats is meant to be the single durable source of
+    truth for "which seats are currently empty," not just a generator
+    failure log — a manually-vacated seat with no durable record here
+    would undercut the point of the table (flagged explicitly during
+    plan review, decided deliberately here rather than left as a gap).
+    """
     engine = get_engine()
     with engine.begin() as conn:
-        result = conn.execute(text("""
-            UPDATE roster SET status = 'CANCELLED'
-            WHERE crew_id = :crew_id AND flight_id = :flight_id
-                AND role_assigned = :role_assigned AND status != 'CANCELLED'
-        """), {"crew_id": crew_id, "flight_id": flight_id, "role_assigned": role_assigned})
-        if result.rowcount == 0:
-            raise ValueError("No active assignment found matching crew_id/flight_id/role_assigned")
+        rows = conn.execute(text("""
+            SELECT r.flight_id, r.operating_position, f.rotation_instance_id
+            FROM roster r JOIN flights f ON r.flight_id = f.flight_id
+            WHERE r.crew_id = :crew_id AND r.duty_id = :duty_id AND r.status != 'CANCELLED'
+        """), {"crew_id": crew_id, "duty_id": duty_id}).mappings().all()
 
-    log_audit(
-        action_type="ASSIGNMENT_REMOVED",
-        affected_crew=crew_id,
-        affected_flight=flight_id,
-        reason=reason,
-        app_user=app_user,
-    )
+        if not rows:
+            raise ValueError("No active assignment found matching crew_id/duty_id")
+
+        conn.execute(text("""
+            UPDATE roster SET status = 'CANCELLED'
+            WHERE crew_id = :crew_id AND duty_id = :duty_id AND status != 'CANCELLED'
+        """), {"crew_id": crew_id, "duty_id": duty_id})
+
+        operating_position = rows[0]["operating_position"]
+        rotation_instance_id = rows[0]["rotation_instance_id"]
+        if operating_position is not None and rotation_instance_id is not None:
+            conn.execute(text("""
+                INSERT INTO uncovered_seats (rotation_instance_id, operating_position, reason)
+                VALUES (:rotation_instance_id, :operating_position, :reason)
+                ON CONFLICT (rotation_instance_id, operating_position)
+                DO UPDATE SET reason = EXCLUDED.reason, generated_at = NOW(), resolved_at = NULL
+            """), {
+                "rotation_instance_id": rotation_instance_id,
+                "operating_position": operating_position,
+                "reason": f"Manually unassigned ({crew_id}): {reason or 'no reason given'}",
+            })
+
+        log_audit(
+            action_type="ASSIGNMENT_REMOVED",
+            affected_crew=crew_id,
+            affected_flight=rows[0]["flight_id"],
+            affected_duty=duty_id,
+            reason=reason,
+            app_user=app_user,
+            conn=conn,
+        )
 
 
 def cancel_flight_and_roster(flight_id: int, reason: Optional[str] = None,

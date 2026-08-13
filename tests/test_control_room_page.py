@@ -1,5 +1,13 @@
 """
 tests/test_control_room_page.py
+
+Rebuilt for the flight-deck crew package (2026-08-13): the page now
+has a "Crew type" radio (defaults to the flight-deck pair path) that
+determines which fields render — Commander/Second Pilot selectboxes
+live OUTSIDE the form (read before submission, same reasoning as
+every other live-updating control in this codebase), the single
+crew_id/role selectboxes for LM/ENGR/Other live INSIDE the form and
+only render when "Single crew" is selected.
 """
 import os
 import sys
@@ -26,24 +34,36 @@ def page_app(migrated_db, monkeypatch):
     get_engine.cache_clear()
 
 
-def _seed_crew():
+_FAR_FUTURE = dt.date(2099, 1, 1)
+_QUAL_DEFAULTS = {
+    "license_expiry": _FAR_FUTURE, "medical_expiry": _FAR_FUTURE,
+    "sim_expiry": _FAR_FUTURE, "route_check_expiry": _FAR_FUTURE,
+    "ir_expiry": _FAR_FUTURE, "sep_expiry": _FAR_FUTURE,
+    "crm_expiry": _FAR_FUTURE, "dg_expiry": _FAR_FUTURE,
+}
+
+
+def _seed_crew(role="LM", **overrides):
     from services import crew_service
     # All qualification expiry fields set far in the future so these
     # page tests exercise page/FDP/rest mechanics, not the
     # qualification gate (2026-07-31) — that gate has its own
     # dedicated tests in test_assignment_service.py.
-    far_future = dt.date(2099, 1, 1)
-    return crew_service.add_crew({
-        "name": "Test Captain", "role": "CPT", "base": "KHI",
-        "license_expiry": far_future, "medical_expiry": far_future,
-        "sim_expiry": far_future, "route_check_expiry": far_future,
-        "ir_expiry": far_future, "sep_expiry": far_future,
-        "crm_expiry": far_future, "dg_expiry": far_future,
-    })
+    crew_data = {"name": f"Test {role}", "role": role, "base": "KHI"}
+    crew_data.update(_QUAL_DEFAULTS)
+    crew_data.update(overrides)
+    from services import crew_service as cs
+    return cs.add_crew(crew_data)
+
+
+def _seed_pair(commander_dob=dt.date(1980, 1, 1), second_pilot_dob=dt.date(1985, 1, 1)):
+    cpt = _seed_crew("CPT", date_of_birth=commander_dob)
+    fo = _seed_crew("FO", date_of_birth=second_pilot_dob)
+    return cpt, fo
 
 
 def test_page_loads_without_exception(page_app):
-    _seed_crew()
+    _seed_pair()
     at = page_app.run()
     assert not at.exception
 
@@ -53,10 +73,23 @@ def test_no_active_crew_shows_warning(page_app):
     assert any("No active crew" in w.value for w in at.warning)
 
 
-def test_legal_adhoc_assignment_saves_flight_and_shows_success(page_app):
-    _seed_crew()
+def test_no_eligible_pair_shows_warning(page_app):
+    """Only an LM on file — no CPT/FO at all — the pair path (the
+    default crew type) must warn rather than error, since there's no
+    eligible Commander or Second Pilot pool to build a form from."""
+    _seed_crew("LM")
+    at = page_app.run()
+    assert not at.exception
+    assert any("active CPT" in w.value for w in at.warning)
+
+
+def test_legal_pair_assignment_saves_flight_and_shows_success(page_app):
+    cpt, fo = _seed_pair()
     at = page_app.run()
 
+    # Pair is the default crew type — no radio interaction needed.
+    at.selectbox[0].select(cpt)  # Commander
+    at.selectbox[1].select(fo)   # Second Pilot
     at.text_input[0].input("KHI")   # Origin
     at.text_input[1].input("LHE")   # Destination
     at.date_input[0].set_value(dt.date(2026, 7, 20))
@@ -71,18 +104,19 @@ def test_legal_adhoc_assignment_saves_flight_and_shows_success(page_app):
 
     from services import flight_service, assignment_service
     assert len(flight_service.get_all_flights()) == 1
-    assert len(assignment_service.get_roster_for_crew("CPT-01")) == 1
+    assert len(assignment_service.get_roster_for_crew(cpt)) == 1
+    assert len(assignment_service.get_roster_for_crew(fo)) == 1
 
 
-def test_illegal_adhoc_assignment_shows_rejection_and_saves_nothing(page_app):
-    crew_id = _seed_crew()
+def test_illegal_pair_assignment_shows_rejection_and_saves_nothing(page_app):
+    cpt, fo = _seed_pair()
 
-    # Seed a prior 8h-FDP duty directly — an 8h duty now correctly
-    # triggers NEEDS_MANUAL_REVIEW through the real
-    # assign_crew_to_duty() call (no meal/snack data populated,
-    # tested separately), so it's seeded here as GIVEN history
-    # instead, the same way test_assignment_service.py's _seed_duty
-    # helper does it.
+    # Seed a prior 8h-FDP duty for the Commander directly — an 8h duty
+    # now correctly triggers NEEDS_MANUAL_REVIEW through the real
+    # assign_pair_to_new_flights() call (no meal/snack data
+    # populated, tested separately), so it's seeded here as GIVEN
+    # history instead, same pattern as test_assignment_service.py's
+    # own _seed_duty helper.
     from services import flight_service
     from sqlalchemy import text
     prior_flight = flight_service.add_flight({
@@ -99,7 +133,7 @@ def test_illegal_adhoc_assignment_shows_rejection_and_saves_nothing(page_app):
             VALUES (:crew_id, :flight_id, 'SEEDED-PRIOR', :duty_date,
                 :report_time, :debrief_time, :fdp_hours, :role_assigned)
         """), {
-            "crew_id": crew_id, "flight_id": prior_flight,
+            "crew_id": cpt, "flight_id": prior_flight,
             "duty_date": dt.date(2026, 7, 20),
             "report_time": dt.datetime(2026, 7, 20, 4, 15),
             "debrief_time": dt.datetime(2026, 7, 20, 12, 15),
@@ -107,6 +141,8 @@ def test_illegal_adhoc_assignment_shows_rejection_and_saves_nothing(page_app):
         })
 
     at = page_app.run()
+    at.selectbox[0].select(cpt)
+    at.selectbox[1].select(fo)
     at.text_input[0].input("KHI")
     at.text_input[1].input("LHE")
     at.date_input[0].set_value(dt.date(2026, 7, 20))
@@ -120,34 +156,25 @@ def test_illegal_adhoc_assignment_shows_rejection_and_saves_nothing(page_app):
     assert any("REJECTED" in e.value for e in at.error)
 
     # Only the ONE prior (legal) flight should exist — the illegal
-    # ad-hoc attempt must not have saved a second one.
+    # ad-hoc attempt must not have saved a second one, for either seat.
     assert len(flight_service.get_all_flights()) == 1
 
 
-def test_needs_review_adhoc_assignment_shows_warning_not_success(page_app):
-    """Regression guard for a real bug: before the NEEDS_REVIEW
-    branch was added to this page, a held assignment would fall into
-    the 'else' (ALLOWED) branch, which references flight_ids[0] —
-    but flight_ids is genuinely empty for a held assignment, so this
-    would have raised an IndexError, not just shown a misleading
-    success message.
+def test_needs_review_pair_assignment_shows_warning_not_success(page_app):
+    """Regression guard for a real bug already fixed once on this
+    page (pre-pair-model): a held assignment must never fall into the
+    ALLOWED branch, which references flight_ids[0] — genuinely empty
+    for a held assignment.
 
-    Trigger: a missing qualification-expiry field
-    (AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING), not a >6h duty —
-    previously used a 7h FDP duty to trigger D25 nutrition-data-
-    missing instead, which migrations/014 (2026-08-08) fixed by
-    giving every flight a real meal_provided, making that trigger
-    structurally unreachable. Same substitution as
-    tests/test_assignment_service.py's own NEEDS_MANUAL_REVIEW-gate
-    tests. Local to this one test — _seed_crew()'s other 3 callers
-    still get fully-qualified crew, since this file deliberately
-    avoids exercising the qualification gate elsewhere (it has its
-    own dedicated tests in test_assignment_service.py)."""
+    Trigger: a missing qualification-expiry field on the Commander
+    (AE-CREW-QUAL-001_LICENSE_EXPIRY_MISSING)."""
     from services import crew_service
-    crew_id = _seed_crew()
-    crew_service.update_crew(crew_id, {"license_expiry": None})
+    cpt, fo = _seed_pair()
+    crew_service.update_crew(cpt, {"license_expiry": None})
 
     at = page_app.run()
+    at.selectbox[0].select(cpt)
+    at.selectbox[1].select(fo)
     at.text_input[0].input("KHI")
     at.text_input[1].input("LHE")
     at.date_input[0].set_value(dt.date(2026, 7, 20))
@@ -163,3 +190,31 @@ def test_needs_review_adhoc_assignment_shows_warning_not_success(page_app):
 
     from services import flight_service as fs
     assert len(fs.get_all_flights()) == 0  # nothing saved
+
+
+def test_single_crew_path_still_works_for_lm(page_app):
+    """The unaffected LM/ENGR/Other path — switching Crew type off
+    the default pair option renders the single crew_id/role form
+    instead."""
+    lm = _seed_crew("LM")
+    at = page_app.run()
+
+    at.radio[0].set_value("Single crew (LM / ENGR / Other)")
+    at = at.run()
+
+    at.text_input[0].input("KHI")
+    at.text_input[1].input("LHE")
+    at.date_input[0].set_value(dt.date(2026, 7, 20))
+    at.time_input[0].set_value(dt.time(5, 45))
+    at.date_input[1].set_value(dt.date(2026, 7, 20))
+    at.time_input[1].set_value(dt.time(7, 45))
+    at.selectbox[0].select(lm)     # Crew member
+    at.selectbox[1].select("LM")   # Role
+    at.button[0].click()
+    at = at.run()
+
+    assert not at.exception
+    assert any("ALLOWED" in s.value for s in at.success)
+
+    from services import assignment_service
+    assert len(assignment_service.get_roster_for_crew(lm)) == 1

@@ -305,8 +305,12 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-11).
-  `home-page-branding` merged into `main`** — home page branding in
+- **As of this snapshot (2026-08-13): one branch in flight,
+  `flight-deck-crew-package` — NOT YET MERGED, in progress.** See the
+  dated log entry near the end of this file. Everything below this
+  bullet reflects state as of 2026-08-11, before that branch started.
+
+- **`home-page-branding` merged into `main`** — home page branding in
   two rounds: round 1 (2026-08-10, logo/background/theming) and round
   2 (2026-08-11, refinements from actually running round 1 — an inline
   double-size logo replacing "Air Eagle" in the title, a green
@@ -330,14 +334,17 @@ forward.
   and confirmed the sidebar genuinely reads "Home" with the page
   rendering correctly. Merged into `main`, pushed; branch
   `home-page-branding` deleted, both remote and local. **The
-  background-image resolution open item (below) was partially resolved
+  background-image resolution open item (below) was resolved
   afterward, on its own branch (`background-image-update`,
-  2026-08-11): 640x480 → 910x672.** Still not fully resolved — a
-  3000px+ original (likely available if this came from a phone camera)
-  would still be worth swapping in later, same path, same approach. See
-  the two dated log entries below for full detail on the original
-  merge, and the newest entry at the end of the file for the image
-  update.
+  2026-08-11): 640x480 → 910x672, dark overlay removed, DB-status date
+  format fixed to dd-mm-yyyy, and the redundant page-link button grid
+  removed entirely (sidebar navigation already covers it). Merged into
+  `main`, pushed; branch deleted, both remote and local.** A 3000px+
+  original (likely available if this came from a phone camera) would
+  still be worth swapping in later, same path, same approach — that
+  part remains open. See the two dated log entries below for full
+  detail on the original merge, and the newest entries at the end of
+  the file for the image update and button removal.
 
 - **Merged into `main` before that**: `streamlit-cloud-secrets` —
   `db/db.py`'s `get_engine()` raised `RuntimeError: DATABASE_URL not
@@ -1706,9 +1713,14 @@ NEEDS_MANUAL_REVIEW/ILLEGAL branches Step 2 already built handle this
 with zero new branching logic in `assign_crew_to_duty()` /
 `assign_crew_to_new_flights()`.
 
-**Fields checked** (9): license_expiry, medical_expiry,
-type_rating_expiry, sim_expiry, route_check_expiry, ir_expiry,
-sep_expiry, crm_expiry, dg_expiry — plus `is_active`.
+**Fields checked** (8): license_expiry, medical_expiry, sim_expiry,
+route_check_expiry, ir_expiry, sep_expiry, crm_expiry, dg_expiry —
+plus `is_active`. [Corrected 2026-08-12: this originally said 9 and
+included `type_rating_expiry`, accurate at the time this entry was
+written but stale ever since `type_rating_expiry` was dropped from the
+gate — see the 2026-08-01 entry below. Every other mention in this
+file already said 8; this was the one stale holdout, found and fixed
+while researching the flight-deck crew package piece.]
 `contract_expiry` is deliberately excluded: an employment/HR date,
 not a flight-safety qualification. This is an ASSUMPTION, not an
 operator-confirmed decision, and should be revisited if Air Eagle's
@@ -5177,5 +5189,153 @@ the sidebar to navigate." One combined test
 replaced by two narrower ones (`test_utc_clock_is_inline_with_db_status`,
 `test_nav_text_points_to_sidebar_only`) — net one more test file-wide,
 DB-gated like the one it replaced, so the locally-passing count stays
-199; skipped goes 284 → 285. `check_reachability.py` clean. Pushed to
-`background-image-update`; still not merged.
+199; skipped goes 284 → 285. `check_reachability.py` clean. Merged into
+`main`, pushed; branch `background-image-update` deleted, both remote
+and local (per the operator's explicit merge instruction — full suite
++ reachability re-confirmed clean first, and confirmed nothing outside
+`home.py`/`tests/test_home_page.py` changed).
+
+## 2026-08-12/13: Flight-deck crew package — Commander/Second-Pilot
+## seat model. IN PROGRESS, NOT YET MERGED.
+
+The biggest architectural change to the assignment path since the
+rebuild. Full design reasoning lives in the plan the operator
+approved before any code was written — not reproduced in full here;
+this entry tracks what's actually been built and the decisions made
+along the way. Four empirically-reproduced defects drove it: no DB-
+level concept of a flight-deck seat (five Captains on one flight was
+`ALLOWED`), a pilot pair committed as two separate non-atomic calls
+(first pilot real before the second was validated), `remove_
+assignment()` corrupting a multi-sector duty on a partial unassign,
+and `find_legal_candidates_for_duty()` offering candidates the real
+gate would then refuse (NEEDS_MANUAL_REVIEW mislabeled legal).
+
+**Core change**: new `roster.operating_position` (COMMANDER/
+SECOND_PILOT, nullable) separates *seat on this flight* from `crew.
+role`/`roster.role_assigned` (grade — CPT/FO/LM/ENGR, unchanged
+meaning). Commander must be CPT-graded; Second Pilot may be CPT or FO.
+Age-pairing rule (`_evaluate_pair_age`, `services/assignment_
+service.py`) kept byte-for-byte identical, re-keyed from grade to
+operating position — a CPT+CPT pair now goes through the exact same
+domestic/international check a CPT+FO pair always did.
+
+**Architectural fork, decided**: `operating_position` column + partial
+unique indexes + a new atomic pair-assignment function (`migrations/
+016_operating_position.sql`), not a separate `crew_packages` table —
+`roster` stays the single source of truth for "who's assigned,"
+avoiding exactly the drift-bug class `migrations/003_roster_
+table.sql`'s own header calls "the single most repeated bug in this
+platform's history." Migration 016 independently verified by the
+operator against real Postgres 16 before implementation started — all
+six invariants (seat CHECK values, Commander-must-be-CPT CHECK, the
+flight-scoped partial unique index, and its non-collision with a
+pilot's own multi-sector rows) confirmed.
+
+**The one gap Option B leaves — durable UNCOVERED** (an uncovered seat
+has no roster row, nothing to query once the generator's in-memory
+`GenerationSummary` is gone after a refresh) — closed with a small,
+negative-only `migrations/017_uncovered_seats.sql` table, not by
+inflating the roster model. A sentinel/NULL-`crew_id` row was rejected
+(breaks the `NOT NULL REFERENCES crew(crew_id)` FK, needs pervasive
+filtering); live-diffing APPROVED rotations against roster coverage
+was rejected (loses the real rejection reason from the specific
+attempted-candidate ordering at generation time).
+
+**Design decision, deliberately flagged for review rather than
+assumed**: should `remove_assignment_from_duty()` (the new duty-scoped
+unassign, replacing the old per-flight `remove_assignment()`) also
+write to `uncovered_seats` when it leaves a rotation-linked seat
+manually vacated? Decided **yes** — a controller manually removing a
+Commander leaves that seat just as genuinely uncovered as a generator
+search that never found one, and a silently-uncovered manually-vacated
+seat would undercut the whole point of the table: being the single
+durable source of truth for "which seats are currently empty," not
+merely a generator failure log. Implemented via the same upsert
+pattern the generator itself uses (`ON CONFLICT (rotation_instance_id,
+operating_position) DO UPDATE`), with a distinct "Manually unassigned"
+reason string so the two write paths stay distinguishable in the data.
+**This means `uncovered_seats` is written by two call sites, not one
+— `migrations/017_uncovered_seats.sql`'s header comment originally
+scoped the table to "the generator's own bulk-fill use case" only,
+which no longer matched actual usage once this decision was made.
+Corrected in the migration file itself (2026-08-13) to describe both
+writers; this log entry is the "why," the migration file is the
+current "what."** Control Room's ad-hoc path remains the one genuine
+exception — synchronous, always resolves immediately (REJECTED or
+written), so it never leaves a durable gap to record.
+
+**Built so far**: `migrations/016_operating_position.sql` (user-
+verified against real Postgres), `migrations/017_uncovered_
+seats.sql` (not yet independently verified), full rewrite of
+`services/assignment_service.py` (`SEAT_ELIGIBLE_GRADES`, `validate_
+pair()`, `assign_pair_to_duty()`, `assign_pair_to_new_flights()`,
+`assign_crew_to_duty()`/`assign_crew_to_new_flights()` now reject CPT/
+FO outright, `remove_assignment_from_duty()` replacing `remove_
+assignment()`, `find_legal_candidates_for_seat()` replacing `find_
+legal_candidates_for_duty()`), full rewrite of `services/roster_
+generator_service.py` (seat-based pair search replacing sequential
+per-role fill, `publish_window()` re-validating each rotation's actual
+pair fresh before flipping PROPOSED→PLANNED), `pages/4_Roster.py`
+(pair-based assignment form, duty-scoped unassign — verified via
+mocked `AppTest`), and `pages/1_Control_Room.py` (ad-hoc pair-based
+flow for pilots, original single-crew form kept for LM/ENGR/Other).
+
+**`pages/6_Roster_Generation.py` done (2026-08-13)**: uncovered is now
+read from `uncovered_seats` directly (new `get_open_uncovered_seats()`,
+joined against `rotation_instances`) as its own always-current panel,
+independent of session state — shown right after the date picker, not
+gated behind clicking Generate. Fairness display is seat-aware
+(Commander/Second Pilot duty counts, not CPT/FO). Publish now reports
+how many rows remain PROPOSED after a publish click, surfacing the
+per-rotation re-validation gate's skips rather than leaving them
+silent.
+
+**Real gap found and fixed while writing tests for this piece
+(2026-08-13)**: `assign_pair_to_new_flights()`'s REJECTED/NEEDS_
+MANUAL_REVIEW branch never called `log_audit()` — every other
+rejection path in this file (`assign_pair_to_duty()`, `assign_crew_
+to_duty()`, `assign_crew_to_new_flights()`) logs a record even when
+nothing is saved, and this file's own existing tests establish that as
+a settled invariant, not an incidental behavior. Fixed: `ADHOC_PAIR_
+REJECTED`/`ADHOC_PAIR_HELD_FOR_REVIEW` audit records added, naming
+mirrored off the LM/ENGR ad-hoc path's existing `ADHOC_FLIGHT_
+REJECTED`/`ADHOC_FLIGHT_HELD_FOR_REVIEW` convention.
+
+**Tests reworked (2026-08-13)**: `tests/test_assignment_service.py`
+(full rewrite — `_assign_pilot()`/`_assign_pilot_adhoc()` helpers
+auto-pair a subject pilot with a disposable, always-otherwise-legal
+partner so the many FDP/rest/qualification/downstream-conflict tests
+that were never really ABOUT pairing keep reading the same as before;
+a dedicated pairing/composition section calls `validate_pair()`/
+`assign_pair_to_duty()` directly for the tests that ARE about pairing).
+`tests/test_roster_generator_service.py` (seat-based fairness,
+`uncovered_seats` durability tests, `publish_window()`'s per-rotation
+skip behavior — several scenarios re-derived, not just renamed: the
+widened `SECOND_PILOT` eligibility (CPT-or-FO) and pair atomicity both
+genuinely change which crewing outcomes are reachable, see each
+test's own docstring). New `tests/test_flight_deck_seat_constraints.py`
+— migrations 016/017's CHECK/unique/FK constraints proven directly
+against real Postgres via raw SQL, same discipline as
+`test_rotation_template_service.py`'s own migration-011/012
+precedents. `tests/test_control_room_page.py`, `tests/test_roster_
+page.py`, `tests/test_roster_generation_page.py` updated for the new
+form layouts (`AppTest`, positional widget indices per this
+codebase's established convention).
+
+**Status: functionally complete.** Full local suite green (199
+passed, 327 skipped — all DB-integration tests skip without
+`TEST_DATABASE_URL` in this sandbox, same standing limitation as every
+piece this session) and `scripts/check_reachability.py` clean. Diff
+scoped exactly to what the plan named: `services/assignment_service.py`,
+`services/roster_generator_service.py`, `pages/1_Control_Room.py`,
+`pages/4_Roster.py`, `pages/6_Roster_Generation.py`, their tests, the
+two new migrations, and this file — no other page or service touched.
+
+**Not yet done**: the operator's own real-Postgres run of the full
+suite (migration 017 specifically has not been independently verified
+the way migration 016 was before this piece started) and the manual
+click-through this session's UI pieces normally get before merging.
+One branch (`flight-deck-crew-package`), merged as one unit once that
+verification is in — a half-migrated state would leave the app
+genuinely broken against a shared `roster` table. No merge without it,
+same standing discipline as every piece this session.

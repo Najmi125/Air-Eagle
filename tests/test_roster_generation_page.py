@@ -12,6 +12,13 @@ already established for the service layer this page presents.
 Dates are computed relative to dt.date.today() (never hardcoded) so
 this file stays valid indefinitely, same discipline as every other
 page test file this session.
+
+Rebuilt for the flight-deck crew package (2026-08-13): seats are
+Commander/Second Pilot, not CPT/FO. Uncovered is now shown in its own
+always-current "Currently uncovered seats" panel (durable, reads
+uncovered_seats directly), rendered BEFORE the Generate button — so
+its dataframe, when present, is dataframe[0], ahead of the two
+fairness dataframes in the Results section below it.
 """
 import os
 import sys
@@ -148,6 +155,11 @@ def test_no_approved_rotations_shows_templates_page_pointer(page_app):
     assert not any(b.label == "Generate" for b in at.button)
 
 
+def test_currently_uncovered_panel_shows_success_when_nothing_open(page_app):
+    at = page_app.run()
+    assert any("No open uncovered seats" in s.value for s in at.success)
+
+
 # ------------------------------------------------------------------
 # Generate — happy path
 # ------------------------------------------------------------------
@@ -163,27 +175,28 @@ def test_generate_fills_seats_and_shows_fairness_counts(page_app):
     at = _click(at, "Generate")
 
     assert not at.exception
-    assert any("All seats filled" in s.value for s in at.success)
+    assert any("Every seat this run attempted was filled or already covered" in s.value for s in at.success)
 
-    # No uncovered dataframe renders when uncovered is empty, so the
-    # fairness tables are dataframe[0] (CPT) and dataframe[1] (FO).
-    cpt_df = at.dataframe[0].value
-    fo_df = at.dataframe[1].value
-    assert cpt_df["Crew"].iloc[0].startswith(cpt_id)
-    assert int(cpt_df["Duties filled"].iloc[0]) == 1
-    assert fo_df["Crew"].iloc[0].startswith(fo_id)
-    assert int(fo_df["Duties filled"].iloc[0]) == 1
+    # No uncovered dataframe renders when nothing's open, so the
+    # fairness tables are dataframe[0] (Commander) and dataframe[1]
+    # (Second Pilot).
+    commander_df = at.dataframe[0].value
+    second_pilot_df = at.dataframe[1].value
+    assert commander_df["Crew"].iloc[0].startswith(cpt_id)
+    assert int(commander_df["Duties filled"].iloc[0]) == 1
+    assert second_pilot_df["Crew"].iloc[0].startswith(fo_id)
+    assert int(second_pilot_df["Duties filled"].iloc[0]) == 1
 
 
 # ------------------------------------------------------------------
-# uncovered — shown first, both the structural (no-candidates) and the
-# real rule-derived-reason case.
+# uncovered — shown first, in its own durable panel, both the
+# structural (no-candidates) and the real rule-derived-reason case.
 # ------------------------------------------------------------------
 
 def test_uncovered_no_candidates_shown_before_fairness(page_app):
     date = _next_weekday(dt.date.today(), 1)
     _make_domestic_instance(date)
-    _add_crew("FO")  # no CPT at all -- guaranteed, clean uncovered
+    _add_crew("FO")  # no CPT at all -- guaranteed, clean uncovered on both seats
 
     at = page_app.run()
     at = _set_window(at, date, date)
@@ -199,6 +212,7 @@ def test_uncovered_no_candidates_shown_before_fairness(page_app):
 
     uncovered_df = at.dataframe[0].value
     assert "No candidates in pool" in uncovered_df["Reason"].iloc[0]
+    assert set(uncovered_df["Position"]) == {"COMMANDER", "SECOND_PILOT"}
 
 
 def test_uncovered_real_rejection_reason_reaches_page(page_app):
@@ -207,7 +221,9 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
     reaches the page unaltered, not just that the section renders in
     the right place. Back-to-back international duty for the sole CPT
     candidate is a real, already-established rest-math rejection
-    (tests/test_roster_generator_service.py's own grounding case)."""
+    (tests/test_roster_generator_service.py's own grounding case) —
+    under the pair model, BOTH seats show uncovered together (pair
+    atomicity), not just Commander."""
     thu = _next_weekday(dt.date.today(), 4)
     fri = thu + dt.timedelta(days=1)
     _make_international_instances(thu, fri)
@@ -221,10 +237,10 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
 
     assert not at.exception
     uncovered_df = at.dataframe[0].value
-    fri_cpt = uncovered_df[(uncovered_df["Date"] == fri) & (uncovered_df["Role"] == "CPT")]
-    assert len(fri_cpt) == 1
-    reason = fri_cpt["Reason"].iloc[0]
-    assert "REJECTED" in reason
+    fri_commander = uncovered_df[(uncovered_df["Date"] == fri) & (uncovered_df["Position"] == "COMMANDER")]
+    assert len(fri_commander) == 1
+    reason = fri_commander["Reason"].iloc[0]
+    assert "REJECTED" in reason or "NEEDS_MANUAL_REVIEW" in reason
     assert "No candidates in pool" not in reason
 
 
@@ -241,7 +257,7 @@ def test_generate_twice_is_idempotent(page_app):
     at = page_app.run()
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
-    assert any("All seats filled" in s.value for s in at.success)
+    assert any("Every seat this run attempted was filled or already covered" in s.value for s in at.success)
 
     at = _click(at, "Generate")
     assert not at.exception
@@ -265,20 +281,26 @@ def test_publish_shows_correct_count_and_flips_to_planned(page_app):
     at = _click(at, "Generate")
 
     # search_roster() is sector-level: the domestic rotation has 2 legs
-    # x 2 crew (CPT+FO) = 4 rows, not 2 duties -- same row-vs-duty unit
-    # publish_window() itself returns (confirmed in
+    # x 2 crew (Commander+Second Pilot) = 4 rows, not 2 duties -- same
+    # row-vs-duty unit publish_window() itself returns (confirmed in
     # tests/test_roster_generator_service.py's own publish test).
     assert any("4" in w.value and "PROPOSED roster row" in w.value for w in at.markdown)
 
     at = _click(at, "Publish")
     assert not at.exception
     assert any("Published 4 roster row" in s.value for s in at.success)
+    assert not any("remain PROPOSED" in w.value for w in at.warning)
 
     roster = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     assert set(roster["status"]) == {"PLANNED"}
 
 
-def test_reject_then_publish_skips_cancelled_row(page_app):
+def test_manual_unassign_before_publish_skips_the_whole_rotation(page_app):
+    """A rotation with only one seat filled (the other manually
+    unassigned after Generate ran) must not publish at all — pair
+    atomicity means BOTH pilots' rows stay as they are, not just the
+    unassigned one; the page must surface how many rows remain
+    PROPOSED rather than silently reporting a clean publish."""
     from services import assignment_service
 
     date = _next_weekday(dt.date.today(), 1)
@@ -290,24 +312,22 @@ def test_reject_then_publish_skips_cancelled_row(page_app):
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
 
-    # search_roster() is sector-level (one row per leg) -- the domestic
-    # rotation has 2 legs, so the CPT's duty spans 2 rows. Cancelling
-    # only one leg would leave the other ACTIVE, which is not what
-    # "unassign it on the Roster page" means operationally.
     proposed = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
-    for _, cpt_row in proposed[proposed["crew_id"] == cpt_id].iterrows():
-        assignment_service.remove_assignment(cpt_id, int(cpt_row["flight_id"]), "CPT", reason="test reject")
+    cpt_duty_id = proposed[proposed["crew_id"] == cpt_id].iloc[0]["duty_id"]
+    assignment_service.remove_assignment_from_duty(cpt_id, cpt_duty_id, reason="test reject")
 
     at = at.run()  # rerun to pick up the cancellation before publishing (Publish is DB-fresh, not session-cached)
     at = _click(at, "Publish")
     assert not at.exception
+    assert any("Published 0 roster row" in s.value for s in at.success)
+    assert any("remain PROPOSED" in w.value for w in at.warning)
 
     after = assignment_service.search_roster(
         date_from=date, date_to=date, include_proposed=True, include_cancelled=True)
     cpt_after = after[after["crew_id"] == cpt_id]
     fo_after = after[after["crew_id"] != cpt_id]
     assert set(cpt_after["status"]) == {"CANCELLED"}
-    assert set(fo_after["status"]) == {"PLANNED"}
+    assert set(fo_after["status"]) == {"PROPOSED"}  # NOT published -- the pair was incomplete
 
 
 # ------------------------------------------------------------------
