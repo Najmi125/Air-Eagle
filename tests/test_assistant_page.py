@@ -53,10 +53,22 @@ def _add_crew(name, role="CPT", **overrides):
 
 
 def _seed_duty_yesterday(crew_id):
-    """A real duty via the real assignment API, dated "yesterday"
-    relative to whenever this test actually runs — a domestic,
-    comfortably-legal 2h flight, no history to conflict with."""
-    from services import flight_service, assignment_service
+    """A real duty, dated "yesterday" relative to whenever this test
+    actually runs — a domestic, comfortably-legal 2h flight, no
+    history to conflict with.
+
+    Seeded directly via SQL rather than through assign_crew_to_duty()
+    (2026-08-14, flight-deck crew package): these tests are about the
+    OCC Assistant's reporting on one named crew member's duties, not
+    about pairing, and a CPT can no longer be assigned solo through
+    the real assignment API — assign_pair_to_duty() would need a
+    disposable second pilot for a scenario that has nothing to do with
+    pairing. Mirrors the same "seed given state via raw SQL" pattern
+    tests/test_assignment_service.py's own _seed_duty() helper uses for
+    exactly this reason."""
+    import uuid
+    from sqlalchemy import text
+    from services import flight_service
     yesterday = dt.date.today() - dt.timedelta(days=1)
     flight_id = flight_service.add_flight({
         "origin": "KHI", "destination": "LHE",
@@ -64,8 +76,21 @@ def _seed_duty_yesterday(crew_id):
         "arr_time_planned": dt.datetime.combine(yesterday, dt.time(7, 45)),
         "domestic": True,
     })
-    result = assignment_service.assign_crew_to_duty(crew_id, [flight_id], "CPT")
-    assert result.status == "ALLOWED"
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
+                report_time, debrief_time, fdp_hours, role_assigned)
+            VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
+                :report_time, :debrief_time, :fdp_hours, 'CPT')
+        """), {
+            "crew_id": crew_id, "flight_id": flight_id,
+            "duty_id": f"SEEDED-{uuid.uuid4().hex[:8]}",
+            "duty_date": yesterday,
+            "report_time": dt.datetime.combine(yesterday, dt.time(5, 0)),
+            "debrief_time": dt.datetime.combine(yesterday, dt.time(8, 0)),
+            "fdp_hours": 3.0,
+        })
     return flight_id
 
 

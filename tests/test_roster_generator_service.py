@@ -7,11 +7,21 @@ and EPE 802/804/805 (international, Tue/Thu/Fri/Sat) rotations, reused
 end-to-end through the real template -> approval -> generation arc
 (expand_and_persist() + approve_instance(), not synthetic shortcuts).
 
-Every seat decision here goes through the real assign_crew_to_duty()
-gate — these tests verify the generator's WIRING (right pool, right
-window, right idempotency, right status/visibility) and the specific,
-previously-broken domestic age-ordering scenario from HANDOVER.md's
-2026-08-04 entry, never re-derive FTL/pairing math themselves.
+Every seat decision here goes through the real assign_pair_to_duty()/
+assign_crew_to_duty() gate — these tests verify the generator's WIRING
+(right pool, right window, right idempotency, right status/visibility)
+and the specific, previously-broken domestic age-ordering scenario
+from HANDOVER.md's 2026-08-04 entry, never re-derive FTL/pairing math
+themselves.
+
+Rebuilt for the flight-deck crew package (2026-08-13): seats are
+Commander/Second Pilot (SeatResult.operating_position), not CPT/FO
+(SeatResult.role) — crew are still graded CPT/FO as before (crew.role,
+unchanged), but SEAT_ELIGIBLE_GRADES makes a CPT eligible for EITHER
+seat now, not just Commander. Several fairness/ordering scenarios
+below were re-derived rather than mechanically renamed, since that
+widened eligibility pool genuinely changes which crewing outcomes are
+reachable — see each test's own docstring for what changed and why.
 """
 import sys
 import datetime as dt
@@ -27,6 +37,7 @@ import services.rotation_template_service as rts
 import services.roster_generator_service as rgs
 import services.assignment_service as assignment_service
 import services.crew_service as crew_service
+import services.flight_service as flight_service
 from services.assistant import reports as assistant_reports
 from services.assistant.query_parser import ReportRequest
 from core.duty_summary import group_roster_rows_into_duties
@@ -107,12 +118,38 @@ def _roster_duty_count(engine):
     by the leg count (a 2-leg rotation crewed by CPT+FO is 4 rows, 2
     duties). core/duty_summary.py's group_roster_rows_into_duties() is
     the canonical dedup — used here rather than a raw COUNT(*), which
-    is what keeps this helper honest about which unit it measures.
-    Renamed from _roster_row_count (2026-08-08): that name itself
-    invited the exact row-vs-duty mistake Section 9 calls the single
-    most repeated bug in this platform's history."""
+    is what keeps this helper honest about which unit it measures."""
     df = pd.read_sql(text("SELECT * FROM roster"), engine)
     return len(group_roster_rows_into_duties(df))
+
+
+def _seed_seat(engine, crew_id, flight_ids, role_assigned, operating_position, status="PLANNED"):
+    """Seeds a real, ACTIVE occupant of one seat directly via SQL —
+    represents a seat pre-filled by some OTHER means (a manual
+    assignment made before the generator ever ran) without needing a
+    real partner to already exist, which the real pair-assignment API
+    can no longer construct one seat at a time. generate_for_window()'s
+    _seat_occupant() check doesn't care how a row got there, only that
+    it's ACTIVE — same reasoning as tests/test_assignment_service.py's
+    own _seed_seat_occupant()."""
+    import uuid
+    duty_id = f"SEEDED-{uuid.uuid4().hex[:8]}"
+    with engine.begin() as conn:
+        for fid in flight_ids:
+            flight = flight_service.get_flight(fid)
+            conn.execute(text("""
+                INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
+                    report_time, debrief_time, fdp_hours, role_assigned, operating_position, status)
+                VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
+                    :report_time, :debrief_time, :fdp_hours, :role_assigned, :operating_position, :status)
+            """), {
+                "crew_id": crew_id, "flight_id": fid, "duty_id": duty_id,
+                "duty_date": flight["dep_time_planned"].date(),
+                "report_time": flight["dep_time_planned"], "debrief_time": flight["arr_time_planned"],
+                "fdp_hours": 2.0, "role_assigned": role_assigned,
+                "operating_position": operating_position, "status": status,
+            })
+    return duty_id
 
 
 # ------------------------------------------------------------------
@@ -127,7 +164,7 @@ def test_generate_for_window_fills_domestic_rotation_as_proposed(_patch_engine):
     summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
 
     assert len(summary.filled) == 2
-    assert {s.role for s in summary.filled} == {"CPT", "FO"}
+    assert {s.operating_position for s in summary.filled} == {"COMMANDER", "SECOND_PILOT"}
     assert summary.uncovered == []
     assert summary.already_covered == []
 
@@ -155,18 +192,26 @@ def test_generate_for_window_no_approved_instances_in_range_is_a_no_op(_patch_en
 # ------------------------------------------------------------------
 # The real gate, not the generator, decides legality — back-to-back
 # international is illegal (measured rest/FDP constraint), back-to-back
-# domestic is legal. Both proven by the OUTCOME of real assign_crew_to_
-# duty() calls, never asserted by re-deriving the rest math here.
+# domestic is legal. Both proven by the OUTCOME of real assign_pair_
+# to_duty() calls, never asserted by re-deriving the rest math here.
 # ------------------------------------------------------------------
 
-def test_back_to_back_international_duty_for_the_sole_candidate_is_uncovered_not_double_booked(_patch_engine):
+def test_back_to_back_international_duty_for_the_sole_candidate_leaves_both_seats_uncovered(_patch_engine):
     """Thu 8/6 -> Fri 8/7: consecutive international operating days.
-    Exactly ONE CPT candidate exists, so there is no fairness-driven
-    escape route to a different pilot -- if Friday's CPT seat still
-    gets filled, it can only be because the real gate allowed a second
-    consecutive international duty for the same pilot; if it's
-    UNCOVERED, the gate rejected it, which is what back-to-back
-    international rest math requires."""
+    Exactly ONE CPT candidate exists (the only possible Commander), so
+    if Friday's seats still get filled, it can only be because the
+    real gate allowed a second consecutive international duty for that
+    same pilot.
+
+    Under the pair model, atomicity means BOTH seats go uncovered
+    together on Friday, not just Commander: assign_pair_to_duty()
+    tries every (sole Commander candidate, Second Pilot candidate)
+    combination, and every one fails for the SAME reason (the
+    Commander's own rest breach) regardless of which Second Pilot is
+    tried — an individually-fine Second Pilot candidate doesn't get a
+    seat on their own, since "both seats validated and committed
+    together, or neither" is the whole point of assign_pair_to_duty().
+    This is a deliberate consequence of pair atomicity, not a gap."""
     _make_international_instances(dt.date(2026, 8, 6), dt.date(2026, 8, 7))
     _add_crew("CPT")
     _add_crew("FO")
@@ -175,17 +220,18 @@ def test_back_to_back_international_duty_for_the_sole_candidate_is_uncovered_not
     summary = rgs.generate_for_window(dt.date(2026, 8, 6), dt.date(2026, 8, 7))
 
     thu_filled = [s for s in summary.filled if s.rotation_date == dt.date(2026, 8, 6)]
-    assert {s.role for s in thu_filled} == {"CPT", "FO"}
+    assert {s.operating_position for s in thu_filled} == {"COMMANDER", "SECOND_PILOT"}
 
-    fri_uncovered_roles = {s.role for s in summary.uncovered if s.rotation_date == dt.date(2026, 8, 7)}
-    assert "CPT" in fri_uncovered_roles  # the sole CPT candidate was rejected for Friday
+    fri_uncovered_positions = {s.operating_position for s in summary.uncovered
+                                if s.rotation_date == dt.date(2026, 8, 7)}
+    assert fri_uncovered_positions == {"COMMANDER", "SECOND_PILOT"}
 
 
 def test_back_to_back_domestic_duty_for_the_sole_candidate_is_allowed(_patch_engine):
     """Mon 8/3 -> Tue 8/4, one CPT and one FO only -- if domestic
     back-to-back really is legal (the grounding fact this session
     already measured), both days must get fully covered by that same
-    sole pilot; any UNCOVERED result here would mean the real gate
+    sole pair; any UNCOVERED result here would mean the real gate
     rejected a domestic pairing this codebase has already confirmed
     legal."""
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 4))
@@ -196,21 +242,24 @@ def test_back_to_back_domestic_duty_for_the_sole_candidate_is_allowed(_patch_eng
 
     assert summary.uncovered == []
     assert len(summary.filled) == 4
-    assert {s.crew_id for s in summary.filled if s.role == "CPT"} == {cpt_id}
-    assert {s.crew_id for s in summary.filled if s.role == "FO"} == {fo_id}
+    assert {s.crew_id for s in summary.filled if s.operating_position == "COMMANDER"} == {cpt_id}
+    assert {s.crew_id for s in summary.filled if s.operating_position == "SECOND_PILOT"} == {fo_id}
 
 
 # ------------------------------------------------------------------
-# Fairness (Q2/Q3): even duty counts within role, scoped to the window.
-# Domestic-only week -- avoids any international rest-math uncertainty
-# so the only thing under test is the fairness bookkeeping itself.
+# Fairness: even duty counts within a seat, scoped to the window.
+# SEAT_ELIGIBLE_GRADES widens SECOND_PILOT eligibility to CPT-or-FO
+# (2026-08-12), so a CPT/FO cross-pool comparison no longer has a
+# fixed meaning the way it did under the old exact-grade-match model
+# — this only asserts what's still structurally guaranteed: COMMANDER
+# duty counts stay even within the CPT pool (the only pool eligible
+# for that seat, unchanged by the widening).
 # ------------------------------------------------------------------
 
-def test_duty_counts_stay_even_within_role_and_smaller_pool_carries_more_load(_patch_engine):
-    """6 CPT / 4 FO (scaled down from the real 6/4 grounding ratio),
-    one domestic rotation Mon-Fri (5 seats per role). Even counts
-    within role (max-min <= 1) falls out of fewest-duty-first ordering
-    alone -- no cross-role balancing exists or is expected (Q2)."""
+def test_commander_duty_counts_stay_even_across_the_cpt_pool(_patch_engine):
+    """6 CPT (the real Air Eagle Commander pool size), one domestic
+    rotation Mon-Fri (5 Commander seats). Even counts (max-min <= 1)
+    falls out of fewest-duty-first ordering alone."""
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 7))
     cpt_ids = [_add_crew("CPT") for _ in range(6)]
     fo_ids = [_add_crew("FO") for _ in range(4)]
@@ -220,50 +269,55 @@ def test_duty_counts_stay_even_within_role_and_smaller_pool_carries_more_load(_p
     assert summary.uncovered == []
     assert len(summary.filled) == 10  # 5 rotations x 2 seats
 
-    def _counts(crew_ids, role):
-        counts = {cid: 0 for cid in crew_ids}
-        for s in summary.filled:
-            if s.role == role:
-                counts[s.crew_id] += 1
-        return counts
+    commander_counts = {cid: 0 for cid in cpt_ids}
+    second_pilot_counts = {cid: 0 for cid in cpt_ids + fo_ids}
+    for s in summary.filled:
+        if s.operating_position == "COMMANDER":
+            commander_counts[s.crew_id] += 1
+        else:
+            second_pilot_counts[s.crew_id] += 1
 
-    cpt_counts = _counts(cpt_ids, "CPT")
-    fo_counts = _counts(fo_ids, "FO")
-    assert max(cpt_counts.values()) - min(cpt_counts.values()) <= 1
-    assert max(fo_counts.values()) - min(fo_counts.values()) <= 1
-
-    avg_cpt = sum(cpt_counts.values()) / len(cpt_counts)
-    avg_fo = sum(fo_counts.values()) / len(fo_counts)
-    assert avg_fo > avg_cpt  # smaller pool, same total demand -> more load per person
+    assert max(commander_counts.values()) - min(commander_counts.values()) <= 1
+    # Second Pilot counts stay even across whoever ACTUALLY got used for
+    # that seat this run (not necessarily every eligible person — a CPT
+    # who was never picked as Second Pilot has a legitimate 0, same as
+    # fewest-duty-first ordering intends).
+    used_second_pilots = {cid: n for cid, n in second_pilot_counts.items() if n > 0}
+    if used_second_pilots:
+        assert max(used_second_pilots.values()) - min(used_second_pilots.values()) <= 1
 
 
 # ------------------------------------------------------------------
-# Q4's corrected domestic fix, end-to-end: an entirely-65+ FO pool
-# still gets a legal pairing when an eligible under-65 CPT candidate
-# exists, because FO is filled BEFORE CPT (services/roster_generator_
-# service.py's ROLES order, verified 2026-08-04 -- filling CPT first
-# would lock onto the 67yo before the conditional fix ever sees the FO
-# pool's composition, dooming the seat regardless of ordering within
-# FO's own candidate list).
+# Age-aware candidate ordering (HANDOVER.md, 2026-08-04 grounding;
+# re-derived for the pair model, 2026-08-13): a 65+ Commander candidate
+# tried FIRST (fewest-duty-first ordering has no other basis to prefer
+# a younger one when both start at 0 duties) must not doom the seat —
+# the Second Pilot search for THAT commander is itself age-aware
+# (core/roster_generation.py's order_candidates(), domestic +
+# partner_age>=65 -> under-65-first), so it finds the one under-65
+# partner immediately rather than the seat going uncovered. Unlike the
+# old sequential CPT/FO-fill model, the widened SECOND_PILOT eligibility
+# means this now resolves by keeping the 65+ pilot AS Commander and
+# pairing them with a young Second Pilot, not by avoiding them — a
+# different, but equally correct, way of finding a legal crewing.
 # ------------------------------------------------------------------
 
-def test_domestic_seat_fully_crewed_despite_entirely_65_plus_fo_pool(_patch_engine):
+def test_domestic_seat_fully_crewed_when_first_tried_commander_is_65_plus(_patch_engine):
+    old_cpt = _add_crew("CPT", dob=dt.date(1959, 1, 1))    # 67 in Aug 2026 -- tried first (duty_count tie, insertion order)
+    young_fo = _add_crew("FO", dob=dt.date(1986, 1, 1))    # 40 -- the one legal Second Pilot
+    _add_crew("FO", dob=dt.date(1958, 1, 1))               # 68 -- decoy, would also be illegal if tried
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
-    old_cpt = _add_crew("CPT", dob=dt.date(1959, 1, 1))    # 67 in Aug 2026
-    young_cpt = _add_crew("CPT", dob=dt.date(1986, 1, 1))  # 40 in Aug 2026
-    _add_crew("FO", dob=dt.date(1960, 1, 1))               # 66
-    _add_crew("FO", dob=dt.date(1958, 1, 1))               # 68
 
     summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
 
     assert summary.uncovered == []
-    filled_cpt = {s.crew_id for s in summary.filled if s.role == "CPT"}
-    assert filled_cpt == {young_cpt}
-    assert old_cpt not in filled_cpt
+    filled_by_position = {s.operating_position: s.crew_id for s in summary.filled}
+    assert filled_by_position["COMMANDER"] == old_cpt
+    assert filled_by_position["SECOND_PILOT"] == young_fo
 
 
 # ------------------------------------------------------------------
-# Idempotency (Q7)
+# Idempotency
 # ------------------------------------------------------------------
 
 def test_generate_for_window_is_idempotent_on_a_fully_generated_window(_patch_engine):
@@ -278,67 +332,158 @@ def test_generate_for_window_is_idempotent_on_a_fully_generated_window(_patch_en
     second = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     assert second.filled == []
     assert len(second.already_covered) == 2
-    assert _roster_duty_count(engine) == 2  # not duplicated (2 duties: CPT's, FO's)
+    assert _roster_duty_count(engine) == 2  # not duplicated (2 duties: Commander's, Second Pilot's)
 
 
 def test_generate_for_window_only_fills_gaps_on_a_partially_generated_window(_patch_engine):
+    """Monday's Commander seat pre-filled by some other means (a
+    manual assignment made before the generator ever ran) — seeded
+    directly, since the real pair-assignment API can no longer
+    construct a real one-seat-only state from scratch (see _seed_seat()'s
+    own docstring). Generate must recognize it as already covered and
+    only fill the genuine gap (Second Pilot), on Monday; Tuesday, with
+    neither seat real yet, gets a fresh pair."""
+    engine = _patch_engine
     instance_ids = _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 4))
     cpt_id = _add_crew("CPT")
     _add_crew("FO")
 
     mon_flight_ids = rts.get_promoted_flight_ids(instance_ids[0])
-    manual = assignment_service.assign_crew_to_duty(
-        cpt_id, mon_flight_ids, "CPT", roster_status="PLANNED")
-    assert manual.status == "ALLOWED"
+    _seed_seat(engine, cpt_id, mon_flight_ids, "CPT", "COMMANDER")
 
     summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 4))
 
-    # Monday's CPT seat was already covered (manually, as PLANNED) --
-    # untouched, not re-generated as a second PROPOSED row.
+    # Monday's Commander seat was already covered (manually) -- untouched.
     mon_already = [s for s in summary.already_covered if s.rotation_date == dt.date(2026, 8, 3)]
     assert len(mon_already) == 1
-    assert mon_already[0].role == "CPT"
+    assert mon_already[0].operating_position == "COMMANDER"
     assert mon_already[0].crew_id == cpt_id
 
-    mon_filled_roles = {s.role for s in summary.filled if s.rotation_date == dt.date(2026, 8, 3)}
-    assert mon_filled_roles == {"FO"}  # only the genuine gap
+    mon_filled_positions = {s.operating_position for s in summary.filled if s.rotation_date == dt.date(2026, 8, 3)}
+    assert mon_filled_positions == {"SECOND_PILOT"}  # only the genuine gap
 
-    tue_filled_roles = {s.role for s in summary.filled if s.rotation_date == dt.date(2026, 8, 4)}
-    assert tue_filled_roles == {"CPT", "FO"}
+    tue_filled_positions = {s.operating_position for s in summary.filled if s.rotation_date == dt.date(2026, 8, 4)}
+    assert tue_filled_positions == {"COMMANDER", "SECOND_PILOT"}
 
     mon_cpt_roster = assignment_service.get_roster_for_flight(mon_flight_ids[0], include_proposed=True)
-    mon_cpt_row = mon_cpt_roster[mon_cpt_roster["role_assigned"] == "CPT"].iloc[0]
+    mon_cpt_row = mon_cpt_roster[mon_cpt_roster["operating_position"] == "COMMANDER"].iloc[0]
     assert mon_cpt_row["status"] == "PLANNED"  # never touched/replaced
 
 
-def test_uncovered_seat_is_retried_and_succeeds_once_the_blocker_is_removed(_patch_engine):
+def test_uncovered_seat_pair_is_retried_and_succeeds_once_the_blocker_is_removed(_patch_engine):
     """A missing qualification field, not is_active=False: is_active
     isn't in crew_service.UPDATABLE_FIELDS, so _add_crew(is_active=False)
     would silently no-op (add_crew() filters crew_data to that
     allowlist before inserting) and there's no reactivate_crew()
     either — update_crew(..., {"is_active": True}) would silently
     no-op the same way. license_expiry IS in UPDATABLE_FIELDS, giving
-    a real, achievable block-then-unblock via the actual service API:
-    missing it produces a genuine NEEDS_REVIEW (uncovered, not
-    filled), and update_crew() can genuinely fix it between runs."""
+    a real, achievable block-then-unblock via the actual service API.
+
+    Under the pair model, the Commander's own NEEDS_MANUAL_REVIEW
+    (missing license) holds the WHOLE pair, not just their own seat —
+    both seats come back uncovered on the first run, even though the
+    Second Pilot candidate is individually fine, same atomicity
+    reasoning as the back-to-back-international test above."""
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     cpt_id = _add_crew("CPT", license_expiry=None)
-    _add_crew("FO")
+    fo_id = _add_crew("FO")
 
     first = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
-    assert [s.role for s in first.uncovered] == ["CPT"]  # missing license_expiry -> NEEDS_REVIEW
+    assert {s.operating_position for s in first.uncovered} == {"COMMANDER", "SECOND_PILOT"}
 
     crew_service.update_crew(cpt_id, {"license_expiry": dt.date(2099, 1, 1)})
 
     second = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     assert second.uncovered == []
-    assert {s.role for s in second.filled} == {"CPT"}
-    assert second.filled[0].crew_id == cpt_id
-    assert len(second.already_covered) == 1  # the FO seat, unchanged from the first run
+    assert second.already_covered == []  # nothing was written on the first, blocked run
+    filled_by_position = {s.operating_position: s.crew_id for s in second.filled}
+    assert filled_by_position == {"COMMANDER": cpt_id, "SECOND_PILOT": fo_id}
 
 
 # ------------------------------------------------------------------
-# publish_window (Q5)
+# uncovered_seats (migrations/017) — durable, survives a page refresh
+# unlike the in-memory GenerationSummary. get_open_uncovered_seats()
+# is the read side pages/6_Roster_Generation.py now uses.
+# ------------------------------------------------------------------
+
+def test_uncovered_seats_table_written_on_genuine_no_legal_pair_outcome(_patch_engine):
+    engine = _patch_engine
+    _make_international_instances(dt.date(2026, 8, 6), dt.date(2026, 8, 7))
+    _add_crew("CPT")
+    _add_crew("FO")
+    _add_crew("FO")
+
+    rgs.generate_for_window(dt.date(2026, 8, 6), dt.date(2026, 8, 7))
+
+    open_rows = pd.read_sql(text("SELECT * FROM uncovered_seats WHERE resolved_at IS NULL"), engine)
+    assert len(open_rows) == 2  # Friday's Commander + Second Pilot
+    assert set(open_rows["operating_position"]) == {"COMMANDER", "SECOND_PILOT"}
+    assert all(open_rows["reason"].str.len() > 0)
+
+
+def test_get_open_uncovered_seats_survives_in_memory_summary_being_gone(_patch_engine):
+    """Simulates a refresh: the in-memory GenerationSummary from a
+    prior generate_for_window() call is simply never referenced again
+    — get_open_uncovered_seats(), reading the DB directly, must still
+    report the same gap."""
+    _make_international_instances(dt.date(2026, 8, 6), dt.date(2026, 8, 7))
+    _add_crew("CPT")
+    _add_crew("FO")
+
+    rgs.generate_for_window(dt.date(2026, 8, 6), dt.date(2026, 8, 7))  # summary discarded, never read
+
+    durable = rgs.get_open_uncovered_seats(dt.date(2026, 8, 6), dt.date(2026, 8, 7))
+    assert len(durable) == 2
+    assert set(durable["operating_position"]) == {"COMMANDER", "SECOND_PILOT"}
+    assert set(durable["rotation_date"]) == {dt.date(2026, 8, 7)}
+
+
+def test_get_open_uncovered_seats_excludes_resolved_rows(_patch_engine):
+    """Re-running Generate after the blocker clears resolves the open
+    row (via assign_crew_to_duty()/assign_pair_to_duty()'s own
+    _resolve_uncovered_seat() call) — the durable read must not keep
+    showing it."""
+    _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    cpt_id = _add_crew("CPT", license_expiry=None)
+    _add_crew("FO")
+
+    rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    assert len(rgs.get_open_uncovered_seats(dt.date(2026, 8, 3), dt.date(2026, 8, 3))) == 2
+
+    crew_service.update_crew(cpt_id, {"license_expiry": dt.date(2099, 1, 1)})
+    rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+
+    assert len(rgs.get_open_uncovered_seats(dt.date(2026, 8, 3), dt.date(2026, 8, 3))) == 0
+
+
+def test_get_open_uncovered_seats_reflects_manual_unassign_too(_patch_engine):
+    """Not just the generator's own writer — remove_assignment_from_
+    duty() vacating a rotation-linked seat must show up here too,
+    uncovered_seats being the single durable source of truth for
+    "which seats are currently empty," not a generator-only log."""
+    _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    cpt_id = _add_crew("CPT")
+    _add_crew("FO")
+
+    summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    assert summary.uncovered == []
+    commander_row = next(s for s in summary.filled if s.operating_position == "COMMANDER")
+    flight_ids = rts.get_promoted_flight_ids(commander_row.rotation_instance_id)
+    roster = assignment_service.get_roster_for_flight(flight_ids[0], include_proposed=True)
+    duty_id = roster[roster["crew_id"] == cpt_id].iloc[0]["duty_id"]
+
+    assignment_service.remove_assignment_from_duty(cpt_id, duty_id, reason="sick")
+
+    open_rows = rgs.get_open_uncovered_seats(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    assert len(open_rows) == 1
+    assert open_rows.iloc[0]["operating_position"] == "COMMANDER"
+
+
+# ------------------------------------------------------------------
+# publish_window — per-rotation re-validation gate (2026-08-12,
+# flight-deck crew package): both seats must be filled AND the actual
+# assigned pair must re-validate LEGAL/WARNING fresh at publish time,
+# not just trust the original PROPOSED-time result.
 # ------------------------------------------------------------------
 
 def test_publish_window_flips_only_proposed_rows_in_range(_patch_engine):
@@ -352,8 +497,8 @@ def test_publish_window_flips_only_proposed_rows_in_range(_patch_engine):
 
     published = rgs.publish_window(dt.date(2026, 8, 1), dt.date(2026, 8, 31))
     # publish_window() returns a raw UPDATE rowcount (sector rows, per
-    # its own docstring), not a duty count — 2 legs x 2 crew (CPT+FO)
-    # in the August rotation = 4 rows flipped, not 2 duties.
+    # its own docstring), not a duty count — 2 legs x 2 crew (Commander
+    # + Second Pilot) in the August rotation = 4 rows flipped, not 2 duties.
     assert published == 4
 
     aug_roster = assignment_service.search_roster(
@@ -367,6 +512,52 @@ def test_publish_window_flips_only_proposed_rows_in_range(_patch_engine):
 
 def test_publish_window_with_nothing_proposed_in_range_returns_zero(_patch_engine):
     assert rgs.publish_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3)) == 0
+
+
+def test_publish_window_skips_rotation_with_only_one_seat_filled(_patch_engine):
+    """A rotation missing one seat (e.g. the other pilot was manually
+    unassigned after Generate ran) must not publish at all — skipped,
+    left PROPOSED, rather than publishing an incomplete cockpit."""
+    engine = _patch_engine
+    _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    cpt_id = _add_crew("CPT")
+    _add_crew("FO")
+
+    summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    commander_row = next(s for s in summary.filled if s.operating_position == "COMMANDER")
+    flight_ids = rts.get_promoted_flight_ids(commander_row.rotation_instance_id)
+    roster = assignment_service.get_roster_for_flight(flight_ids[0], include_proposed=True)
+    duty_id = roster[roster["crew_id"] == cpt_id].iloc[0]["duty_id"]
+    assignment_service.remove_assignment_from_duty(cpt_id, duty_id)
+
+    published = rgs.publish_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+
+    assert published == 0
+    remaining = assignment_service.search_roster(
+        date_from=dt.date(2026, 8, 3), date_to=dt.date(2026, 8, 3), include_proposed=True)
+    assert set(remaining["status"]) == {"PROPOSED"}
+
+
+def test_publish_window_skips_rotation_that_fails_fresh_revalidation(_patch_engine):
+    """A rotation whose pair was legal at PROPOSED time but no longer
+    is by publish time (crew data changed in between) must be skipped,
+    not published on stale trust of the original result — and must not
+    take down the rest of the window's publish."""
+    _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    _make_domestic_instances(dt.date(2026, 9, 1), dt.date(2026, 9, 1), rotation_code="EPE-786-787-SEP")
+    cpt_id = _add_crew("CPT")
+    _add_crew("FO")
+
+    rgs.generate_for_window(dt.date(2026, 8, 1), dt.date(2026, 9, 30))
+    # The Commander's license expires between PROPOSED and publish time.
+    crew_service.update_crew(cpt_id, {"license_expiry": dt.date(2020, 1, 1)})
+
+    published = rgs.publish_window(dt.date(2026, 8, 1), dt.date(2026, 9, 30))
+
+    assert published == 0  # both rotations use the same now-unqualified Commander
+    still_proposed = assignment_service.search_roster(
+        date_from=dt.date(2026, 8, 1), date_to=dt.date(2026, 9, 30), include_proposed=True)
+    assert set(still_proposed["status"]) == {"PROPOSED"}
 
 
 # ------------------------------------------------------------------

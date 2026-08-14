@@ -3,10 +3,11 @@ pages/6_Roster_Generation.py
 
 Phase 7's first UI — presentation only. Everything this page calls
 already exists and is already tested: services/roster_generator_
-service.py's generate_for_window()/publish_window(), services/
-rotation_template_service.py's get_instances(). No new service logic
-lives here; this page's only job is to make the generator's real
-output legible to a controller and let them act on it.
+service.py's generate_for_window()/publish_window()/get_open_
+uncovered_seats(), services/rotation_template_service.py's
+get_instances(). No new service logic lives here; this page's only
+job is to make the generator's real output legible to a controller
+and let them act on it.
 
 SCOPE: this page assumes approved rotation instances already exist.
 It does not create or approve rotations — that's a separate,
@@ -14,10 +15,17 @@ not-yet-built templates/draft-review page. If no approved rotations
 fall in the chosen window, this page says so plainly and points at
 that (future) page rather than failing obscurely on an empty result.
 
-The flow is one linear window: pick dates -> generate -> see results
--> publish. uncovered is the most actionable output (a real per-seat
-rejection reason from the actual legality gate) and is shown first
-and most prominently, never buried under a success count.
+Rebuilt for the flight-deck crew package (2026-08-13): seats are
+Commander/Second Pilot, not CPT/FO, and uncovered is now read from
+the durable uncovered_seats table (get_open_uncovered_seats()) rather
+than only the in-memory GenerationSummary — it survives a refresh,
+and reflects BOTH writers (a generator search that found no legal
+pair, and a controller's manual unassign on the Roster page vacating
+a rotation-linked seat), not just this page's own last run. That's
+why it's shown as its own always-current panel, independent of
+whether Generate has been clicked this session, right after the date
+picker — the most actionable output, first and most prominent, never
+buried under a success count.
 """
 import datetime as dt
 
@@ -25,16 +33,17 @@ import pandas as pd
 import streamlit as st
 
 from services import assignment_service, crew_service, roster_generator_service, rotation_template_service
+from services.roster_generator_service import SEATS
 
 st.set_page_config(page_title="Roster Generation", page_icon="⚙️", layout="wide")
 st.title("Roster Generation")
 
 st.markdown(
-    "Fills CPT/FO seats for already-**approved** rotations in a date "
-    "window, using the same legality gate as every manual assignment "
-    "— then publishes the result. This page doesn't create or approve "
-    "rotations; that happens on the (not yet built) Rotation Templates "
-    "page."
+    "Fills the Commander + Second Pilot seats for already-**approved** "
+    "rotations in a date window, using the same legality gate as every "
+    "manual assignment — then publishes the result. This page doesn't "
+    "create or approve rotations; that happens on the (not yet built) "
+    "Rotation Templates page."
 )
 
 # This page's own first use of st.session_state, holding the
@@ -82,6 +91,31 @@ if window_days > 35:
     )
 
 # ------------------------------------------------------------------
+# Currently uncovered — durable, from uncovered_seats directly. Always
+# current for the selected window regardless of whether Generate has
+# been run this session, and regardless of which write path (a
+# generator search or a manual unassign) left the seat open.
+# ------------------------------------------------------------------
+st.divider()
+st.subheader("Currently uncovered seats")
+
+open_uncovered = roster_generator_service.get_open_uncovered_seats(date_from, date_to)
+if open_uncovered.empty:
+    st.success("No open uncovered seats in this window.")
+else:
+    st.error(f"{len(open_uncovered)} seat(s) currently uncovered — action needed.")
+    st.dataframe(pd.DataFrame([
+        {
+            "Rotation": row["rotation_code"],
+            "Date": row["rotation_date"],
+            "Position": row["operating_position"],
+            "Reason": row["reason"],
+            "Since": row["generated_at"],
+        }
+        for _, row in open_uncovered.iterrows()
+    ]), width="stretch", hide_index=True)
+
+# ------------------------------------------------------------------
 # Pre-generate preview — the same APPROVED + window filter
 # generate_for_window() applies internally, computed here too so a
 # controller sees what they're about to run before running it.
@@ -125,34 +159,31 @@ if summary is not None:
     st.subheader("Results")
     st.caption(f"For the last-generated window: {gen_from} – {gen_to}")
 
-    # Most prominent, first, full detail — the actionable output.
+    # Uncovered is NOT re-shown here — the "Currently uncovered seats"
+    # panel above is durable (reads uncovered_seats directly) and
+    # already reflects this run's outcome on this rerun; duplicating it
+    # from the in-memory summary would risk the two disagreeing.
     if summary.uncovered:
-        st.error(f"{len(summary.uncovered)} seat(s) could not be filled — action needed.")
-        uncovered_df = pd.DataFrame([
-            {
-                "Rotation": s.rotation_code,
-                "Date": s.rotation_date,
-                "Role": s.role,
-                "Reason": s.reason,
-            }
-            for s in summary.uncovered
-        ])
-        st.dataframe(uncovered_df, width="stretch", hide_index=True)
+        st.warning(
+            f"{len(summary.uncovered)} seat(s) newly uncovered this run "
+            f"— see the panel above for the real reasons."
+        )
     else:
-        st.success("All seats filled — nothing uncovered.")
+        st.success("Every seat this run attempted was filled or already covered.")
 
-    # Per-pilot duty counts derived from `filled` only — GenerationSummary.
+    # Per-seat duty counts derived from `filled` only — GenerationSummary.
     # filled already has exactly one SeatResult per seat successfully
     # filled THIS run (duty-level, not sector-level), so counting
-    # crew_id occurrences per role is the duty count directly.
+    # crew_id occurrences per operating_position is the duty count
+    # directly.
     st.markdown("**Duty counts this run (fairness check)**")
     fair_col1, fair_col2 = st.columns(2)
-    for col, role in ((fair_col1, "CPT"), (fair_col2, "FO")):
+    for col, position in ((fair_col1, SEATS[0]), (fair_col2, SEATS[1])):
         counts: dict = {}
         for s in summary.filled:
-            if s.role == role and s.crew_id:
+            if s.operating_position == position and s.crew_id:
                 counts[s.crew_id] = counts.get(s.crew_id, 0) + 1
-        col.markdown(f"*{role}*")
+        col.markdown(f"*{position.replace('_', ' ').title()}*")
         if counts:
             counts_df = pd.DataFrame([
                 {"Crew": f"{cid} ({crew_directory.get(cid, 'unknown')})", "Duties filled": n}
@@ -171,7 +202,8 @@ if summary is not None:
         with st.expander("Show already-covered seats"):
             st.dataframe(pd.DataFrame([
                 {"Rotation": s.rotation_code, "Date": s.rotation_date,
-                 "Role": s.role, "Crew": f"{s.crew_id} ({crew_directory.get(s.crew_id, 'unknown')})"}
+                 "Position": s.operating_position,
+                 "Crew": f"{s.crew_id} ({crew_directory.get(s.crew_id, 'unknown')})"}
                 for s in summary.already_covered
             ]), width="stretch", hide_index=True)
 
@@ -179,7 +211,8 @@ if summary is not None:
         if summary.filled:
             st.dataframe(pd.DataFrame([
                 {"Rotation": s.rotation_code, "Date": s.rotation_date,
-                 "Role": s.role, "Crew": f"{s.crew_id} ({crew_directory.get(s.crew_id, 'unknown')})"}
+                 "Position": s.operating_position,
+                 "Crew": f"{s.crew_id} ({crew_directory.get(s.crew_id, 'unknown')})"}
                 for s in summary.filled
             ]), width="stretch", hide_index=True)
         else:
@@ -196,7 +229,12 @@ st.divider()
 st.subheader("Publish")
 st.caption(
     "Publishing promotes PROPOSED assignments to PLANNED for this window "
-    "— that's what makes them visible to crew."
+    "— that's what makes them visible to crew. Each rotation is "
+    "re-validated fresh right before it flips (crew data or other "
+    "duties may have changed since it was proposed); a rotation that "
+    "fails re-validation, or no longer has both seats filled, is "
+    "skipped and left as PROPOSED rather than blocking the rest of "
+    "the window."
 )
 
 proposed_rows = assignment_service.search_roster(date_from=date_from, date_to=date_to, include_proposed=True)
@@ -212,5 +250,13 @@ st.info(
 
 if st.button("Publish", disabled=(proposed_count == 0)):
     published = roster_generator_service.publish_window(date_from, date_to)
+    remaining = assignment_service.search_roster(date_from=date_from, date_to=date_to, include_proposed=True)
+    remaining_count = int((remaining["status"] == "PROPOSED").sum()) if not remaining.empty else 0
     st.success(f"Published {published} roster row(s).")
+    if remaining_count:
+        st.warning(
+            f"{remaining_count} row(s) remain PROPOSED — the rotation(s) "
+            f"behind them failed re-validation or weren't fully paired "
+            f"at publish time. Check the panel above, or the Roster page."
+        )
     st.rerun()
