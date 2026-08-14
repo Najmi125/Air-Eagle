@@ -305,10 +305,21 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **As of this snapshot (2026-08-13): one branch in flight,
-  `flight-deck-crew-package` — NOT YET MERGED, in progress.** See the
-  dated log entry near the end of this file. Everything below this
-  bullet reflects state as of 2026-08-11, before that branch started.
+- **No outstanding branches as of this snapshot (2026-08-14).
+  `flight-deck-crew-package` merged into `main`.** Commander/Second
+  Pilot seat model — see the dated log entry near the end of this file
+  for the full design/build history. **527/527 verified against real
+  Postgres 16** (two rounds: 517/526 first pass found nine failures —
+  eight test-side, one a real bug in `publish_window()`'s per-rotation
+  re-validation, fixed and documented in the log entry below; 527/527
+  clean on re-verification), reachability clean, diff scope confirmed
+  exactly the 16 files across the branch's two commits. Merged, pushed;
+  branch deleted, both remote and local.
+
+  **Production migration note**: Supabase is currently at migration
+  015 — `migrations/016_operating_position.sql` and `017_uncovered_
+  seats.sql` still need applying there before this piece is live in
+  production. Not yet done as of this snapshot.
 
 - **`home-page-branding` merged into `main`** — home page branding in
   two rounds: round 1 (2026-08-10, logo/background/theming) and round
@@ -5391,5 +5402,20 @@ was a real, previously-undiscovered bug:
   proving the real gate computes correct numbers for a template-sourced
   flight — kept on the real API, switched to `assign_pair_to_duty()`.
 
-Pushed for re-verification; still awaiting the operator's own
-real-Postgres confirmation and manual click-through before merge.
+**Second real-Postgres verification round (2026-08-14): 527/527
+passed, zero failures.** Reachability clean, diff scope confirmed
+exactly the 16 files across both commits. The operator independently
+confirmed all four original defects closed, beyond this piece's own
+test suite: five simultaneous Captain assignments on one flight now
+blocked 5/5 at the API (0 written, was all 5 `ALLOWED`); a partial
+unassign of a 2-sector duty now cancels the whole duty (0 rows left,
+was 1 orphaned row carrying stale duty-level times); the solo-pilot
+path now raises, the pair path commits together; a missing-DG
+candidate now returns `status=NEEDS_MANUAL_REVIEW` with the real
+reason instead of appearing in a bare "legal" list.
+
+**Merged into `main`, pushed; branch `flight-deck-crew-package`
+deleted, both remote and local (2026-08-14).** See the "Merge status
+as of this snapshot" paragraph near the top of this file.
+`migrations/016`/`017` still need applying to Supabase — production is
+at 015 as of this merge.
