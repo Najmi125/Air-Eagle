@@ -10,10 +10,11 @@ job is to make the generator's real output legible to a controller
 and let them act on it.
 
 SCOPE: this page assumes approved rotation instances already exist.
-It does not create or approve rotations — that's a separate,
-not-yet-built templates/draft-review page. If no approved rotations
-fall in the chosen window, this page says so plainly and points at
-that (future) page rather than failing obscurely on an empty result.
+It does not create or approve rotations — that happens on the
+Schedule Templates page (pages/7_Schedule_Templates.py). If no
+approved rotations fall in the chosen window, this page says so
+plainly and points there rather than failing obscurely on an empty
+result.
 
 Rebuilt for the flight-deck crew package (2026-08-13): seats are
 Commander/Second Pilot, not CPT/FO, and uncovered is now read from
@@ -42,8 +43,8 @@ st.markdown(
     "Fills the Commander + Second Pilot seats for already-**approved** "
     "rotations in a date window, using the same legality gate as every "
     "manual assignment — then publishes the result. This page doesn't "
-    "create or approve rotations; that happens on the (not yet built) "
-    "Rotation Templates page."
+    "create or approve rotations; that happens on the Schedule "
+    "Templates page (sidebar)."
 )
 
 # This page's own first use of st.session_state, holding the
@@ -130,7 +131,7 @@ rotation_count = len(approved)
 if rotation_count == 0:
     st.info(
         "No approved rotations in this window. Rotations need to be "
-        "approved first, on the Rotation Templates page (not built yet) "
+        "approved first, on the Schedule Templates page (sidebar) "
         "— there's nothing to generate here until one exists."
     )
 else:

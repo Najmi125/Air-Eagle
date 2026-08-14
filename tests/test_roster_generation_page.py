@@ -151,7 +151,7 @@ def test_page_loads_without_exception(page_app):
 
 def test_no_approved_rotations_shows_templates_page_pointer(page_app):
     at = page_app.run()
-    assert any("not built yet" in i.value for i in at.info)
+    assert any("Schedule Templates" in i.value for i in at.info)
     assert not any(b.label == "Generate" for b in at.button)
 
 
