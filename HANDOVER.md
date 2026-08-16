@@ -316,10 +316,12 @@ forward.
   exactly the 16 files across the branch's two commits. Merged, pushed;
   branch deleted, both remote and local.
 
-  **Production migration note**: Supabase is currently at migration
-  015 — `migrations/016_operating_position.sql` and `017_uncovered_
-  seats.sql` still need applying there before this piece is live in
-  production. Not yet done as of this snapshot.
+  **Production migration note — CORRECTED 2026-08-16, prior note here
+  was stale.** `migrations/016_operating_position.sql` and
+  `017_uncovered_seats.sql` ARE applied to the real Supabase database
+  — confirmed via `run_migrations.py --status` (`Applied: 18,
+  Pending: 0`), and the deployed app has been verified working against
+  the new schema. This piece is live in production.
 
 - **`home-page-branding` merged into `main`** — home page branding in
   two rounds: round 1 (2026-08-10, logo/background/theming) and round
@@ -864,7 +866,16 @@ merge status, rather than repeating it here.
 - "Engr" role definition unconfirmed (flight-deck FE vs
   line-maintenance AME) — flagged on the crew data template,
   still pending with the rest of the operator data.
-- **Auth — spec now SETTLED (2026-08-04), still NOT built.** Three
+- **Auth — spec SETTLED (2026-08-04), trigger PARTIALLY FIRED
+  (2026-08-16), build starting.** Real crew data is about to be
+  entered for a shadow trial — see `docs/AirEagle_Shadow_Trial_
+  Training_Guide.md` — which is the trigger condition below. This is
+  a deliberate partial fire, not drift: auth is being built now, but
+  the Supabase Pro plan upgrade and automated backups (the other two
+  legs of the original "all three land together" trigger) are still
+  deferred, on the operator's judgement that shadow-trial data is
+  re-creatable rather than operationally critical. Full spec as
+  originally settled: three
   accounts, all full access, no permission tiers — the app is not
   publicly reachable, so a CONTROLLER/ADMIN split isn't buying
   anything real right now. Session-level login is acceptable (re-login
