@@ -305,8 +305,52 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-14).
-  `flight-deck-crew-package` merged into `main`.** Commander/Second
+- **No outstanding branches as of this snapshot (2026-08-18).
+  `auth-and-attribution` merged into `main`.** Authentication for
+  attribution — three fixed OCC accounts, PBKDF2 via stdlib `hashlib`,
+  a `require_login()` gate in all 8 page files, and `app_user` threaded
+  through 18 page call sites and 36 service-internal forwards, closing
+  the NULL `audit_log.app_user` gap. See the dated log entry at the end
+  of this file for the full design, including why `st.login()`/OIDC was
+  evaluated and rejected. **563/563 verified against real Postgres 16**,
+  reachability clean.
+
+  `test_writes_by_a_logged_in_user_never_leave_a_null_app_user` — the
+  end-to-end proof that `app_user` reaches the column rather than merely
+  being passed — passed on that run, its first execution anywhere.
+  `migrations/018_users.sql` applied to a database already at 017 with
+  existing crew data: table created correctly, existing rows intact.
+  Merged, pushed; branch deleted, both remote and local.
+
+  Took three real-Postgres rounds, and **none of the three found a bug
+  in the feature**: round 1 a CWD-dependent `AppTest.from_file()` path
+  bug in the test harness (57 errors), round 2 an unpinned
+  `streamlit>=1.38` resolving to 1.61.1 in a recycled sandbox (10
+  failures, reproduced identically on unchanged `main`). The pattern
+  behind every wrong conclusion drawn along the way was the same:
+  treating a local environment as representative when it was silently
+  under-reporting. Two independent instances of that in one piece of
+  work — the version drift, and `openpyxl` declared but never installed,
+  hiding 41 tests that had never run in that environment through every
+  prior round. `REQUIRE_DB=1`, `tests/test_dependency_pinning.py`'s
+  installed-versus-pinned check, and the DB-free harness guards in
+  `tests/test_auth_coverage.py` all exist to make that failure loud
+  instead of silent. The pinning guard proved itself on first contact in
+  a fresh sandbox, reporting `pandas`/`sqlalchemy` drift precisely
+  rather than as downstream errors.
+
+  **Still open as its own scoped task: Streamlit 1.61.x compatibility.**
+  Pinned to 1.60.0; the same failures reappear at the next upgrade. See
+  the 2026-08-18 log entry for the shape of that work.
+
+  **Production migration note.** `migrations/018_users.sql` needs
+  applying to the real Supabase database, and the three OCC accounts
+  seeding with `scripts/seed_users.py`, before the deployed app is
+  usable — every page now requires a login, so deploying this without
+  seeded accounts locks the app for everyone.
+
+- **`flight-deck-crew-package` merged into `main` (2026-08-14).**
+  Commander/Second
   Pilot seat model — see the dated log entry near the end of this file
   for the full design/build history. **527/527 verified against real
   Postgres 16** (two rounds: 517/526 first pass found nine failures —
@@ -5432,7 +5476,7 @@ as of this snapshot" paragraph near the top of this file.
 at 015 as of this merge.
 
 ## 2026-08-18: authentication for attribution — closing the NULL
-## `audit_log.app_user` gap. NOT YET MERGED (branch `auth-and-attribution`).
+## `audit_log.app_user` gap. MERGED into `main` 2026-08-18.
 
 Every `audit_log` row written before this branch had `app_user` NULL:
 the audit trail recorded WHAT happened and WHEN, never WHO. The 22
@@ -5675,3 +5719,27 @@ decide whether the affected assertions should be robust across both
 versions (several assert on messages that `st.rerun()` discards, which
 is fragile independent of version), then move the pin deliberately with
 a full real-Postgres run. Not a blocker for auth.
+
+### 2026-08-18 (continued): green, and merged
+
+**563 passed, 0 failed against real Postgres 16 on the pinned
+environment.** Reachability clean. This supersedes the "Verification
+status — read before merging" paragraph above, which was accurate when
+written and is now historical: the test it named as never having
+executed anywhere,
+`test_writes_by_a_logged_in_user_never_leave_a_null_app_user`, **passed
+on this run** — the end-to-end proof that `app_user` actually reaches
+the column rather than merely being passed to a function that accepts
+it. Auth and coverage suites 26/26. `migrations/018_users.sql` applied
+to a database already at 017 carrying existing crew data: table created
+correctly, existing rows intact.
+
+The dependency guard proved itself on first contact rather than in
+theory: the fresh sandbox had `pandas` and `sqlalchemy` off-pin, and
+`test_dependency_pinning.py` reported "installed X, pinned Y" precisely,
+where the same class of drift had previously surfaced as 57 errors that
+read as a code regression. Realigning took one command.
+
+Merged into `main`, pushed; branch `auth-and-attribution` deleted, both
+remote and local. See the "Merge status as of this snapshot" paragraph
+near the top of this file.
