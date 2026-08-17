@@ -5615,3 +5615,63 @@ and without the gate. `test_require_login_already_authenticated_session_
 skips_the_form` asserts the same property directly. The cause is
 therefore something else and is not yet identified; it cannot be
 reproduced on a machine whose only reachable Postgres is production.
+
+### 2026-08-18 (continued): the 10 failures were an unpinned dependency
+
+Resolved, and the answer was in neither the branch nor the tests.
+Running the same failing tests against unchanged `main` — the check
+that separates "caused" from "exposed" — reproduced them exactly. The
+sandbox that produced the earlier 527/527 had been recycled and its
+dependencies reinstalled from scratch. `requirements.txt` said
+`streamlit>=1.38`, so the resolver picked **1.61.1** instead of the
+**1.60.0** everything had been verified against. 1.61.1 changed
+`AppTest` behaviour: unchanged `main` went 527/527 → 468 passed, 2
+failed, 57 errors, with the same `FileNotFoundError` signature.
+
+Worth being precise about how much of this was a red herring, because
+each layer looked like the real bug at the time:
+
+- The `7 → 10` widget growth is **normal** `st.rerun()` behaviour. It
+  reproduces with and without the login gate, and on `main`. It is the
+  add form (7) plus the edit section (3) that renders once a crew record
+  exists, and it proves only that the write succeeded.
+- The missing `st.success` is what `st.rerun()` legitimately discards.
+- The login gate is genuinely transparent when authenticated:
+  `require_login()` returns before rendering anything, verified by
+  running the **real** `pages/2_Crew_Data.py` through AppTest with
+  `crew_service` faked in memory — identical widget counts to the
+  failing run, and the assertion passed.
+- The timing-race hypothesis was wrong too. It was a version difference.
+
+**Everything is now pinned exactly.** `requirements.txt` carries the 7
+direct dependencies at exact versions; `requirements.lock` (53 entries,
+`pip freeze`) carries the full transitive set. `>=` on a test-facing
+dependency means the suite tests whatever the resolver picked that
+morning, which is not a controlled input — this was already flagged in
+this file as a known gap, and it cost two verification rounds to
+collect on it.
+
+`tests/test_dependency_pinning.py` guards both, DB-free: the pins stay
+exact, the lock agrees with them, and — the one that would have caught
+this at its source — the **installed** versions match the pins. In the
+recycled sandbox that check would have said "streamlit 1.61.1 installed,
+1.60.0 pinned" on the first run, instead of 57 errors that read as a
+code regression. All three guards were mutation-tested, including
+reproducing the exact drift.
+
+Also fixed in passing: `openpyxl` was declared in `requirements.txt` but
+had never been installed in the local venv, so
+`test_import_crew_script.py` and `test_reporting_export.py` failed at
+collection and their 41 tests had never run locally at all. Installing
+it took the local run from 178 to **219 passed, 0 failed, 334 skipped**,
+and it is now in the lock — a naive `pip freeze` from the old venv would
+have silently omitted it.
+
+**Open, scoped as its own piece of work: Streamlit 1.61.x
+compatibility.** Pinning to 1.60.0 restores green but leaves the project
+one version behind, and the same failures will reappear at the next
+upgrade. That task is: understand what changed in 1.61's `AppTest`,
+decide whether the affected assertions should be robust across both
+versions (several assert on messages that `st.rerun()` discards, which
+is fragile independent of version), then move the pin deliberately with
+a full real-Postgres run. Not a blocker for auth.
