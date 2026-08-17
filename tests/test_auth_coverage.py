@@ -47,6 +47,8 @@ import pytest
 from sqlalchemy import text
 from streamlit.testing.v1 import AppTest
 
+from tests.conftest import page_path
+
 ROOT = Path(__file__).resolve().parent.parent
 
 GATE_FUNCTION = "require_login"
@@ -235,7 +237,60 @@ def test_every_service_internal_call_forwards_app_user():
 
 
 # ------------------------------------------------------------------
-# 3. Runtime proof: the real page files actually stop
+# 3. The page-test harness itself resolves
+# ------------------------------------------------------------------
+
+def test_authed_app_test_resolves_every_page_to_a_real_file():
+    """Guards the harness the page tests depend on, not the app.
+
+    This exists because of a specific escape (2026-08-18):
+    authed_app_test() passed a repo-relative path straight to
+    AppTest.from_file(), whose resolution is CWD-dependent (see
+    conftest.page_path). Every consumer of that helper is a DB-backed
+    page test, and all of them skip without Postgres — so the broken
+    helper sailed through a local run reporting "176 passed, 0 failed"
+    and only surfaced as 57 errors when the suite was finally run
+    against real Postgres.
+
+    A structural guard that only checks the app can't catch that: the
+    pages were correct, the test harness was not. This check needs no
+    database, so it fails in exactly the environment where the tests it
+    protects cannot run.
+    """
+    unresolved = []
+    for path in _page_files():
+        rel = path.relative_to(ROOT).as_posix()
+        at = AppTest.from_file(str(page_path(rel)))
+        # _script_path is private API: it's what Streamlit ACTUALLY
+        # resolved to, which is the thing worth asserting, but fall
+        # back to our own resolution if a future version renames it, so
+        # an upgrade produces a clear failure elsewhere rather than a
+        # confusing AttributeError here.
+        resolved = Path(getattr(at, "_script_path", page_path(rel)))
+        if not resolved.is_file():
+            unresolved.append("%s -> %s (does not exist)" % (rel, resolved))
+
+    assert unresolved == [], (
+        "authed_app_test()/page_path() resolved these pages to paths that "
+        "do not exist — every page test using them will error:\n  %s"
+        % "\n  ".join(unresolved)
+    )
+
+
+def test_page_path_is_cwd_independent(tmp_path, monkeypatch):
+    """The actual property that was broken: resolution must not depend
+    on where pytest happens to be invoked from. Verified by resolving
+    from a different working directory entirely."""
+    from_root = page_path("home.py")
+    monkeypatch.chdir(tmp_path)
+    from_elsewhere = page_path("home.py")
+
+    assert from_root == from_elsewhere
+    assert from_elsewhere.is_file()
+
+
+# ------------------------------------------------------------------
+# 4. Runtime proof: the real page files actually stop
 # ------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -251,8 +306,14 @@ def test_unauthenticated_run_of_a_real_page_shows_the_login_form(page):
     page reaches any of its own data access. If a page ever grew a
     module-level query above its gate, this test would start failing
     with a connection error instead of passing — which is the correct
-    and loud outcome."""
-    at = AppTest.from_file(page)
+    and loud outcome.
+
+    Builds its own AppTest rather than using authed_app_test(), since
+    the whole point is the UNauthenticated path — but resolves the path
+    through the same page_path() helper, because
+    AppTest.from_file()'s relative-path handling is CWD-dependent (see
+    page_path's docstring)."""
+    at = AppTest.from_file(str(page_path(page)))
     at.run()
 
     assert not at.exception, "%s raised on an unauthenticated run: %s" % (
@@ -266,7 +327,7 @@ def test_unauthenticated_run_of_a_real_page_shows_the_login_form(page):
 
 
 # ------------------------------------------------------------------
-# 4. Runtime proof: a logged-in write leaves no NULL app_user
+# 5. Runtime proof: a logged-in write leaves no NULL app_user
 # ------------------------------------------------------------------
 
 @pytest.fixture

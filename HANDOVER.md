@@ -5554,3 +5554,64 @@ merging, the same way the meal_provided and flight-deck pieces were
 verified. `migrations/018_users.sql` also needs applying, and the three
 accounts seeding via `scripts/seed_users.py`, before the app is usable
 on any deployment.
+
+### 2026-08-18 (continued): real-Postgres 16 verification — the branch did NOT pass
+
+The paragraph above was correct about its own environment and wrong
+about the branch. Against real Postgres: **484 passed, 10 failed, 57
+errors.** Every one of those had been among the 334 local skips. This is
+the fourth time in this file's history that a real-Postgres round found
+what a local run could not; the standing practice earned its keep again.
+
+**All 57 errors were one bug, in the test harness rather than the app.**
+`authed_app_test()` passed a repo-relative path to
+`AppTest.from_file()`. That method's resolution is two-stage and its own
+source comments call it fragile: it first tries `script_path.is_file()`,
+evaluated **against the current working directory**, and only falls back
+to resolving against the *calling file's* directory. So a relative path
+works when pytest runs from the repo root and resolves to
+`tests/pages/...` — which does not exist — from anywhere else.
+
+The subtlety worth recording, because the obvious diagnosis is slightly
+off: moving the helper into `conftest.py` was not itself the trigger.
+Both the old call sites and the new one live in `tests/`, so the
+fallback branch produces the same wrong path either way. The real
+variable is the CWD. Fixed by resolving through `conftest.page_path()`,
+which returns an absolute path and so takes the first branch
+unconditionally — independent of both the CWD and the calling file.
+`test_auth_coverage.py`'s unauthenticated-page test builds its own
+`AppTest` (correctly — it is testing the unauthenticated path) and
+needed the same treatment; that was the 8 remaining failures in group
+(a).
+
+**Why the guard suite passed while 65 tests could not run at all.** The
+structural guards check the *app*: every page is gated, every call site
+threads `app_user`. The pages were correct. The *harness* was broken,
+and every consumer of that harness is a DB-backed page test that skips
+without Postgres — so nothing was left to fail. A structural guard
+cannot report that the tests it protects never executed. Two responses,
+both added here:
+
+- `test_authed_app_test_resolves_every_page_to_a_real_file` and
+  `test_page_path_is_cwd_independent` exercise the harness itself and
+  need no database, so they fail in exactly the environment where the
+  page tests cannot run. Both were mutation-tested against the original
+  relative-path behavior, from a different CWD, and both catch it.
+- `REQUIRE_DB=1` makes the DB fixtures **fail** instead of skip. Set it
+  for any run whose result will be quoted as evidence the branch works;
+  without it, "178 passed" and "178 passed, 334 skipped" look alike at a
+  glance. `TEST_DATABASE_URL` must point at a throwaway database — the
+  fixture opens with `DROP SCHEMA public CASCADE`, and this machine's
+  `DATABASE_URL` is the production Supabase pooler.
+
+**Still open: 10 form-submission failures** across Control Room, Crew
+Data, Flight Log, Roster, and Roster Generation. The natural hypothesis
+— that adding a login form shifted `at.button[0]`/`at.text_input[0]` —
+was tested directly and **disproved**: with `session_state["app_user"]`
+set, `require_login()` returns before rendering anything, and a probe
+mirroring Crew Data's form structure produced identical widget counts
+(1 text_input, 1 selectbox, 1 button) and a successful submission with
+and without the gate. `test_require_login_already_authenticated_session_
+skips_the_form` asserts the same property directly. The cause is
+therefore something else and is not yet identified; it cannot be
+reproduced on a machine whose only reachable Postgres is production.
