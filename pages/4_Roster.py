@@ -20,11 +20,12 @@ person's own duty in one call, not one flight leg at a time.
 """
 import streamlit as st
 
-from services import crew_service, flight_service, assignment_service
+from services import crew_service, flight_service, assignment_service, auth_service
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
 from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
+app_user = auth_service.require_login()
 st.title("Roster")
 
 OTHER_ROLE_OPTIONS = ["LM", "ENGR", "Other"]
@@ -106,7 +107,8 @@ else:
                     .sort_values("dep_time_planned")["flight_id"].tolist()
 
                 try:
-                    result = assignment_service.assign_pair_to_duty(commander_id, second_pilot_id, ordered_ids)
+                    result = assignment_service.assign_pair_to_duty(
+                        commander_id, second_pilot_id, ordered_ids, app_user=app_user)
                 except ValueError as e:
                     st.error(str(e))
                     result = None
@@ -193,7 +195,8 @@ else:
                     .sort_values("dep_time_planned")["flight_id"].tolist()
 
                 try:
-                    result = assignment_service.assign_crew_to_duty(crew_id, ordered_ids, role_choice)
+                    result = assignment_service.assign_crew_to_duty(
+                        crew_id, ordered_ids, role_choice, app_user=app_user)
                 except ValueError as e:
                     st.error(str(e))
                     result = None
@@ -270,6 +273,6 @@ else:
     if st.button("Unassign"):
         row = active_df.loc[unassign_choice]
         assignment_service.remove_assignment_from_duty(
-            row["crew_id"], row["duty_id"], reason=reason or None)
+            row["crew_id"], row["duty_id"], reason=reason or None, app_user=app_user)
         st.success(f"Unassigned {row['crew_id']} from duty {row['duty_id']}")
         st.rerun()

@@ -26,8 +26,10 @@ import datetime as dt
 
 import streamlit as st
 from db.db import test_connection
+from services import auth_service
 
 st.set_page_config(page_title="Air Eagle OCC", page_icon="✈️", layout="wide")
+app_user = auth_service.require_login()
 
 
 def _background_css() -> str:

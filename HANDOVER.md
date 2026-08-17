@@ -5430,3 +5430,127 @@ deleted, both remote and local (2026-08-14).** See the "Merge status
 as of this snapshot" paragraph near the top of this file.
 `migrations/016`/`017` still need applying to Supabase — production is
 at 015 as of this merge.
+
+## 2026-08-18: authentication for attribution — closing the NULL
+## `audit_log.app_user` gap. NOT YET MERGED (branch `auth-and-attribution`).
+
+Every `audit_log` row written before this branch had `app_user` NULL:
+the audit trail recorded WHAT happened and WHEN, never WHO. The 22
+service functions that take an `app_user` parameter had all been
+carrying it since they were written; nothing was ever passing one,
+because there was no notion of a logged-in user to pass. This branch
+adds that notion and threads it through.
+
+**Scope is deliberately attribution, NOT access control.** Three fixed
+OCC accounts, full access each, no roles/tiers, no self-registration,
+no self-service password reset (re-running `scripts/seed_users.py` for
+an existing username IS the reset mechanism, via `ON CONFLICT DO
+UPDATE`). `migrations/018_users.sql` has no role/permission column on
+purpose — adding one later is a migration, but shipping one now would
+imply a tiered-access model the operator did not ask for.
+
+- `services/auth_service.py` — `hash_password`/`verify_password`
+  (PBKDF2-HMAC-SHA256, stdlib `hashlib`, 600k iterations, per-user
+  16-byte random salt, `secrets.compare_digest` for the compare),
+  `authenticate()`, and `require_login()`. No new dependency: bcrypt/
+  passlib would be the reflex, and would be the wrong call for three
+  internal accounts when the stdlib covers it.
+- `scripts/seed_users.py` — operator-run account creation. The password
+  is never a CLI argument (it would land unredacted in shell history)
+  and never echoed; always `getpass.getpass()` twice.
+
+**`st.login()`/OIDC was evaluated and rejected, and the reasoning is
+worth keeping.** It does work with bare Google accounts — no Workspace
+domain required — so the usual objection doesn't apply. It was rejected
+because it authenticates identity without restricting entry: OIDC would
+prove *some* Google account signed in, but any Google account would
+satisfy it. Restricting to three specific people would mean maintaining
+an allowlist of their Google identities on top of the OIDC flow, which
+is strictly more moving parts than the three local accounts the settled
+spec already calls for, for a deployment with no external users.
+
+**The gate lives in every page, not only in `app.py`'s router.** This is
+easy to get wrong in the direction that looks fine: `AppTest.from_file()`
+execs a page script directly and bypasses `st.navigation()` entirely, so
+a router-only check would leave every page unprotected under test — and
+in production too, since the router is the normal navigation path, not
+an enforcement boundary. Each of the 8 page files (`home.py` +
+`pages/*.py`) calls `auth_service.require_login()` immediately after its
+own `st.set_page_config()`; the function `st.stop()`s until
+`session_state["app_user"]` is set, so nothing below it executes.
+
+**Two structural guards, in `tests/test_auth_coverage.py`** — both for
+failure modes where the broken state is indistinguishable from the
+working one by reading any single file:
+
+- **Missing gate.** 8 files each need one call; the failure mode is
+  forgetting one, and an unprotected page renders identically to a
+  protected one until somebody navigates straight to it. The guard
+  globs `pages/*.py` + `home.py` (never a hardcoded list — a hardcoded
+  list passes forever the moment page 8 is added and the list isn't
+  updated) and asserts each calls the gate, at module level, before any
+  service call that takes `app_user`. Same discipline as
+  `test_check_reachability.py`.
+- **Dropped `app_user`.** A call site that omits it writes a NULL
+  `app_user` on a real audit record — the exact deficiency this branch
+  exists to fix, and invisible unless someone thinks to query for it
+  months later. The guard checks all 18 page call sites AND all 36
+  service-internal forwards (a page can thread `app_user` correctly into
+  `assign_pair_to_duty()` and still lose it if that function doesn't
+  forward it down to `log_audit()`).
+
+Both guards parse with `ast`, not grep, because the threading in this
+codebase mixes keyword (`app_user=app_user`) and positional
+(`_write_pair_rows(..., app_user)`) passing. A keyword-only grep reports
+six false failures on the positional sites in `assignment_service.py`
+and `roster_generator_service.py`; a substring grep for `app_user`
+reports false passes on any line that merely mentions it. Only resolving
+each callee's signature separates the two — which is also how the "36
+sites are threaded" claim above was actually confirmed rather than
+assumed.
+
+**The guards were mutation-tested, not just observed passing.** Five
+deliberate breakages — a new ungated page, a stripped gate, a page call
+site dropping `app_user`, a service dropping a forward, and a gate moved
+below the writes — were each confirmed to make the corresponding test
+fail, and the tree restored afterward. A guard that has never failed is
+not yet known to work.
+
+**Known property, recorded deliberately: `app_user` identifies the
+ACCOUNT that acted, not necessarily the person.** With three shared OCC
+accounts, anyone who knows an account's password acts under that
+account's name in the audit trail. This is acceptable at three OCC staff
+and matches the settled spec — it is written down here so it surfaces as
+a known limitation rather than being discovered mid-audit. Per-person
+attribution would require per-person accounts, which is a spec change,
+not a bug fix.
+
+**Test-side change every future page test inherits:** all 9 `AppTest`
+construction sites across the 8 page-test files now go through
+`tests/conftest.py`'s `authed_app_test()`, which pre-sets
+`session_state["app_user"]`. Without it a page test asserts against a
+login form instead of the page, and fails confusingly — the page renders
+with no exception, just none of its own content (this is exactly how the
+two `test_home_page.py` failures first surfaced). It lives in `conftest`
+for the same reason `_patch_all_service_engines` does: nine sites across
+eight files is nine chances to forget. Tests that deliberately exercise
+the unauthenticated path build their own `AppTest` directly.
+
+**Verification status — read before merging.** 176 passed, 0 failed,
+334 skipped. Every skip is DB-dependent: this machine has no Postgres
+(no `TEST_DATABASE_URL`, no local server, no Docker), so the DB-backed
+suite could not run here, exactly as it could not before this branch.
+The static guards and the 8 runtime "unauthenticated page shows the
+login form" checks need no database and did run. **The one test that
+has never executed is
+`test_writes_by_a_logged_in_user_never_leave_a_null_app_user`** — the
+end-to-end proof that `app_user` actually lands in the column rather
+than merely being passed. Its calls were verified to bind against the
+real service signatures and to satisfy `REQUIRED_FIELDS`/
+`UPDATABLE_FIELDS` (which caught two genuine bugs in it: `flight_number`
+should be `flight_no`, and the required `domestic` was missing), but
+binding is not execution. Run the DB suite against real Postgres before
+merging, the same way the meal_provided and flight-deck pieces were
+verified. `migrations/018_users.sql` also needs applying, and the three
+accounts seeding via `scripts/seed_users.py`, before the app is usable
+on any deployment.

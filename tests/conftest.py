@@ -21,8 +21,40 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
+from streamlit.testing.v1 import AppTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+# Username the page tests run as. Any non-empty string satisfies the
+# gate — require_login() returns session_state["app_user"] as-is when
+# it's already set, without touching the users table — so page tests
+# need no seeded user and no DB for authentication itself.
+TEST_APP_USER = "occ1"
+
+
+def authed_app_test(path: str, app_user: str = TEST_APP_USER) -> AppTest:
+    """Build an AppTest for a real page file with the login gate
+    already satisfied.
+
+    Every page calls auth_service.require_login() near its top, which
+    st.stop()s unless session_state["app_user"] is set. Without this,
+    every page test asserts against a login form instead of the page,
+    and the failure is confusing rather than obvious: the page renders
+    "successfully" with no exception, just none of its own content.
+
+    This lives here rather than in each test file for the same reason
+    _patch_all_service_engines does — nine construction sites across
+    eight files is nine chances to forget, and the gate is now a
+    precondition for testing ANY page, not a per-file concern.
+
+    Tests that deliberately exercise the UNAUTHENTICATED path build
+    their own AppTest directly instead of calling this (see
+    test_auth_coverage.py and test_auth_service.py).
+    """
+    at = AppTest.from_file(path)
+    at.session_state["app_user"] = app_user
+    return at
 
 
 @pytest.fixture(scope="function")

@@ -30,11 +30,12 @@ submission.
 import datetime as dt
 import streamlit as st
 
-from services import crew_service, assignment_service
+from services import crew_service, assignment_service, auth_service
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
 from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Control Room", page_icon="🛫", layout="wide")
+app_user = auth_service.require_login()
 st.title("Control Room — Ad-hoc / Charter")
 
 OTHER_ROLE_OPTIONS = ["LM", "ENGR", "Other"]
@@ -119,7 +120,7 @@ with st.form("control_room_form"):
             if is_pair:
                 try:
                     result, flight_ids = assignment_service.assign_pair_to_new_flights(
-                        commander_id, second_pilot_id, flights_data)
+                        commander_id, second_pilot_id, flights_data, app_user=app_user)
                 except ValueError as e:
                     st.error(str(e))
                     result = None
@@ -178,7 +179,7 @@ with st.form("control_room_form"):
             else:
                 try:
                     result, flight_ids = assignment_service.assign_crew_to_new_flights(
-                        crew_id, flights_data, role_choice)
+                        crew_id, flights_data, role_choice, app_user=app_user)
                 except ValueError as e:
                     st.error(str(e))
                     result = None

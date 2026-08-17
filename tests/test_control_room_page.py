@@ -17,9 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
-from streamlit.testing.v1 import AppTest
-
 from db.db import get_engine
+from tests.conftest import authed_app_test
 
 
 @pytest.fixture
@@ -28,7 +27,7 @@ def page_app(migrated_db, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", test_url)
     get_engine.cache_clear()
 
-    at = AppTest.from_file("pages/1_Control_Room.py")
+    at = authed_app_test("pages/1_Control_Room.py")
     yield at
 
     get_engine.cache_clear()

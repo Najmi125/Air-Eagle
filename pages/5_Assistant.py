@@ -29,11 +29,12 @@ import dataclasses
 import pandas as pd
 import streamlit as st
 
-from services import crew_service
+from services import crew_service, auth_service
 from services.assistant import query_parser, reports
 from services.reporting import AIR_EAGLE, dataset_to_xlsx, report_filename
 
 st.set_page_config(page_title="OCC Assistant", page_icon="🤖", layout="wide")
+app_user = auth_service.require_login()
 st.title("OCC Assistant")
 
 st.markdown(

@@ -33,10 +33,11 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from services import assignment_service, crew_service, roster_generator_service, rotation_template_service
+from services import assignment_service, auth_service, crew_service, roster_generator_service, rotation_template_service
 from services.roster_generator_service import SEATS
 
 st.set_page_config(page_title="Roster Generation", page_icon="⚙️", layout="wide")
+app_user = auth_service.require_login()
 st.title("Roster Generation")
 
 st.markdown(
@@ -145,7 +146,7 @@ else:
 
     if st.button("Generate", type="primary"):
         with st.spinner(f"Filling {rotation_count} rotation(s) — {estimate_text}, this can take a while..."):
-            summary = roster_generator_service.generate_for_window(date_from, date_to)
+            summary = roster_generator_service.generate_for_window(date_from, date_to, app_user=app_user)
         st.session_state.generation_summary = summary
         st.session_state.generation_window = (date_from, date_to)
         st.rerun()
@@ -250,7 +251,7 @@ st.info(
 )
 
 if st.button("Publish", disabled=(proposed_count == 0)):
-    published = roster_generator_service.publish_window(date_from, date_to)
+    published = roster_generator_service.publish_window(date_from, date_to, app_user=app_user)
     remaining = assignment_service.search_roster(date_from=date_from, date_to=date_to, include_proposed=True)
     remaining_count = int((remaining["status"] == "PROPOSED").sum()) if not remaining.empty else 0
     st.success(f"Published {published} roster row(s).")

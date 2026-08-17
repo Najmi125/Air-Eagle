@@ -1,0 +1,57 @@
+
+Authentication for Air Eagle OCC
+Context
+audit_log.app_user is NULL on every row today — every write function in services/ already accepts app_user: Optional[str] = None, but no page has ever populated it. For a PCAA-regulated operator this means the audit trail (the permanent regulatory record) knows what happened and when, never who. This was deliberately deferred (spec settled 2026-08-04, see HANDOVER.md's "Open stubs") until real crew/flight data was about to enter the system. That trigger has now fired: real crew data is about to be entered for the shadow trial. Scope is deliberately narrow — three fixed OCC accounts, full access each, no tiers, no self-registration, no password reset. The point is attribution, not access control.
+
+Design decisions
+Login mechanism: self-contained username/password, not st.login(). Researched st.login()/st.user directly (Streamlit docs, current as of Aug 2026): it requires a real OIDC provider configured in secrets.toml ([auth] block — client_id, client_secret, server_metadata_url, cookie_secret, redirect_uri). It works with any OIDC provider including a bare Google account, not just Workspace, so it isn't blocked by the operator's lack of confirmed Workspace accounts — but it still doesn't fit here: it needs a Google Cloud OAuth client set up and maintained outside this repo, a redirect_uri that differs between local dev and whatever Streamlit Community Cloud assigns (a second thing to keep in sync, on top of the existing DATABASE_URL split this repo already manages), and it would still need an email allowlist check on top — st.login() authenticates identity, it doesn't restrict who's allowed in, and anyone with a Google account could otherwise reach the login screen. For three fixed internal accounts with no self-registration, a self-contained users table matches the original settled spec, has no external dependency, and is less to maintain. st.login() stays a reasonable upgrade later if the operator adopts real SSO — not needed now.
+
+Password storage: stdlib hashlib.pbkdf2_hmac, no new dependency. requirements.txt currently has 7 entries and no hashing library. PBKDF2-HMAC-SHA256 (600,000 iterations, per-user random 16-byte salt via secrets.token_bytes, constant-time compare via secrets.compare_digest) is built into Python's standard library and is enough for three accounts — no need to add bcrypt/passlib for this.
+
+Credentials never in the repo. The users table lives in the same Postgres database as everything else, reached through the existing db.db.get_engine() — no new secrets-location decision needed; DATABASE_URL already resolves via .env locally / st.secrets on Streamlit Community Cloud. Only hashes are ever stored. The three accounts are created by a one-off operator-run script, never through the app UI (no self-registration surface to build or secure).
+
+Gate lives once, called once per page. AppTest.from_file() execs each page script directly and bypasses app.py's st.navigation() router entirely (confirmed from app.py's own docstring, and this is exactly why the existing 8 page-level test files each construct AppTest.from_file("pages/...") directly). That means the check can't live only in app.py — it has to run at the top of every page script. The check logic itself lives once, in services/auth_service.py; each page adds a single call, same shape as st.set_page_config() is already added to every page today.
+
+Build
+migrations/018_users.sql — new users table: username text primary key, password_hash bytea not null, salt bytea not null, created_at timestamptz not null default now(). No role/permission column (spec: no tiers).
+
+services/auth_service.py (new, follows the existing services/audit_service.py pattern — single owner of one concern):
+
+hash_password(password: str) -> tuple[bytes, bytes] / verify_password(password, password_hash, salt) -> bool — the PBKDF2 logic described above.
+authenticate(username: str, password: str) -> bool — looks up the row, verifies.
+require_login() -> str — Streamlit-facing. If st.session_state.get("app_user") is already set, returns it immediately (no re-render). Otherwise renders a small username/password st.form, calls authenticate() on submit; on success sets st.session_state["app_user"] and st.rerun()s; on failure shows st.error(). Calls st.stop() whenever login hasn't succeeded yet, so nothing below it in the calling page ever executes. This is the one function every page calls — the "check" that must not be duplicated 8 times lives entirely here.
+scripts/seed_users.py (new, modeled on scripts/import_crew_from_xlsx.py's CLI-script shape): takes a username via argparse, prompts for the password twice via getpass.getpass() (never as a CLI arg, never echoed, never in shell history), hashes it, upserts the row. Run once per account by the operator; rerunning with an existing username resets that user's password — this doubles as the only "password reset" mechanism, which is deliberate (spec explicitly excludes a self-service reset flow).
+
+Every page gets one line added near the top, right after st.set_page_config(...):
+
+app_user = auth_service.require_login()
+home.py gets the same line (it's a page too, per app.py's own docstring). That's 8 files: home.py + pages/{1_Control_Room,2_Crew_Data,3_Flight_Log,4_Roster,5_Assistant, 6_Roster_Generation,7_Schedule_Templates}.py.
+
+app_user=app_user gets added to every existing write call site. No service-layer signature changes — every write function already accepts app_user. Confirmed by grepping every page for its service write calls; full list (13 call sites, 6 pages — 5_Assistant.py is read-only, no changes needed beyond the gate):
+
+pages/1_Control_Room.py: assign_pair_to_new_flights, assign_crew_to_new_flights
+pages/2_Crew_Data.py: add_crew, update_crew
+pages/3_Flight_Log.py: add_flight, update_flight_actual_times_and_revalidate
+pages/4_Roster.py: assign_pair_to_duty, assign_crew_to_duty, remove_assignment_from_duty
+pages/6_Roster_Generation.py: generate_for_window, publish_window
+pages/7_Schedule_Templates.py: create_template, create_new_version, expand_and_persist, approve_instance, reject_instance
+Verification that none was missed: after implementation, grep each page for its *_service. call sites and confirm app_user=app_user on every one that also appears in the list above — a manual pass, not new tooling, since the list is now enumerated and won't grow silently.
+
+Tests
+Service-level tests need no changes. Per existing convention, functions like assign_pair_to_duty(...) are already called directly with app_user="tester" in files like tests/ test_assignment_service.py — login is a page/session concern, not a service-layer one, so these are unaffected.
+
+Page-level AppTest tests need a logged-in session seeded before the first .run(). Each of the 8 existing page test files (tests/test_home_page.py, test_control_room_page.py, test_crew_data_page.py, test_flight_log_page.py, test_roster_page.py, test_assistant_page.py, test_roster_generation_page.py, test_schedule_templates_page.py) defines its own local page_app fixture constructing AppTest.from_file(...). Rather than duplicating the seed logic 8 times, add one shared piece to tests/conftest.py — same pattern already used for _patch_all_service_engines (a single fixture the per-file fixtures build on, documented there specifically to prevent this class of per-file drift). New _authenticated_session(at) helper in conftest.py sets at.session_state["app_user"] = "tester" directly (bypassing the real form, since AppTest can pre-seed session_state before the first .run() — no need to hash/verify a password in tests). Each page's local page_app fixture calls it before yielding, same one-line-per-file addition as the page scripts themselves get.
+
+New tests/test_auth_service.py: hash_password/verify_password round-trip, wrong-password rejection, unknown-username rejection, require_login()'s session-state gate behavior via a minimal AppTest page.
+
+Documentation
+Once built and verified, add a dated HANDOVER.md entry (matching existing convention) recording what was built, the st.login() assessment and why it was rejected, and updating the "Open stubs" auth bullet from "build starting" to built/merged status — same pattern as every other completed piece in that file.
+
+Verification
+pytest — full suite green, including the new test_auth_service.py and the 8 updated page test files.
+python scripts/check_reachability.py — clean (services/ auth_service.py and scripts/seed_users.py both need to show as reachable/intentionally-entry-point).
+Manual click-through once merged: python scripts/seed_users.py to create a real account, streamlit run app.py, confirm the login form gates every page, confirm a wrong password is rejected, confirm a successful write (e.g. adding a flight) shows the real username in audit_log.app_user via services.audit_service.get_audit_log().
+Out of scope (deliberately)
+Supabase Pro plan upgrade and automated backups — the other two legs of the original combined trigger, explicitly deferred per the operator's judgement that shadow-trial data is re-creatable (already recorded in HANDOVER.md on the auth-and-attribution branch). Password reset flow, self-registration, permission tiers — all explicitly excluded by the settled spec.
+
+Add Comment
