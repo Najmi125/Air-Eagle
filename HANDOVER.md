@@ -305,8 +305,52 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-14).
-  `flight-deck-crew-package` merged into `main`.** Commander/Second
+- **No outstanding branches as of this snapshot (2026-08-18).
+  `auth-and-attribution` merged into `main`.** Authentication for
+  attribution — three fixed OCC accounts, PBKDF2 via stdlib `hashlib`,
+  a `require_login()` gate in all 8 page files, and `app_user` threaded
+  through 18 page call sites and 36 service-internal forwards, closing
+  the NULL `audit_log.app_user` gap. See the dated log entry at the end
+  of this file for the full design, including why `st.login()`/OIDC was
+  evaluated and rejected. **563/563 verified against real Postgres 16**,
+  reachability clean.
+
+  `test_writes_by_a_logged_in_user_never_leave_a_null_app_user` — the
+  end-to-end proof that `app_user` reaches the column rather than merely
+  being passed — passed on that run, its first execution anywhere.
+  `migrations/018_users.sql` applied to a database already at 017 with
+  existing crew data: table created correctly, existing rows intact.
+  Merged, pushed; branch deleted, both remote and local.
+
+  Took three real-Postgres rounds, and **none of the three found a bug
+  in the feature**: round 1 a CWD-dependent `AppTest.from_file()` path
+  bug in the test harness (57 errors), round 2 an unpinned
+  `streamlit>=1.38` resolving to 1.61.1 in a recycled sandbox (10
+  failures, reproduced identically on unchanged `main`). The pattern
+  behind every wrong conclusion drawn along the way was the same:
+  treating a local environment as representative when it was silently
+  under-reporting. Two independent instances of that in one piece of
+  work — the version drift, and `openpyxl` declared but never installed,
+  hiding 41 tests that had never run in that environment through every
+  prior round. `REQUIRE_DB=1`, `tests/test_dependency_pinning.py`'s
+  installed-versus-pinned check, and the DB-free harness guards in
+  `tests/test_auth_coverage.py` all exist to make that failure loud
+  instead of silent. The pinning guard proved itself on first contact in
+  a fresh sandbox, reporting `pandas`/`sqlalchemy` drift precisely
+  rather than as downstream errors.
+
+  **Still open as its own scoped task: Streamlit 1.61.x compatibility.**
+  Pinned to 1.60.0; the same failures reappear at the next upgrade. See
+  the 2026-08-18 log entry for the shape of that work.
+
+  **Production migration note.** `migrations/018_users.sql` needs
+  applying to the real Supabase database, and the three OCC accounts
+  seeding with `scripts/seed_users.py`, before the deployed app is
+  usable — every page now requires a login, so deploying this without
+  seeded accounts locks the app for everyone.
+
+- **`flight-deck-crew-package` merged into `main` (2026-08-14).**
+  Commander/Second
   Pilot seat model — see the dated log entry near the end of this file
   for the full design/build history. **527/527 verified against real
   Postgres 16** (two rounds: 517/526 first pass found nine failures —
@@ -316,10 +360,12 @@ forward.
   exactly the 16 files across the branch's two commits. Merged, pushed;
   branch deleted, both remote and local.
 
-  **Production migration note**: Supabase is currently at migration
-  015 — `migrations/016_operating_position.sql` and `017_uncovered_
-  seats.sql` still need applying there before this piece is live in
-  production. Not yet done as of this snapshot.
+  **Production migration note — CORRECTED 2026-08-16, prior note here
+  was stale.** `migrations/016_operating_position.sql` and
+  `017_uncovered_seats.sql` ARE applied to the real Supabase database
+  — confirmed via `run_migrations.py --status` (`Applied: 18,
+  Pending: 0`), and the deployed app has been verified working against
+  the new schema. This piece is live in production.
 
 - **`home-page-branding` merged into `main`** — home page branding in
   two rounds: round 1 (2026-08-10, logo/background/theming) and round
@@ -864,7 +910,16 @@ merge status, rather than repeating it here.
 - "Engr" role definition unconfirmed (flight-deck FE vs
   line-maintenance AME) — flagged on the crew data template,
   still pending with the rest of the operator data.
-- **Auth — spec now SETTLED (2026-08-04), still NOT built.** Three
+- **Auth — spec SETTLED (2026-08-04), trigger PARTIALLY FIRED
+  (2026-08-16), build starting.** Real crew data is about to be
+  entered for a shadow trial — see `docs/AirEagle_Shadow_Trial_
+  Training_Guide.md` — which is the trigger condition below. This is
+  a deliberate partial fire, not drift: auth is being built now, but
+  the Supabase Pro plan upgrade and automated backups (the other two
+  legs of the original "all three land together" trigger) are still
+  deferred, on the operator's judgement that shadow-trial data is
+  re-creatable rather than operationally critical. Full spec as
+  originally settled: three
   accounts, all full access, no permission tiers — the app is not
   publicly reachable, so a CONTROLLER/ADMIN split isn't buying
   anything real right now. Session-level login is acceptable (re-login
@@ -5419,3 +5474,272 @@ deleted, both remote and local (2026-08-14).** See the "Merge status
 as of this snapshot" paragraph near the top of this file.
 `migrations/016`/`017` still need applying to Supabase — production is
 at 015 as of this merge.
+
+## 2026-08-18: authentication for attribution — closing the NULL
+## `audit_log.app_user` gap. MERGED into `main` 2026-08-18.
+
+Every `audit_log` row written before this branch had `app_user` NULL:
+the audit trail recorded WHAT happened and WHEN, never WHO. The 22
+service functions that take an `app_user` parameter had all been
+carrying it since they were written; nothing was ever passing one,
+because there was no notion of a logged-in user to pass. This branch
+adds that notion and threads it through.
+
+**Scope is deliberately attribution, NOT access control.** Three fixed
+OCC accounts, full access each, no roles/tiers, no self-registration,
+no self-service password reset (re-running `scripts/seed_users.py` for
+an existing username IS the reset mechanism, via `ON CONFLICT DO
+UPDATE`). `migrations/018_users.sql` has no role/permission column on
+purpose — adding one later is a migration, but shipping one now would
+imply a tiered-access model the operator did not ask for.
+
+- `services/auth_service.py` — `hash_password`/`verify_password`
+  (PBKDF2-HMAC-SHA256, stdlib `hashlib`, 600k iterations, per-user
+  16-byte random salt, `secrets.compare_digest` for the compare),
+  `authenticate()`, and `require_login()`. No new dependency: bcrypt/
+  passlib would be the reflex, and would be the wrong call for three
+  internal accounts when the stdlib covers it.
+- `scripts/seed_users.py` — operator-run account creation. The password
+  is never a CLI argument (it would land unredacted in shell history)
+  and never echoed; always `getpass.getpass()` twice.
+
+**`st.login()`/OIDC was evaluated and rejected, and the reasoning is
+worth keeping.** It does work with bare Google accounts — no Workspace
+domain required — so the usual objection doesn't apply. It was rejected
+because it authenticates identity without restricting entry: OIDC would
+prove *some* Google account signed in, but any Google account would
+satisfy it. Restricting to three specific people would mean maintaining
+an allowlist of their Google identities on top of the OIDC flow, which
+is strictly more moving parts than the three local accounts the settled
+spec already calls for, for a deployment with no external users.
+
+**The gate lives in every page, not only in `app.py`'s router.** This is
+easy to get wrong in the direction that looks fine: `AppTest.from_file()`
+execs a page script directly and bypasses `st.navigation()` entirely, so
+a router-only check would leave every page unprotected under test — and
+in production too, since the router is the normal navigation path, not
+an enforcement boundary. Each of the 8 page files (`home.py` +
+`pages/*.py`) calls `auth_service.require_login()` immediately after its
+own `st.set_page_config()`; the function `st.stop()`s until
+`session_state["app_user"]` is set, so nothing below it executes.
+
+**Two structural guards, in `tests/test_auth_coverage.py`** — both for
+failure modes where the broken state is indistinguishable from the
+working one by reading any single file:
+
+- **Missing gate.** 8 files each need one call; the failure mode is
+  forgetting one, and an unprotected page renders identically to a
+  protected one until somebody navigates straight to it. The guard
+  globs `pages/*.py` + `home.py` (never a hardcoded list — a hardcoded
+  list passes forever the moment page 8 is added and the list isn't
+  updated) and asserts each calls the gate, at module level, before any
+  service call that takes `app_user`. Same discipline as
+  `test_check_reachability.py`.
+- **Dropped `app_user`.** A call site that omits it writes a NULL
+  `app_user` on a real audit record — the exact deficiency this branch
+  exists to fix, and invisible unless someone thinks to query for it
+  months later. The guard checks all 18 page call sites AND all 36
+  service-internal forwards (a page can thread `app_user` correctly into
+  `assign_pair_to_duty()` and still lose it if that function doesn't
+  forward it down to `log_audit()`).
+
+Both guards parse with `ast`, not grep, because the threading in this
+codebase mixes keyword (`app_user=app_user`) and positional
+(`_write_pair_rows(..., app_user)`) passing. A keyword-only grep reports
+six false failures on the positional sites in `assignment_service.py`
+and `roster_generator_service.py`; a substring grep for `app_user`
+reports false passes on any line that merely mentions it. Only resolving
+each callee's signature separates the two — which is also how the "36
+sites are threaded" claim above was actually confirmed rather than
+assumed.
+
+**The guards were mutation-tested, not just observed passing.** Five
+deliberate breakages — a new ungated page, a stripped gate, a page call
+site dropping `app_user`, a service dropping a forward, and a gate moved
+below the writes — were each confirmed to make the corresponding test
+fail, and the tree restored afterward. A guard that has never failed is
+not yet known to work.
+
+**Known property, recorded deliberately: `app_user` identifies the
+ACCOUNT that acted, not necessarily the person.** With three shared OCC
+accounts, anyone who knows an account's password acts under that
+account's name in the audit trail. This is acceptable at three OCC staff
+and matches the settled spec — it is written down here so it surfaces as
+a known limitation rather than being discovered mid-audit. Per-person
+attribution would require per-person accounts, which is a spec change,
+not a bug fix.
+
+**Test-side change every future page test inherits:** all 9 `AppTest`
+construction sites across the 8 page-test files now go through
+`tests/conftest.py`'s `authed_app_test()`, which pre-sets
+`session_state["app_user"]`. Without it a page test asserts against a
+login form instead of the page, and fails confusingly — the page renders
+with no exception, just none of its own content (this is exactly how the
+two `test_home_page.py` failures first surfaced). It lives in `conftest`
+for the same reason `_patch_all_service_engines` does: nine sites across
+eight files is nine chances to forget. Tests that deliberately exercise
+the unauthenticated path build their own `AppTest` directly.
+
+**Verification status — read before merging.** 176 passed, 0 failed,
+334 skipped. Every skip is DB-dependent: this machine has no Postgres
+(no `TEST_DATABASE_URL`, no local server, no Docker), so the DB-backed
+suite could not run here, exactly as it could not before this branch.
+The static guards and the 8 runtime "unauthenticated page shows the
+login form" checks need no database and did run. **The one test that
+has never executed is
+`test_writes_by_a_logged_in_user_never_leave_a_null_app_user`** — the
+end-to-end proof that `app_user` actually lands in the column rather
+than merely being passed. Its calls were verified to bind against the
+real service signatures and to satisfy `REQUIRED_FIELDS`/
+`UPDATABLE_FIELDS` (which caught two genuine bugs in it: `flight_number`
+should be `flight_no`, and the required `domestic` was missing), but
+binding is not execution. Run the DB suite against real Postgres before
+merging, the same way the meal_provided and flight-deck pieces were
+verified. `migrations/018_users.sql` also needs applying, and the three
+accounts seeding via `scripts/seed_users.py`, before the app is usable
+on any deployment.
+
+### 2026-08-18 (continued): real-Postgres 16 verification — the branch did NOT pass
+
+The paragraph above was correct about its own environment and wrong
+about the branch. Against real Postgres: **484 passed, 10 failed, 57
+errors.** Every one of those had been among the 334 local skips. This is
+the fourth time in this file's history that a real-Postgres round found
+what a local run could not; the standing practice earned its keep again.
+
+**All 57 errors were one bug, in the test harness rather than the app.**
+`authed_app_test()` passed a repo-relative path to
+`AppTest.from_file()`. That method's resolution is two-stage and its own
+source comments call it fragile: it first tries `script_path.is_file()`,
+evaluated **against the current working directory**, and only falls back
+to resolving against the *calling file's* directory. So a relative path
+works when pytest runs from the repo root and resolves to
+`tests/pages/...` — which does not exist — from anywhere else.
+
+The subtlety worth recording, because the obvious diagnosis is slightly
+off: moving the helper into `conftest.py` was not itself the trigger.
+Both the old call sites and the new one live in `tests/`, so the
+fallback branch produces the same wrong path either way. The real
+variable is the CWD. Fixed by resolving through `conftest.page_path()`,
+which returns an absolute path and so takes the first branch
+unconditionally — independent of both the CWD and the calling file.
+`test_auth_coverage.py`'s unauthenticated-page test builds its own
+`AppTest` (correctly — it is testing the unauthenticated path) and
+needed the same treatment; that was the 8 remaining failures in group
+(a).
+
+**Why the guard suite passed while 65 tests could not run at all.** The
+structural guards check the *app*: every page is gated, every call site
+threads `app_user`. The pages were correct. The *harness* was broken,
+and every consumer of that harness is a DB-backed page test that skips
+without Postgres — so nothing was left to fail. A structural guard
+cannot report that the tests it protects never executed. Two responses,
+both added here:
+
+- `test_authed_app_test_resolves_every_page_to_a_real_file` and
+  `test_page_path_is_cwd_independent` exercise the harness itself and
+  need no database, so they fail in exactly the environment where the
+  page tests cannot run. Both were mutation-tested against the original
+  relative-path behavior, from a different CWD, and both catch it.
+- `REQUIRE_DB=1` makes the DB fixtures **fail** instead of skip. Set it
+  for any run whose result will be quoted as evidence the branch works;
+  without it, "178 passed" and "178 passed, 334 skipped" look alike at a
+  glance. `TEST_DATABASE_URL` must point at a throwaway database — the
+  fixture opens with `DROP SCHEMA public CASCADE`, and this machine's
+  `DATABASE_URL` is the production Supabase pooler.
+
+**Still open: 10 form-submission failures** across Control Room, Crew
+Data, Flight Log, Roster, and Roster Generation. The natural hypothesis
+— that adding a login form shifted `at.button[0]`/`at.text_input[0]` —
+was tested directly and **disproved**: with `session_state["app_user"]`
+set, `require_login()` returns before rendering anything, and a probe
+mirroring Crew Data's form structure produced identical widget counts
+(1 text_input, 1 selectbox, 1 button) and a successful submission with
+and without the gate. `test_require_login_already_authenticated_session_
+skips_the_form` asserts the same property directly. The cause is
+therefore something else and is not yet identified; it cannot be
+reproduced on a machine whose only reachable Postgres is production.
+
+### 2026-08-18 (continued): the 10 failures were an unpinned dependency
+
+Resolved, and the answer was in neither the branch nor the tests.
+Running the same failing tests against unchanged `main` — the check
+that separates "caused" from "exposed" — reproduced them exactly. The
+sandbox that produced the earlier 527/527 had been recycled and its
+dependencies reinstalled from scratch. `requirements.txt` said
+`streamlit>=1.38`, so the resolver picked **1.61.1** instead of the
+**1.60.0** everything had been verified against. 1.61.1 changed
+`AppTest` behaviour: unchanged `main` went 527/527 → 468 passed, 2
+failed, 57 errors, with the same `FileNotFoundError` signature.
+
+Worth being precise about how much of this was a red herring, because
+each layer looked like the real bug at the time:
+
+- The `7 → 10` widget growth is **normal** `st.rerun()` behaviour. It
+  reproduces with and without the login gate, and on `main`. It is the
+  add form (7) plus the edit section (3) that renders once a crew record
+  exists, and it proves only that the write succeeded.
+- The missing `st.success` is what `st.rerun()` legitimately discards.
+- The login gate is genuinely transparent when authenticated:
+  `require_login()` returns before rendering anything, verified by
+  running the **real** `pages/2_Crew_Data.py` through AppTest with
+  `crew_service` faked in memory — identical widget counts to the
+  failing run, and the assertion passed.
+- The timing-race hypothesis was wrong too. It was a version difference.
+
+**Everything is now pinned exactly.** `requirements.txt` carries the 7
+direct dependencies at exact versions; `requirements.lock` (53 entries,
+`pip freeze`) carries the full transitive set. `>=` on a test-facing
+dependency means the suite tests whatever the resolver picked that
+morning, which is not a controlled input — this was already flagged in
+this file as a known gap, and it cost two verification rounds to
+collect on it.
+
+`tests/test_dependency_pinning.py` guards both, DB-free: the pins stay
+exact, the lock agrees with them, and — the one that would have caught
+this at its source — the **installed** versions match the pins. In the
+recycled sandbox that check would have said "streamlit 1.61.1 installed,
+1.60.0 pinned" on the first run, instead of 57 errors that read as a
+code regression. All three guards were mutation-tested, including
+reproducing the exact drift.
+
+Also fixed in passing: `openpyxl` was declared in `requirements.txt` but
+had never been installed in the local venv, so
+`test_import_crew_script.py` and `test_reporting_export.py` failed at
+collection and their 41 tests had never run locally at all. Installing
+it took the local run from 178 to **219 passed, 0 failed, 334 skipped**,
+and it is now in the lock — a naive `pip freeze` from the old venv would
+have silently omitted it.
+
+**Open, scoped as its own piece of work: Streamlit 1.61.x
+compatibility.** Pinning to 1.60.0 restores green but leaves the project
+one version behind, and the same failures will reappear at the next
+upgrade. That task is: understand what changed in 1.61's `AppTest`,
+decide whether the affected assertions should be robust across both
+versions (several assert on messages that `st.rerun()` discards, which
+is fragile independent of version), then move the pin deliberately with
+a full real-Postgres run. Not a blocker for auth.
+
+### 2026-08-18 (continued): green, and merged
+
+**563 passed, 0 failed against real Postgres 16 on the pinned
+environment.** Reachability clean. This supersedes the "Verification
+status — read before merging" paragraph above, which was accurate when
+written and is now historical: the test it named as never having
+executed anywhere,
+`test_writes_by_a_logged_in_user_never_leave_a_null_app_user`, **passed
+on this run** — the end-to-end proof that `app_user` actually reaches
+the column rather than merely being passed to a function that accepts
+it. Auth and coverage suites 26/26. `migrations/018_users.sql` applied
+to a database already at 017 carrying existing crew data: table created
+correctly, existing rows intact.
+
+The dependency guard proved itself on first contact rather than in
+theory: the fresh sandbox had `pandas` and `sqlalchemy` off-pin, and
+`test_dependency_pinning.py` reported "installed X, pinned Y" precisely,
+where the same class of drift had previously surfaced as 57 errors that
+read as a code regression. Realigning took one command.
+
+Merged into `main`, pushed; branch `auth-and-attribution` deleted, both
+remote and local. See the "Merge status as of this snapshot" paragraph
+near the top of this file.

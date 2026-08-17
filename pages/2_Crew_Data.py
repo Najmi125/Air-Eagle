@@ -10,9 +10,10 @@ pass (2026-08-10/11), this page hasn't; UI work here is parked for later.
 """
 import streamlit as st
 
-from services import crew_service
+from services import crew_service, auth_service
 
 st.set_page_config(page_title="Crew Data", page_icon="👨‍✈️", layout="wide")
+app_user = auth_service.require_login()
 st.title("Crew Data")
 
 # CPT/FO only, per the operator's 2026-08-02 decision: Air Eagle's
@@ -95,7 +96,7 @@ with st.form("add_crew_form", clear_on_submit=True):
                 "crm_expiry": crm_expiry,
                 "dg_expiry": dg_expiry,
                 "remarks": remarks or None,
-            })
+            }, app_user=app_user)
             st.success(f"Added {name} as {new_id}")
             st.rerun()
         except ValueError as e:
@@ -133,11 +134,12 @@ else:
                     "email": new_email or None,
                     "base": new_base or None,
                     "remarks": new_remarks or None,
-                })
+                }, app_user=app_user)
                 st.success(f"Updated {selected_id}")
                 st.rerun()
 
             if deactivate_submitted:
-                crew_service.deactivate_crew(selected_id, reason="Deactivated via Crew Data page")
+                crew_service.deactivate_crew(
+                    selected_id, reason="Deactivated via Crew Data page", app_user=app_user)
                 st.success(f"Deactivated {selected_id}")
                 st.rerun()

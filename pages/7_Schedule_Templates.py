@@ -19,9 +19,11 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
+from services import auth_service
 from services import rotation_template_service as rts
 
 st.set_page_config(page_title="Schedule Templates", page_icon="📋", layout="wide")
+app_user = auth_service.require_login()
 st.title("Schedule Templates")
 
 WEEKDAY_OPTIONS = [("Mon", 1), ("Tue", 2), ("Wed", 3), ("Thu", 4), ("Fri", 5), ("Sat", 6), ("Sun", 7)]
@@ -183,6 +185,7 @@ with st.form("create_template_form"):
                         meal_provided=ct_meal_provided, snack_provided=ct_snack_provided,
                         description=ct_description.strip() or None,
                         effective_until=ct_effective_until,
+                        app_user=app_user,
                     )
                 except ValueError as e:
                     st.error(str(e))
@@ -254,6 +257,7 @@ else:
                         effective_from=cv_effective_from, meal_provided=cv_meal_provided,
                         snack_provided=cv_snack_provided, description=cv_description.strip() or None,
                         effective_until=cv_effective_until,
+                        app_user=app_user,
                     )
                 except ValueError as e:
                     st.error(str(e))
@@ -292,7 +296,10 @@ else:
     elif st.button("Expand window"):
         codes_to_expand = rotation_codes if expand_choice == "All rotation codes" else [expand_choice]
         with st.spinner("Expanding..."):
-            breakdown = {code: len(rts.expand_and_persist(code, expand_from, expand_to)) for code in codes_to_expand}
+            breakdown = {
+                code: len(rts.expand_and_persist(code, expand_from, expand_to, app_user=app_user))
+                for code in codes_to_expand
+            }
         total = sum(breakdown.values())
         if total:
             st.success(f"{total} new draft instance(s) created.")
@@ -380,7 +387,7 @@ else:
             approved, failed, total_flights = [], [], 0
             for iid in selected_ids:
                 try:
-                    flight_ids = rts.approve_instance(iid)
+                    flight_ids = rts.approve_instance(iid, app_user=app_user)
                 except ValueError as e:
                     failed.append((iid, str(e)))
                 else:
@@ -399,7 +406,7 @@ else:
             rejected, failed = [], []
             for iid in selected_ids:
                 try:
-                    rts.reject_instance(iid, reason=reject_reason.strip())
+                    rts.reject_instance(iid, reason=reject_reason.strip(), app_user=app_user)
                 except ValueError as e:
                     failed.append((iid, str(e)))
                 else:

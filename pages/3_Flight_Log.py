@@ -12,10 +12,11 @@ Deliberately unstyled, matches pages/2_Crew_Data.py — the home page
 import datetime as dt
 import streamlit as st
 
-from services import flight_service, assignment_service
+from services import flight_service, assignment_service, auth_service
 from services.alert_summary import format_alert_lines
 
 st.set_page_config(page_title="Flight Log", page_icon="📘", layout="wide")
+app_user = auth_service.require_login()
 st.title("Flight Log")
 
 STATUS_OPTIONS = ["All", "PLANNED", "OPERATED", "CANCELLED", "DISRUPTED"]
@@ -66,7 +67,7 @@ with st.form("add_flight_form", clear_on_submit=True):
                 "domestic": domestic == "Domestic",
                 "cargo_dg": cargo_dg,
                 "remarks": remarks or None,
-            })
+            }, app_user=app_user)
             st.success(f"Added flight {new_id}")
             st.rerun()
         except ValueError as e:
@@ -108,7 +109,8 @@ else:
                               if actual_arr_date and actual_arr_time else None)
                 if dep_actual or arr_actual:
                     outcomes = assignment_service.update_flight_actual_times_and_revalidate(
-                        selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual)
+                        selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual,
+                        app_user=app_user)
                     st.success(f"Updated flight {selected_id}")
                     for outcome in outcomes:
                         result = outcome["validation_result"]
@@ -137,6 +139,7 @@ else:
                     st.warning("No actual times entered.")
 
             if cancel_submitted:
-                assignment_service.cancel_flight_and_roster(selected_id, reason=cancel_reason or None)
+                assignment_service.cancel_flight_and_roster(
+                    selected_id, reason=cancel_reason or None, app_user=app_user)
                 st.success(f"Cancelled flight {selected_id}")
                 st.rerun()

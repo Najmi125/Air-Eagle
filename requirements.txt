@@ -1,7 +1,30 @@
-streamlit>=1.38
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
-pandas>=2.0
-pytest>=8.0
-python-dotenv>=1.0
-openpyxl>=3.1
+# Air Eagle OCC — direct dependencies, EXACTLY pinned.
+#
+# These were `>=` ranges until 2026-08-18. That cost a full
+# verification round: a recycled sandbox reinstalled from
+# `streamlit>=1.38`, picked up Streamlit 1.61.1 instead of the 1.60.0
+# everything had been verified against, and 1.61.1 changed AppTest's
+# behaviour under the whole suite. Unchanged `main` went from 527/527
+# to 468 passed / 2 failed / 57 errors — no code change, no test
+# change, purely the resolver picking a newer release. The failures
+# looked exactly like a regression in the branch under review, and two
+# rounds went into proving they weren't.
+#
+# `>=` on a test-facing dependency means the suite is testing whatever
+# the resolver happened to pick that day, which is not a controlled
+# input. Pin exact versions here; regenerate requirements.lock (full
+# transitive set, `pip freeze`) whenever these change.
+#
+# Upgrading is a deliberate task, not something a fresh install does on
+# its own: bump the pin, run the full suite against real Postgres, and
+# only then commit the new version. Streamlit 1.61.x specifically is a
+# known-incompatible upgrade with its own scoped piece of work — see
+# HANDOVER.md (2026-08-18).
+
+streamlit==1.60.0
+sqlalchemy==2.0.51
+psycopg2-binary==2.9.12
+pandas==3.0.5
+pytest==9.1.1
+python-dotenv==1.2.2
+openpyxl==3.1.5

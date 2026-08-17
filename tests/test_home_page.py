@@ -30,9 +30,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
-from streamlit.testing.v1 import AppTest
-
 from db.db import get_engine
+from tests.conftest import authed_app_test
 
 
 @pytest.fixture
@@ -41,7 +40,7 @@ def page_app(migrated_db, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", test_url)
     get_engine.cache_clear()
 
-    at = AppTest.from_file("home.py")
+    at = authed_app_test("home.py")
     yield at
 
     get_engine.cache_clear()
@@ -81,7 +80,7 @@ def test_page_loads_without_exception_when_db_unreachable():
     cleanly (no traceback from the logo/background/panel additions)
     and the DB-status message is still present and readable."""
     with patch("db.db.test_connection", return_value="connection refused"):
-        at = AppTest.from_file("home.py")
+        at = authed_app_test("home.py")
         at.run()
         assert not at.exception
         assert any("connection refused" in e.value for e in at.error)
@@ -92,7 +91,7 @@ def test_router_loads_the_default_home_page_without_exception():
     typo'd filename) and st.navigation()/pg.run() correctly renders
     the default=True page (home.py) with no exception."""
     with patch("db.db.test_connection", return_value=True):
-        at = AppTest.from_file("app.py")
+        at = authed_app_test("app.py")
         at.run()
         assert not at.exception
         assert any("Database connected" in s.value for s in at.success)
