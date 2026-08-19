@@ -45,6 +45,17 @@ def _validate_legs(legs: Sequence[dict]) -> None:
     REQUIRED_FIELDS check already follows) — a template leg describes
     a known, named, recurring rotation, unlike an ad-hoc Control Room
     charter, where a missing flight_no is legitimate.
+
+    Route continuity (leg N's destination == leg N+1's origin) is
+    checked here too, as of 2026-08-19. core/duty_builder.py's
+    build_duty() has always enforced it, but only at EXPANSION time — so
+    a template with disconnected legs saved cleanly and only failed
+    days later, far from where the mistake was made. Same principle as
+    the arr>dep check pages/7_Schedule_Templates.py already does at
+    creation: catch it where it was typed. It lives here rather than in
+    the page so a non-UI caller can't sidestep it, and the message
+    deliberately echoes build_duty()'s so the two never disagree about
+    what continuity means.
     """
     for leg in legs:
         if not leg.get("flight_no"):
@@ -52,6 +63,17 @@ def _validate_legs(legs: Sequence[dict]) -> None:
                 f"leg_order={leg.get('leg_order')}: flight_no is required for a "
                 f"template leg (a recurring rotation is always named) — ad-hoc "
                 f"flights with no flight_no go through Control Room, not templates"
+            )
+
+    ordered = sorted(legs, key=lambda leg: leg.get("leg_order", 0))
+    for current, following in zip(ordered, ordered[1:]):
+        if current.get("destination") != following.get("origin"):
+            raise ValueError(
+                f"leg_order={current.get('leg_order')} arrives at "
+                f"{current.get('destination')} but leg_order="
+                f"{following.get('leg_order')} departs from {following.get('origin')} "
+                f"— a crew member can't be in two places at once. These legs don't "
+                f"form one physically continuous rotation."
             )
 
 
@@ -627,3 +649,123 @@ def reject_instance(instance_id: int, reason: Optional[str] = None,
             app_user=app_user,
             conn=conn,
         )
+
+
+def get_template_deletability(template_id: int) -> dict:
+    """
+    Can this template be deleted, and if not, why not? Returns
+    {"deletable": bool, "reason": str|None, "instance_count": int,
+     "version_count": int}.
+
+    Exists so the UI can DISABLE the delete control with a specific
+    reason rather than offering it and failing — "1 rotation instance
+    already generated" tells a controller what to do next, where a raw
+    trigger exception does not.
+
+    The authority is migrations/019's rotation_template_is_deletable(),
+    not this function. This one only mirrors it for display: the
+    database refuses regardless of what any caller believes, and
+    delete_template() below lets that refusal surface rather than
+    pre-empting it. A read here and a DELETE later are separate
+    statements, so this answer can go stale between them — which is
+    exactly why the trigger, not this, is the thing enforcing it.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT rotation_code, version FROM rotation_templates WHERE id = :id
+        """), {"id": template_id}).mappings().first()
+
+        if row is None:
+            return {"deletable": False, "reason": f"No template with id={template_id}",
+                    "instance_count": 0, "version_count": 0}
+
+        instance_count = conn.execute(text("""
+            SELECT COUNT(*) FROM rotation_instances WHERE template_id = :id
+        """), {"id": template_id}).scalar()
+
+        version_count = conn.execute(text("""
+            SELECT COUNT(*) FROM rotation_templates WHERE rotation_code = :code
+        """), {"code": row["rotation_code"]}).scalar()
+
+    if instance_count:
+        return {
+            "deletable": False,
+            "reason": (
+                f"{instance_count} rotation instance(s) have been generated from this "
+                f"template. Close it with an effective_until date, or supersede it with "
+                f"a new version — deleting it would orphan work already done."
+            ),
+            "instance_count": int(instance_count), "version_count": int(version_count),
+        }
+
+    if version_count > 1:
+        return {
+            "deletable": False,
+            "reason": (
+                f"{row['rotation_code']} has {version_count} versions. Only a sole-version "
+                f"template can be deleted: removing one version of a chain would leave its "
+                f"predecessor permanently closed, since effective_until can only be closed "
+                f"once. Supersede it with a new version instead."
+            ),
+            "instance_count": 0, "version_count": int(version_count),
+        }
+
+    return {"deletable": True, "reason": None,
+            "instance_count": 0, "version_count": int(version_count)}
+
+
+def delete_template(template_id: int, app_user: Optional[str] = None) -> str:
+    """
+    Deletes a template that has produced nothing. Returns the deleted
+    rotation_code.
+
+    Only for undoing a mistaken creation — a template referenced by
+    nothing, where there is no history to protect and therefore nothing
+    to lose. Anything with instances, or any version that is part of a
+    supersession chain, is refused; see migrations/019 for the full
+    reasoning and for why the rule lives in the trigger rather than in a
+    bypass.
+
+    This deliberately does NOT re-check deletability in Python before
+    issuing the DELETE. The trigger is the authority, and a check here
+    would be a TOCTOU gap (an instance can be created between the check
+    and the delete) that would also give a false impression that this
+    function is what enforces the rule. The DELETE simply runs; if the
+    trigger refuses, that exception is what the caller sees.
+
+    Legs go first: rotation_template_legs.template_id has no
+    ON DELETE CASCADE, so the parent row cannot go while they reference
+    it. Both statements share one transaction, so a refusal on either
+    leaves the template completely intact.
+
+    The audit record is written BEFORE the deletes, in the same
+    transaction. Writing it afterwards would be reading from a row that
+    no longer exists; writing it in a separate transaction would risk a
+    committed audit entry for a deletion that was then refused. Ordering
+    it first inside one transaction means it survives if and only if the
+    deletion does.
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT rotation_code, version FROM rotation_templates WHERE id = :id
+        """), {"id": template_id}).mappings().first()
+
+        if row is None:
+            raise ValueError(f"No template with id={template_id}")
+
+        log_audit(
+            action_type="ROTATION_TEMPLATE_DELETED",
+            original_state=f"{row['rotation_code']} v{int(row['version'])} (template_id={template_id})",
+            reason="Unused template deleted — no rotation instances generated",
+            app_user=app_user,
+            conn=conn,
+        )
+
+        conn.execute(text("DELETE FROM rotation_template_legs WHERE template_id = :id"),
+                     {"id": template_id})
+        conn.execute(text("DELETE FROM rotation_templates WHERE id = :id"),
+                     {"id": template_id})
+
+    return row["rotation_code"]
