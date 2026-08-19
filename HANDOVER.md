@@ -305,8 +305,52 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-18).
-  `auth-and-attribution` merged into `main`.** Authentication for
+- **⚠ DEPLOYMENT ORDERING — READ BEFORE DEPLOYING ANYTHING (2026-08-19).**
+  Two migrations are pending on the real Supabase database, and the
+  second one is a HARDER prerequisite than any migration before it:
+
+  - `migrations/018_users.sql` — every page now requires a login.
+    Deploying without also seeding the three OCC accounts via
+    `scripts/seed_users.py` locks the app for everyone.
+  - `migrations/019_allow_delete_unused_templates.sql` — **the page
+    calls `rotation_template_is_deletable()` on every render that lists
+    a sole-version template.** Against a pre-019 database
+    `pages/7_Schedule_Templates.py` **fails to render at all** — not
+    merely fails to delete. This is unlike 016/017 (new columns, absent
+    features degraded quietly) and unlike 018 (a gate that simply
+    blocks): here a missing migration takes a working page off the air.
+
+  Apply 018 and 019, then seed the accounts, then deploy. Production was
+  at 017 as of the flight-deck merge.
+
+- **No outstanding branches as of this snapshot (2026-08-19).
+  `schedule-template-fixes` merged into `main`.** Schedule Templates:
+  the widget-key data corruption that saved one template's legs into
+  another, HHMM UTC time entry replacing `st.time_input`, route
+  continuity validated at creation instead of days later at expansion,
+  and delete-when-unused for recovering from a mistaken creation. See
+  the dated log entry at the end of this file, including why the delete
+  needed no trigger bypass. **592/592 verified against real Postgres
+  16**, reachability clean. Merged, pushed; branch deleted, both remote
+  and local.
+
+  Took three real-Postgres rounds. The first (13 failures) and second
+  (1 failure) were entirely test-side — `migrations/019` was sound from
+  the first application, and the trigger rewrite never relaxed anything.
+  Round one's cause is the one worth remembering: a test helper omitted
+  two required arguments, so the whole delete and trigger-regression
+  suite failed at setup and **never executed**, which locally is
+  indistinguishable from skipping for want of Postgres. Same shape as
+  the two environment failures logged on 2026-08-18. Every service call
+  in the changed test files is now bind-checked against the real
+  signatures before pushing.
+
+  The database-level guarantee is proven still database-level:
+  `test_the_trigger_still_refuses_a_delete_that_bypasses_the_service`
+  issues a raw DELETE with no help from the service layer and expects
+  the database to refuse it.
+
+- **`auth-and-attribution` merged into `main` (2026-08-18).** Authentication for
   attribution — three fixed OCC accounts, PBKDF2 via stdlib `hashlib`,
   a `require_login()` gate in all 8 page files, and `app_user` threaded
   through 18 page call sites and 36 service-internal forwards, closing
@@ -5745,8 +5789,8 @@ remote and local. See the "Merge status as of this snapshot" paragraph
 near the top of this file.
 
 ## 2026-08-19: Schedule Templates — widget-key data corruption, HHMM
-## times, leg continuity, delete-when-unused. NOT YET MERGED
-## (branch `schedule-template-fixes`).
+## times, leg continuity, delete-when-unused. MERGED into `main`
+## 2026-08-19.
 
 Found in real use. An operator created EPE-786-787 (2 legs), then
 EPE-802-804-805 (3 legs) without reloading the page. The second
@@ -5973,3 +6017,35 @@ render that lists a sole-version template, so the page **requires
 `migrations/019`** — against a pre-019 database it fails to render at
 all, not merely to delete. 019 must be applied before this page is
 deployed.
+
+### 2026-08-19 (continued): green, and merged
+
+**592 passed, 0 failed against real Postgres 16.** Reachability clean.
+The four that carried the most risk all pass:
+
+- `test_the_trigger_still_refuses_a_delete_that_bypasses_the_service` —
+  the database guarantee is still enforced by the database, not
+  downgraded to an application convention when the pre-check moved into
+  the service.
+- `test_updating_a_template_leg_is_refused_even_when_the_template_is_deletable`
+  — deletable and mutable stayed separate; the relaxation the guard
+  rewrite could most easily have introduced did not occur.
+- `test_immutable_template_columns_are_still_refused` — the pre-existing
+  rule survived the rewrite.
+- `test_second_template_created_without_reload_does_not_inherit_the_first`
+  — the reported corruption, genuinely fixed, on the test that took two
+  rounds to actually execute.
+
+**Three real-Postgres rounds, and none of them found a fault in
+`migrations/019`.** It was sound from first application. Round 1 (13
+failures) and round 2 (1 failure) were both test-side. That is worth
+recording because it is the same lesson as 2026-08-18 from a different
+angle: the risk in this project has repeatedly been in whether a test
+*ran* and whether it asserted the *right thing*, not in the change under
+review. Round 1's helper-arity bug meant an entire suite never executed;
+round 2's failure was a correct refusal reported by the wrong guard.
+
+Merged into `main`, pushed; branch `schedule-template-fixes` deleted,
+both remote and local. See the "Merge status as of this snapshot"
+paragraph near the top of this file — including the deployment-ordering
+warning, which is a harder prerequisite than any previous migration.
