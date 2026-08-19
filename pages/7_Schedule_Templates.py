@@ -264,6 +264,14 @@ else:
                          disabled=not deletability["deletable"]):
                 try:
                     rts.delete_template(int(versions.iloc[0]["id"]), app_user=app_user)
+                except ValueError as e:
+                    # Already a controller-facing sentence naming the
+                    # actual blocker — same handling as every other
+                    # ValueError on this page. Reachable even though the
+                    # button is disabled when undeletable: the disabled
+                    # state is computed on the previous render, so an
+                    # instance created in between lands here.
+                    st.error(str(e))
                 except Exception as e:
                     st.error(f"Could not delete {code}: {e}")
                 else:

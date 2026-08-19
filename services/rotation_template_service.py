@@ -651,6 +651,70 @@ def reject_instance(instance_id: int, reason: Optional[str] = None,
         )
 
 
+def _deletability(conn, template_id: int) -> dict:
+    """Shared by get_template_deletability() and delete_template(), on a
+    caller-supplied connection so the latter can ask inside its own
+    transaction.
+
+    The BOOLEAN comes from migrations/019's own
+    rotation_template_is_deletable(), never from a Python
+    reimplementation of the rule. That matters: the trigger and this
+    answer must not be able to drift into disagreeing about what
+    "unused" means, and the only way to guarantee that is to ask the
+    same function the trigger asks. Python's job here is limited to
+    turning "false" into a sentence a controller can act on, which is
+    the one thing a BOOLEAN can't carry.
+    """
+    row = conn.execute(text("""
+        SELECT rotation_code, version FROM rotation_templates WHERE id = :id
+    """), {"id": template_id}).mappings().first()
+
+    if row is None:
+        return {"deletable": False, "reason": f"No template with id={template_id}",
+                "instance_count": 0, "version_count": 0}
+
+    deletable = bool(conn.execute(text(
+        "SELECT rotation_template_is_deletable(:id)"
+    ), {"id": template_id}).scalar())
+
+    instance_count = int(conn.execute(text("""
+        SELECT COUNT(*) FROM rotation_instances WHERE template_id = :id
+    """), {"id": template_id}).scalar())
+
+    version_count = int(conn.execute(text("""
+        SELECT COUNT(*) FROM rotation_templates WHERE rotation_code = :code
+    """), {"code": row["rotation_code"]}).scalar())
+
+    if deletable:
+        return {"deletable": True, "reason": None,
+                "instance_count": instance_count, "version_count": version_count}
+
+    if instance_count:
+        reason = (
+            f"{instance_count} rotation instance(s) have been generated from this "
+            f"template. Close it with an effective_until date, or supersede it with "
+            f"a new version — deleting it would orphan work already done."
+        )
+    elif version_count > 1:
+        reason = (
+            f"{row['rotation_code']} has {version_count} versions. Only a sole-version "
+            f"template can be deleted: removing one version of a chain would leave its "
+            f"predecessor permanently closed, since effective_until can only be closed "
+            f"once. Supersede it with a new version instead."
+        )
+    else:
+        # The function said no for a reason this code doesn't enumerate
+        # (e.g. a superseded_by reference from another code). Say so
+        # plainly rather than inventing an explanation.
+        reason = (
+            f"Template {row['rotation_code']} v{int(row['version'])} is referenced by "
+            f"other records and cannot be deleted."
+        )
+
+    return {"deletable": False, "reason": reason,
+            "instance_count": instance_count, "version_count": version_count}
+
+
 def get_template_deletability(template_id: int) -> dict:
     """
     Can this template be deleted, and if not, why not? Returns
@@ -662,57 +726,13 @@ def get_template_deletability(template_id: int) -> dict:
     already generated" tells a controller what to do next, where a raw
     trigger exception does not.
 
-    The authority is migrations/019's rotation_template_is_deletable(),
-    not this function. This one only mirrors it for display: the
-    database refuses regardless of what any caller believes, and
-    delete_template() below lets that refusal surface rather than
-    pre-empting it. A read here and a DELETE later are separate
-    statements, so this answer can go stale between them — which is
-    exactly why the trigger, not this, is the thing enforcing it.
+    This is a display query, not enforcement. It can go stale between
+    being read and a DELETE being issued; the trigger is what actually
+    refuses. See delete_template() for how the two layers relate.
     """
     engine = get_engine()
     with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT rotation_code, version FROM rotation_templates WHERE id = :id
-        """), {"id": template_id}).mappings().first()
-
-        if row is None:
-            return {"deletable": False, "reason": f"No template with id={template_id}",
-                    "instance_count": 0, "version_count": 0}
-
-        instance_count = conn.execute(text("""
-            SELECT COUNT(*) FROM rotation_instances WHERE template_id = :id
-        """), {"id": template_id}).scalar()
-
-        version_count = conn.execute(text("""
-            SELECT COUNT(*) FROM rotation_templates WHERE rotation_code = :code
-        """), {"code": row["rotation_code"]}).scalar()
-
-    if instance_count:
-        return {
-            "deletable": False,
-            "reason": (
-                f"{instance_count} rotation instance(s) have been generated from this "
-                f"template. Close it with an effective_until date, or supersede it with "
-                f"a new version — deleting it would orphan work already done."
-            ),
-            "instance_count": int(instance_count), "version_count": int(version_count),
-        }
-
-    if version_count > 1:
-        return {
-            "deletable": False,
-            "reason": (
-                f"{row['rotation_code']} has {version_count} versions. Only a sole-version "
-                f"template can be deleted: removing one version of a chain would leave its "
-                f"predecessor permanently closed, since effective_until can only be closed "
-                f"once. Supersede it with a new version instead."
-            ),
-            "instance_count": 0, "version_count": int(version_count),
-        }
-
-    return {"deletable": True, "reason": None,
-            "instance_count": 0, "version_count": int(version_count)}
+        return _deletability(conn, template_id)
 
 
 def delete_template(template_id: int, app_user: Optional[str] = None) -> str:
@@ -727,12 +747,31 @@ def delete_template(template_id: int, app_user: Optional[str] = None) -> str:
     reasoning and for why the rule lives in the trigger rather than in a
     bypass.
 
-    This deliberately does NOT re-check deletability in Python before
-    issuing the DELETE. The trigger is the authority, and a check here
-    would be a TOCTOU gap (an instance can be created between the check
-    and the delete) that would also give a false impression that this
-    function is what enforces the rule. The DELETE simply runs; if the
-    trigger refuses, that exception is what the caller sees.
+    Checks deletability BEFORE touching anything, and raises ValueError
+    with the human reason if it fails. An earlier version of this
+    function deliberately didn't, on the grounds that a Python check
+    would be a TOCTOU gap and would imply Python enforces the rule.
+    That reasoning was half right, and the half it got wrong showed up
+    in real use (2026-08-19):
+
+    Because legs are deleted first, the refusal for a template that IS
+    in use came from the LEGS trigger, so a controller clicking Delete
+    on a used template was told "rotation_template_legs rows are
+    immutable — create a new template version instead", which is true
+    and explains nothing about why THIS template can't go. The invariant
+    held perfectly; the message was about the wrong guard.
+
+    The TOCTOU concern is real but harmless here, because of the
+    direction the race can fail in: a pre-check can only ever produce a
+    better error message, never a permission. If an instance appears
+    between the check and the DELETE, the trigger still refuses, and the
+    caller sees the trigger's message — precisely the old behaviour. The
+    check can never turn a "no" into a "yes".
+
+    So the layering is: this check exists for the message, the trigger
+    is the truth. tests/test_rotation_template_service.py asserts a raw
+    SQL DELETE that bypasses this function entirely is still refused,
+    which is what keeps that claim honest.
 
     Legs go first: rotation_template_legs.template_id has no
     ON DELETE CASCADE, so the parent row cannot go while they reference
@@ -754,6 +793,13 @@ def delete_template(template_id: int, app_user: Optional[str] = None) -> str:
 
         if row is None:
             raise ValueError(f"No template with id={template_id}")
+
+        # Asked inside this transaction, and answered by the same SQL
+        # function the trigger consults — so the message a controller
+        # sees can't describe a different rule from the one enforced.
+        status = _deletability(conn, template_id)
+        if not status["deletable"]:
+            raise ValueError(status["reason"])
 
         log_audit(
             action_type="ROTATION_TEMPLATE_DELETED",

@@ -5923,3 +5923,53 @@ templates, and one existing template). That reproduces the exact
 ambiguity — 2 widgets per label once a template exists — and confirms
 every key lookup the tests use resolves to exactly one widget. A wrong
 key pattern would otherwise have failed the same way on the next round.
+
+### 2026-08-19 (continued): second round — 590 passed, 1 failed, and the message came from the wrong guard
+
+The delete and trigger-regression suite executed properly for the first
+time, including
+`test_updating_a_template_leg_is_refused_even_when_the_template_is_deletable`,
+which passes: an unused template is deletable and its legs are still
+immutable, which was the leak worth pinning.
+
+The single failure was not a security gap. Deleting a template that HAS
+instances was correctly refused — but by the **legs** trigger
+(`rotation_template_legs rows are immutable — create a new template
+version instead`), because `delete_template()` removes legs first and
+so never reached the template DELETE. The invariant held perfectly; the
+explanation was about the wrong guard. A controller clicking Delete on a
+rotation that is in use would have been told about leg immutability,
+which is true and says nothing about why that template can't go.
+
+**Fixed by checking deletability before touching anything**, which
+means reversing reasoning previously written into
+`delete_template()`'s own docstring — it argued against a pre-check on
+TOCTOU grounds and because it would imply Python enforces the rule. That
+was half right, and the half it got wrong is the direction the race can
+fail in: **a pre-check can only ever produce a better error message,
+never a permission.** If an instance appears between the check and the
+DELETE, the trigger still refuses and the caller sees the trigger's
+message — exactly the old behaviour. The check can never turn a "no"
+into a "yes". So the layering is: the check exists for the message, the
+trigger is the truth.
+
+To keep that claim honest rather than asserted,
+`test_the_trigger_still_refuses_a_delete_that_bypasses_the_service`
+issues the DELETE directly, as a hand-written recovery would, and
+expects the database to refuse with no help from the service layer.
+Without it, moving the check into Python would quietly turn a
+database-level guarantee into an application-level convention any other
+caller could sidestep.
+
+The decision itself now comes from `migrations/019`'s own
+`rotation_template_is_deletable()` rather than a Python
+reimplementation, so the message a controller sees cannot describe a
+different rule from the one enforced. Python's remaining job is turning
+"false" into a sentence, which is the one thing a BOOLEAN can't carry.
+
+**Deployment consequence, stronger than before:**
+`pages/7_Schedule_Templates.py` now calls that SQL function on every
+render that lists a sole-version template, so the page **requires
+`migrations/019`** — against a pre-019 database it fails to render at
+all, not merely to delete. 019 must be applied before this page is
+deployed.

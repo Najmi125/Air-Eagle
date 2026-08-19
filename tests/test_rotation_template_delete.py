@@ -224,7 +224,17 @@ def test_deleting_an_unused_template_writes_an_audit_record(_patch_engine):
 
 def test_template_with_instances_cannot_be_deleted(_patch_engine):
     """The case the guard exists for: expansion has produced drafts, so
-    there is history to protect."""
+    there is history to protect.
+
+    Asserts the message a CONTROLLER would actually see. The first
+    real-Postgres run of this test caught something worth keeping in
+    mind: the delete was correctly refused, but by the LEGS trigger
+    ("rotation_template_legs rows are immutable"), because
+    delete_template() removes legs first and so never reached the
+    template DELETE. The invariant held; the explanation was about the
+    wrong guard. delete_template() now checks deletability up front and
+    raises the real reason — see its docstring for why a pre-check can
+    only improve the message and never grant permission."""
     _create()
     template_id = _template_id(_patch_engine, "EPE-786-787")
     rts.expand_and_persist("EPE-786-787", dt.date(2026, 9, 1), dt.date(2026, 9, 7),
@@ -232,9 +242,15 @@ def test_template_with_instances_cannot_be_deleted(_patch_engine):
 
     assert rts.get_template_deletability(template_id)["deletable"] is False
 
-    with pytest.raises(DatabaseError) as excinfo:
+    with pytest.raises(ValueError) as excinfo:
         rts.delete_template(template_id, app_user="occ1")
-    assert "cannot be deleted" in str(excinfo.value)
+
+    message = str(excinfo.value)
+    assert "rotation instance" in message, (
+        "the refusal must explain that the template has been used, not "
+        "report leg immutability: %s" % message
+    )
+    assert "immutable" not in message
 
     with _patch_engine.connect() as conn:
         assert conn.execute(text(
@@ -244,21 +260,60 @@ def test_template_with_instances_cannot_be_deleted(_patch_engine):
 
 def test_a_refused_delete_leaves_the_legs_intact(_patch_engine):
     """delete_template() removes legs before the template, in one
-    transaction. If the template delete is refused, the legs must come
-    back — a partial delete would leave a template with no route, which
-    is worse than either outcome."""
+    transaction, so a refusal must leave the route intact — a partial
+    delete would leave a template with no legs, which is worse than
+    either outcome.
+
+    Since the pre-check was added this passes because nothing is
+    attempted rather than because a transaction rolled back. Kept
+    exactly as it is: the property a caller depends on is "a refused
+    delete changes nothing", and that must hold however it is achieved.
+    The rollback path is still covered by the raw-SQL backstop below,
+    which bypasses the pre-check entirely."""
     _create()
     template_id = _template_id(_patch_engine, "EPE-786-787")
     rts.expand_and_persist("EPE-786-787", dt.date(2026, 9, 1), dt.date(2026, 9, 7),
                             app_user="occ1")
 
-    with pytest.raises(DatabaseError):
+    with pytest.raises(ValueError):
         rts.delete_template(template_id, app_user="occ1")
 
     with _patch_engine.connect() as conn:
         assert conn.execute(text(
             "SELECT COUNT(*) FROM rotation_template_legs WHERE template_id = :id"
         ), {"id": template_id}).scalar() == len(LEGS)
+
+
+def test_the_trigger_still_refuses_a_delete_that_bypasses_the_service(_patch_engine):
+    """The claim delete_template()'s pre-check rests on: the trigger,
+    not Python, is what actually enforces this.
+
+    Without this test, moving the check into the service would quietly
+    turn a database-level guarantee into an application-level
+    convention that any other caller — a script, psql, a future service
+    — could sidestep. Issues the DELETE directly, exactly as a
+    hand-written recovery would, and expects the database to refuse it
+    with no help from the service layer."""
+    _create()
+    template_id = _template_id(_patch_engine, "EPE-786-787")
+    rts.expand_and_persist("EPE-786-787", dt.date(2026, 9, 1), dt.date(2026, 9, 7),
+                            app_user="occ1")
+
+    with pytest.raises(DatabaseError):
+        with _patch_engine.begin() as conn:
+            conn.execute(text("DELETE FROM rotation_template_legs WHERE template_id = :id"),
+                          {"id": template_id})
+
+    with pytest.raises(DatabaseError) as excinfo:
+        with _patch_engine.begin() as conn:
+            conn.execute(text("DELETE FROM rotation_templates WHERE id = :id"),
+                          {"id": template_id})
+    assert "cannot be deleted" in str(excinfo.value)
+
+    with _patch_engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM rotation_templates WHERE id = :id"
+        ), {"id": template_id}).scalar() == 1
 
 
 def test_a_superseded_version_cannot_be_deleted(_patch_engine):
@@ -279,8 +334,12 @@ def test_a_superseded_version_cannot_be_deleted(_patch_engine):
 
     for template_id in ids:
         assert rts.get_template_deletability(template_id)["deletable"] is False
-        with pytest.raises(DatabaseError):
+        with pytest.raises(ValueError) as excinfo:
             rts.delete_template(template_id, app_user="occ1")
+        assert "versions" in str(excinfo.value), (
+            "the refusal must name supersession as the blocker, not leg "
+            "immutability: %s" % excinfo.value
+        )
 
     with _patch_engine.connect() as conn:
         assert conn.execute(text(
