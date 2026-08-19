@@ -272,17 +272,36 @@ else:
 
 st.subheader("Create a new template")
 with st.form("create_template_form"):
-    ct_rotation_code = st.text_input("Rotation code *")
-    ct_description = st.text_input("Description")
-    ct_weekday_labels = st.multiselect("Days of week *", [label for label, _ in WEEKDAY_OPTIONS])
+    # Generation-keyed like the leg rows, and for the same reason: these
+    # fields were previously unkeyed, which does NOT mean stateless —
+    # Streamlit auto-keys them, so after a save the form still held the
+    # previous template's code, description and weekdays. The reported
+    # corruption was in the legs, but "wherever the controller didn't
+    # overwrite every field" applies just as much here; a description or
+    # a day-of-week silently carried into the next template is the same
+    # defect with a quieter symptom.
+    #
+    # Explicit keys also disambiguate these from the "create new
+    # version" form below, which renders widgets with identical labels
+    # ("Description", "Days of week *"). Label-based lookup cannot tell
+    # them apart once a template exists.
+    ct_prefix = f"ct_{st.session_state.template_form_generation}"
+
+    ct_rotation_code = st.text_input("Rotation code *", key=f"{ct_prefix}_rotation_code")
+    ct_description = st.text_input("Description", key=f"{ct_prefix}_description")
+    ct_weekday_labels = st.multiselect(
+        "Days of week *", [label for label, _ in WEEKDAY_OPTIONS], key=f"{ct_prefix}_days")
     ct_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in ct_weekday_labels]
-    ct_effective_from = st.date_input("Effective from *", value=dt.date.today())
-    ct_open_ended = st.checkbox("Open-ended (no end date)", value=True)
-    ct_effective_until = None if ct_open_ended else st.date_input("Effective until", value=dt.date.today())
-    ct_meal_provided = st.checkbox("Meal provided", value=True)
-    ct_snack_provided = st.checkbox("Snack provided", value=True)
+    ct_effective_from = st.date_input(
+        "Effective from *", value=dt.date.today(), key=f"{ct_prefix}_effective_from")
+    ct_open_ended = st.checkbox(
+        "Open-ended (no end date)", value=True, key=f"{ct_prefix}_open_ended")
+    ct_effective_until = None if ct_open_ended else st.date_input(
+        "Effective until", value=dt.date.today(), key=f"{ct_prefix}_effective_until")
+    ct_meal_provided = st.checkbox("Meal provided", value=True, key=f"{ct_prefix}_meal")
+    ct_snack_provided = st.checkbox("Snack provided", value=True, key=f"{ct_prefix}_snack")
     st.markdown("**Legs**")
-    ct_leg_rows = _render_leg_rows(f"ct_{st.session_state.template_form_generation}")
+    ct_leg_rows = _render_leg_rows(ct_prefix)
 
     ct_submitted = st.form_submit_button("Create template")
 

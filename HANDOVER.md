@@ -5868,3 +5868,58 @@ once. A rewrite of a guard is exactly where an unintended relaxation
 hides, and none of that would show up in a test of the new behaviour.
 Needs a real-Postgres run against a database already carrying 018 and
 real data before it goes near Supabase.
+
+### 2026-08-19 (continued): first real-Postgres round — 577 passed, 13 failed, all test-side
+
+**`migrations/019` is sound.** It applies cleanly, and the
+UPDATE-on-legs case was tested directly against the live rewritten
+trigger and is still refused, from
+`reject_rotation_template_legs_mutation()`. The silent relaxation that
+was the whole reason for pinning the old rules did not happen. All 13
+failures were in test code, from three causes:
+
+1. **The `_create()` helper omitted `meal_provided`/`snack_provided`,
+   which are REQUIRED parameters of `create_template()`.** Every test in
+   `test_rotation_template_delete.py` failed at setup, so **the entire
+   delete and trigger-regression suite never executed** — including the
+   test written specifically for the deletable-but-still-immutable leak.
+   This is the same shape as the two environment failures logged on
+   2026-08-18: a suite that cannot run reports nothing, and locally it
+   was indistinguishable from a suite that skipped for want of Postgres.
+   Every `rts.*` call across the changed test files is now bind-checked
+   against the real signatures with `inspect.signature().bind()` — the
+   technique that caught two such bugs during the auth work, applied
+   this time to all calls rather than only the reported one.
+
+2. **`test_rotation_template_legs_delete_is_rejected` encoded behaviour
+   `migrations/019` deliberately changed** — it asserted legs deletion
+   is refused unconditionally. Rewritten as a pair, so the file
+   documents the new rule in both directions: refused once the template
+   has instances, permitted while it has none.
+
+   Found while fixing it: **`test_rotation_templates_delete_is_rejected`
+   was still PASSING, for the wrong reason.** It deleted the template
+   while its legs were still present, so the legs' foreign key raised
+   before the guard was ever consulted. It read as proof the guard
+   refuses and was actually proof that a foreign key does. Now it
+   removes the legs first so the DELETE reaches the guard, and asserts
+   the guard's own message.
+
+3. **Label lookup was ambiguous.** The create form and the
+   "create new version" form both render "Description" and
+   "Days of week *", so the regression test for the reported bug — the
+   one that most needed to run — failed on `found 2`. The create form's
+   non-leg widgets had no keys at all, which is not the same as being
+   stateless: Streamlit auto-keys them, so after a save the form still
+   held the previous template's code, description and weekdays. That is
+   the reported defect with a quieter symptom, so they are now
+   generation-keyed like everything else, which fixes the staleness and
+   the ambiguity together.
+
+**Verified DB-free before pushing**, since the tests that matter still
+skip locally: the real page was run through AppTest with
+`rotation_template_service` faked in memory, in both states (no
+templates, and one existing template). That reproduces the exact
+ambiguity — 2 widgets per label once a template exists — and confirms
+every key lookup the tests use resolves to exactly one widget. A wrong
+key pattern would otherwise have failed the same way on the next round.

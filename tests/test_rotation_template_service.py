@@ -198,9 +198,20 @@ def test_rotation_template_legs_update_is_rejected(_patch_engine):
             """), {"template_id": template_id})
 
 
-def test_rotation_template_legs_delete_is_rejected(_patch_engine):
+def test_rotation_template_legs_delete_is_rejected_once_the_template_is_used(_patch_engine):
+    """UPDATED for migrations/019 (2026-08-19). This asserted that legs
+    deletion is refused unconditionally; that is deliberately no longer
+    the rule. DELETE is now permitted for a template that has produced
+    nothing, so the guard protects history rather than protecting
+    everything — see migrations/019 for why the condition lives in the
+    trigger instead of behind a bypass.
+
+    The rule that remains, and that this test now pins: once the
+    template has produced instances, its legs are undeletable."""
     engine = _patch_engine
     template_id = _create_domestic_template()
+    rts.expand_and_persist("EPE-786-787", dt.date(2026, 1, 1), dt.date(2026, 1, 7))
+
     with pytest.raises(DatabaseError):
         with engine.begin() as conn:
             conn.execute(text("""
@@ -208,12 +219,44 @@ def test_rotation_template_legs_delete_is_rejected(_patch_engine):
             """), {"template_id": template_id})
 
 
-def test_rotation_templates_delete_is_rejected(_patch_engine):
+def test_rotation_template_legs_delete_is_permitted_when_the_template_is_unused(_patch_engine):
+    """The other half of the same change, so this file documents the
+    new rule in both directions rather than only where it still
+    refuses."""
     engine = _patch_engine
     template_id = _create_domestic_template()
-    with pytest.raises(DatabaseError):
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM rotation_template_legs WHERE template_id = :template_id
+        """), {"template_id": template_id})
+
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT COUNT(*) FROM rotation_template_legs WHERE template_id = :id
+        """), {"id": template_id}).scalar() == 0
+
+
+def test_rotation_templates_delete_is_rejected_once_the_template_is_used(_patch_engine):
+    """UPDATED for migrations/019, and worth explaining because the old
+    version of this test still PASSED after the migration — for the
+    wrong reason. It deleted the template while its legs were still
+    present, so the legs' foreign key raised before the guard was ever
+    consulted. It looked like proof the guard refuses, and was actually
+    proof that a foreign key does.
+
+    This version removes the legs first, so the DELETE reaches the
+    guard, and gives the template real instances so the guard is the
+    thing refusing it."""
+    engine = _patch_engine
+    template_id = _create_domestic_template()
+    rts.expand_and_persist("EPE-786-787", dt.date(2026, 1, 1), dt.date(2026, 1, 7))
+
+    with pytest.raises(DatabaseError) as excinfo:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM rotation_templates WHERE id = :id"), {"id": template_id})
+
+    assert "cannot be deleted" in str(excinfo.value)
 
 
 def test_rotation_templates_arbitrary_update_is_rejected(_patch_engine):

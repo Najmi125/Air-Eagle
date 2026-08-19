@@ -80,6 +80,24 @@ def _by_key(elements, key):
     return matches[0]
 
 
+def _ct(elements, field):
+    """A create-form widget by key, ignoring the generation segment.
+
+    Label-based lookup is ambiguous here: the "create new version" form
+    renders widgets with identical labels ("Description",
+    "Days of week *"), so any test that creates a template and then
+    interacts with the create form again hits two matches. Keys are
+    "ct_{generation}_{field}" and the cv form's are
+    "cv_{code}_{generation}_{field}", so they are distinguishable."""
+    pattern = re.compile(rf"^ct_\d+_{re.escape(field)}$")
+    matches = [e for e in elements if e.key and pattern.match(e.key)]
+    assert len(matches) == 1, (
+        f"expected exactly one create-form widget matching {pattern.pattern!r}, "
+        f"found {[e.key for e in elements if e.key]}"
+    )
+    return matches[0]
+
+
 def _leg(at, field, index, prefix="ct"):
     """A leg widget, located WITHOUT hardcoding the form-generation
     segment of its key.
@@ -135,9 +153,9 @@ def test_create_template_via_form_writes_real_data(page_app):
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("EPE-786-787")
-    _by_label(at.text_input, "Description").input("KHI-LHE-KHI domestic")
-    _by_label(at.multiselect, "Days of week *").select("Mon").select("Tue")
+    _ct(at.text_input, "rotation_code").input("EPE-786-787")
+    _ct(at.text_input, "description").input("KHI-LHE-KHI domestic")
+    _ct(at.multiselect, "days").select("Mon").select("Tue")
     _fill_leg(at, 0, "EPE 786", "KHI", "LHE", "1900", "2045")
     _fill_leg(at, 1, "EPE 787", "LHE", "KHI", "2200", "2345")
 
@@ -155,8 +173,8 @@ def test_create_template_partial_leg_row_shows_error_and_writes_nothing(page_app
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("BAD-ROTATION")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("BAD-ROTATION")
+    _ct(at.multiselect, "days").select("Mon")
     _leg(at, "flightno", 0).input("EPE 999")  # origin/destination/times left blank
 
     at = _click(at, "Create template")
@@ -348,8 +366,8 @@ def test_second_template_created_without_reload_does_not_inherit_the_first(page_
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("EPE-786-787")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("EPE-786-787")
+    _ct(at.multiselect, "days").select("Mon")
     _fill_leg(at, 0, "EPE 786", "KHI", "LHE", "1900", "2045")
     _fill_leg(at, 1, "EPE 787", "LHE", "KHI", "2200", "2345")
     at = _click(at, "Create template")
@@ -357,8 +375,8 @@ def test_second_template_created_without_reload_does_not_inherit_the_first(page_
 
     # Second template, no reload — a genuinely different route, and one
     # more leg than the first.
-    _by_label(at.text_input, "Rotation code *").input("EPE-802-804-805")
-    _by_label(at.multiselect, "Days of week *").select("Tue")
+    _ct(at.text_input, "rotation_code").input("EPE-802-804-805")
+    _ct(at.multiselect, "days").select("Tue")
     _fill_leg(at, 0, "EPE 802", "KHI", "LHE", "0100", "0300")
     _fill_leg(at, 1, "EPE 804", "LHE", "DWC", "0430", "0800")
     _fill_leg(at, 2, "EPE 805", "DWC", "KHI", "0900", "1100")
@@ -390,8 +408,8 @@ def test_create_form_is_blank_after_a_successful_save(page_app):
     is saved, the next render's leg widgets must come up empty rather
     than showing what was just submitted."""
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("EPE-786-787")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("EPE-786-787")
+    _ct(at.multiselect, "days").select("Mon")
     _fill_leg(at, 0, "EPE 786", "KHI", "LHE", "1900", "2045")
     _fill_leg(at, 1, "EPE 787", "LHE", "KHI", "2200", "2345")
 
@@ -412,8 +430,8 @@ def test_leg_with_times_but_no_route_is_reported_not_silently_dropped(page_app):
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("PARTIAL-ROW")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("PARTIAL-ROW")
+    _ct(at.multiselect, "days").select("Mon")
     _fill_leg(at, 0, "EPE 786", "KHI", "LHE", "1900", "2045")
     _leg(at, "dep", 1).input("0900")   # times only, no route
     _leg(at, "arr", 1).input("1100")
@@ -431,8 +449,8 @@ def test_invalid_hhmm_is_rejected_with_a_specific_message(page_app):
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("BAD-TIME")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("BAD-TIME")
+    _ct(at.multiselect, "days").select("Mon")
     _fill_leg(at, 0, "EPE 786", "KHI", "LHE", "2465", "2045")
 
     at = _click(at, "Create template")
@@ -447,8 +465,8 @@ def test_times_accept_hhmm_without_a_separator(page_app):
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("HHMM-FORM")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("HHMM-FORM")
+    _ct(at.multiselect, "days").select("Mon")
     _fill_leg(at, 0, "EPE 786", "KHI", "LHE", "0905", "1130")
 
     at = _click(at, "Create template")
@@ -465,8 +483,8 @@ def test_disconnected_legs_are_rejected_at_creation(page_app):
     from services import rotation_template_service as rts
 
     at = page_app.run()
-    _by_label(at.text_input, "Rotation code *").input("BROKEN-ROUTE")
-    _by_label(at.multiselect, "Days of week *").select("Mon")
+    _ct(at.text_input, "rotation_code").input("BROKEN-ROUTE")
+    _ct(at.multiselect, "days").select("Mon")
     _fill_leg(at, 0, "EPE 802", "KHI", "LHE", "0100", "0300")
     _fill_leg(at, 1, "EPE 804", "DWC", "KHI", "0430", "0800")
 

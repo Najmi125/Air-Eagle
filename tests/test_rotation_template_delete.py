@@ -47,9 +47,15 @@ def _patch_engine(_patch_all_service_engines):
 
 
 def _create(code="EPE-786-787", effective_from=dt.date(2026, 9, 1)):
+    # meal_provided/snack_provided are REQUIRED parameters of
+    # create_template(), not optional ones. Omitting them made every
+    # test in this file fail at setup, so the whole delete and
+    # trigger-regression suite silently never ran on its first
+    # real-Postgres round (2026-08-19).
     return rts.create_template(
         rotation_code=code, days_of_week=DAYS, legs=LEGS,
-        effective_from=effective_from, app_user="occ1",
+        effective_from=effective_from, meal_provided=True, snack_provided=True,
+        app_user="occ1",
     )
 
 
@@ -262,7 +268,8 @@ def test_a_superseded_version_cannot_be_deleted(_patch_engine):
     _create()
     rts.create_new_version(
         rotation_code="EPE-786-787", days_of_week=DAYS, legs=LEGS,
-        effective_from=dt.date(2026, 10, 1), app_user="occ1",
+        effective_from=dt.date(2026, 10, 1), meal_provided=True, snack_provided=True,
+        app_user="occ1",
     )
 
     with _patch_engine.connect() as conn:
