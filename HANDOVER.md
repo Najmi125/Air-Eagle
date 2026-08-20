@@ -6111,3 +6111,73 @@ a version guard) — worth doing on its own merits, since tests running on
 a different interpreter from production is a real latent risk, but it
 would **not** have caught this outage and is not being presented as the
 fix for it.
+
+## 2026-08-19 (continued): the review table showed the wrong duty window
+
+Draft expansion was correct — right rotations, right dates, full routes —
+but the review table displayed **first-departure and last-arrival** under
+headings "Report" and "Debrief". Those are not the same thing: ANO-012
+D7.1.2 adds a pre-flight and post-flight buffer either side.
+
+Real production rotations:
+
+| rotation | table showed | actual duty | buffers |
+|---|---|---|---|
+| domestic | 19:00 → 23:45 | **18:15 → 00:00** | 45 / 15 |
+| international | 01:45 → 11:00 | **00:45 → 11:30** | 60 / 30 |
+
+A controller judging whether a rotation is flyable read the FDP as about
+an hour shorter than it is, and the draft contradicted what the Roster
+page showed for the same rotation once crewed. **Display only** — the
+stored data was right, and `rotation_instances` correctly holds no
+report/debrief, since FDP is a property of a duty and a draft has no
+crew.
+
+**Relabelling to "First dep"/"Last arr" was rejected.** It would have
+been honest and trivial, but the duty window is the thing actually worth
+reviewing — a controller looking at a draft is asking "is this flyable",
+and first-departure does not answer that.
+
+`rotation_template_service.compute_duty_window(legs)` computes it via
+`core.duty_builder.build_duty()`. The calculation lives in the service
+rather than the page for a specific reason: `build_duty()` takes ONE
+duty-level `domestic` flag while legs carry one each, and
+`assignment_service` resolves that with `all(bool(leg["domestic"]))` at
+five separate sites — a duty is domestic only if EVERY leg is, so one
+international sector applies the longer 60/30 buffers to the whole duty.
+Re-deriving that in a page would have been a sixth copy of a rule the
+page has no business knowing, and getting it wrong understates the
+window, which is the very direction of error being fixed. Routing
+through `build_duty()` also means the draft review and the Roster page
+now agree **by construction** rather than by two copies of the same
+arithmetic.
+
+It returns `None` rather than raising, and the page shows "—":
+`build_duty()` raises on out-of-order legs, and a display value must
+never be able to take the review table down — the same lesson as the
+delete affordance earlier the same day. Both production figures are
+pinned as DB-free tests, along with the mixed-domestic case.
+
+### Two smaller findings from the same session
+
+**Text fields needed Enter before submitting.** Filling several leg
+fields and clicking submit without pressing Enter on the last left it
+uncommitted, and the page then reported "Leg 1 is partially filled —
+missing origin, destination, departure time, arrival time". The message
+was good; it pointed at the wrong cause. This only ever affected the
+"create new version" section, which used a bare `st.button` — the create
+form above has always been an `st.form`, which is why the same leg
+widgets behave correctly there. Replacing `st.time_input` with text
+entry is what exposed it: a time input commits on selection, a text
+input only on Enter or blur. That section is now an `st.form` so its
+fields commit together. `effective_from` stays outside it (it drives the
+live "this will end version N on …" preview), and so do
+`open_ended`/`effective_until` — a checkbox inside a form doesn't take
+effect until submit, so the conditional date field would not have
+appeared until after a first submit.
+
+**The delete control had no signposting.** It sat immediately below the
+"Show all versions' legs" checkbox with nothing between them, so a
+destructive action read as part of a display toggle — and the expander
+itself is labelled only with the rotation code. Now separated by a
+divider under its own "Delete this template" heading.

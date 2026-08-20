@@ -31,6 +31,7 @@ from db.db import get_engine
 from services.audit_service import log_audit
 from services import flight_service
 from core.rotation_expansion import TemplateLeg, expand_template
+from core.duty_builder import FlightLeg, build_duty
 
 REQUIRED_TEMPLATE_FIELDS = {"rotation_code", "days_of_week", "effective_from"}
 
@@ -815,3 +816,65 @@ def delete_template(template_id: int, app_user: Optional[str] = None) -> str:
                      {"id": template_id})
 
     return row["rotation_code"]
+
+
+def compute_duty_window(legs: pd.DataFrame) -> Optional[tuple]:
+    """The real duty window for a set of rotation_instance_legs:
+    (report_time, debrief_time), or None if it can't be computed.
+
+    Takes the legs DataFrame the caller already has rather than an
+    instance_id, so the review table doesn't issue a second query per
+    row.
+
+    Exists because the draft review table was displaying first-departure
+    and last-arrival under headings "Report" and "Debrief" (2026-08-19).
+    Those are not the same thing: ANO-012 D7.1.2 adds a pre-flight and
+    post-flight buffer either side. A real domestic rotation showed
+    19:00->23:45 where the duty is actually 18:15->00:00, and an
+    international showed 01:45->11:00 where the duty is 00:45->11:30 —
+    so a controller judging whether a rotation is flyable read the FDP
+    as an hour shorter than it is, and the draft contradicted what the
+    Roster page showed for the same rotation once crewed.
+
+    Routing through build_duty() rather than adding 45/15/60/30 here is
+    the point: the draft review and the roster now agree BY
+    CONSTRUCTION, because they are the same calculation. Duplicating the
+    buffer arithmetic would let them drift apart again, which is the
+    bug this fixes.
+
+    This lives in the service, not the page, chiefly for the `domestic`
+    aggregation. build_duty() takes ONE duty-level flag while legs carry
+    one each, and assignment_service resolves that with
+    all(bool(leg["domestic"])) at five separate sites: a duty counts as
+    domestic only if EVERY leg is, so any international sector applies
+    the longer 60/30 buffers to the whole duty. Re-deriving that in a
+    page would be a sixth copy of a rule the page has no business
+    knowing, and getting it wrong understates the duty window — the same
+    direction of error this function exists to correct.
+
+    Returns None rather than raising. build_duty() raises ValueError on
+    empty or out-of-order legs, and a draft is exactly the place
+    odd-looking data can reach: this is a DISPLAY value, and a display
+    value must never be able to take the review table down. The caller
+    shows a placeholder instead. (Learned the hard way the same day —
+    see pages/7_Schedule_Templates.py's delete affordance.)
+    """
+    if legs is None or legs.empty:
+        return None
+
+    try:
+        flight_legs = [
+            FlightLeg(
+                dep_time=row["dep_time_planned"],
+                arr_time=row["arr_time_planned"],
+                origin=row["origin"],
+                destination=row["destination"],
+            )
+            for _, row in legs.iterrows()
+        ]
+        domestic = all(bool(row["domestic"]) for _, row in legs.iterrows())
+        result = build_duty(flight_legs, domestic=domestic)
+    except Exception:
+        return None
+
+    return result.report_time, result.debrief_time
