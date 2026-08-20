@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
 import pytest
 from db.db import get_engine
 from tests.conftest import authed_app_test
@@ -524,3 +525,119 @@ def test_delete_is_disabled_with_a_reason_once_the_template_is_used(page_app):
     assert delete_buttons[0].disabled is True
     assert any("rotation instance" in c.value for c in at.caption)
     assert rts.get_all_rotation_codes() == ["EPE-786-787"]
+
+
+# ------------------------------------------------------------------
+# The delete affordance must never take the page down (2026-08-19)
+# ------------------------------------------------------------------
+#
+# These need no database: every rotation_template_service call the page
+# makes is faked, so they run in any environment. That is deliberate.
+# The failure they guard against was found on a LIVE deployment, not by
+# the suite, because everything covering this page is DB-gated and skips
+# wherever Postgres is absent.
+
+from streamlit.testing.v1 import AppTest  # noqa: E402
+from tests.conftest import page_path      # noqa: E402
+
+_FAKE_VERSIONS = pd.DataFrame([{
+    "id": 1, "rotation_code": "EPE-786-787", "version": 1,
+    "effective_from": dt.date(2026, 1, 1), "effective_until": None,
+    "description": "KHI-LHE", "days_of_week": [1, 2, 3, 4, 5],
+    "meal_provided": True, "snack_provided": True, "superseded_by": None,
+}])
+_FAKE_LEGS = pd.DataFrame([{
+    "leg_order": 1, "flight_no": "EPE 786", "origin": "KHI", "destination": "LHE",
+    "dep_time": dt.time(19, 0), "arr_time": dt.time(20, 45),
+    "day_offset": 0, "domestic": True,
+}])
+_FAKE_INSTANCES = pd.DataFrame(
+    columns=["id", "rotation_code", "rotation_date", "status", "template_id"])
+
+
+@pytest.fixture
+def faked_rts(monkeypatch):
+    """Every service call the page makes, answered from memory."""
+    from services import rotation_template_service as rts
+
+    monkeypatch.setattr(rts, "get_all_rotation_codes", lambda: ["EPE-786-787"])
+    monkeypatch.setattr(rts, "get_versions", lambda code: _FAKE_VERSIONS.copy())
+    monkeypatch.setattr(rts, "get_template_legs", lambda tid: _FAKE_LEGS.copy())
+    monkeypatch.setattr(rts, "get_instances", lambda **kw: _FAKE_INSTANCES.copy())
+    monkeypatch.setattr(rts, "get_instance_legs", lambda iid: _FAKE_LEGS.copy())
+    return rts
+
+
+def _render_page():
+    at = AppTest.from_file(str(page_path("pages/7_Schedule_Templates.py")))
+    at.session_state["app_user"] = "occ1"
+    at.run()
+    return at
+
+
+def _assert_page_is_usable(at):
+    """The page's actual job: view templates, expand a window, review
+    drafts. None of it depends on the delete affordance."""
+    assert not at.exception, f"page failed to render: {at.exception}"
+    assert any("Schedule Templates" in t.value for t in at.title)
+    assert any(b.label == "Expand window" for b in at.button), (
+        "the expand workflow must survive a delete-affordance failure"
+    )
+
+
+def test_page_renders_when_the_deletability_lookup_is_missing_entirely(faked_rts, monkeypatch):
+    """The live outage, reproduced (2026-08-19).
+
+    Streamlit re-executes the page script on every rerun but keeps
+    imported modules in sys.modules for the life of the process, so a
+    page updated without a full restart can call into a stale module
+    object. The page called a service function added in the same commit,
+    got AttributeError, and the ENTIRE page stopped rendering — the
+    operator could not view, create, expand or review anything, nor
+    clean up the templates this feature exists to remove.
+
+    A greyed-out button is not worth a page."""
+    monkeypatch.delattr(faked_rts, "get_template_deletability", raising=False)
+
+    at = _render_page()
+
+    _assert_page_is_usable(at)
+    delete = [b for b in at.button if b.label == "Delete template"]
+    assert len(delete) == 1 and delete[0].disabled is True
+    assert any("could not be determined" in c.value for c in at.caption), (
+        "a degraded delete control must say so, not look like an ordinary "
+        "undeletable template"
+    )
+
+
+def test_page_renders_against_a_database_without_migration_019(faked_rts, monkeypatch):
+    """get_template_deletability() calls migrations/019's
+    rotation_template_is_deletable(). Before this degradation existed,
+    a pre-019 database made the page fail to RENDER rather than merely
+    fail to delete — a missing migration taking a working page off the
+    air. It now renders with delete unavailable, which is the right
+    behaviour for a database predating the feature."""
+    def missing_function(_template_id):
+        raise RuntimeError(
+            "function rotation_template_is_deletable(integer) does not exist")
+
+    monkeypatch.setattr(faked_rts, "get_template_deletability", missing_function)
+
+    at = _render_page()
+
+    _assert_page_is_usable(at)
+    assert any("could not be determined" in c.value for c in at.caption)
+
+
+def test_delete_control_is_enabled_normally_when_the_lookup_succeeds(faked_rts, monkeypatch):
+    """The degradation must not swallow the healthy path — without this,
+    a permanently broken lookup would look exactly like a working one."""
+    monkeypatch.setattr(faked_rts, "get_template_deletability", lambda tid: {
+        "deletable": True, "reason": None, "instance_count": 0, "version_count": 1})
+
+    at = _render_page()
+
+    _assert_page_is_usable(at)
+    delete = [b for b in at.button if b.label == "Delete template"]
+    assert len(delete) == 1 and delete[0].disabled is False
+    assert not any("could not be determined" in c.value for c in at.caption)

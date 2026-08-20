@@ -312,13 +312,14 @@ forward.
   - `migrations/018_users.sql` — every page now requires a login.
     Deploying without also seeding the three OCC accounts via
     `scripts/seed_users.py` locks the app for everyone.
-  - `migrations/019_allow_delete_unused_templates.sql` — **the page
-    calls `rotation_template_is_deletable()` on every render that lists
-    a sole-version template.** Against a pre-019 database
-    `pages/7_Schedule_Templates.py` **fails to render at all** — not
-    merely fails to delete. This is unlike 016/017 (new columns, absent
-    features degraded quietly) and unlike 018 (a gate that simply
-    blocks): here a missing migration takes a working page off the air.
+  - `migrations/019_allow_delete_unused_templates.sql` — needed for the
+    delete control to work. **SOFTENED 2026-08-19:** this previously
+    said a pre-019 database made `pages/7_Schedule_Templates.py` fail to
+    render at all. That was accurate when written and is no longer true:
+    the deletability lookup is now wrapped, so a pre-019 database
+    renders the page normally with delete shown disabled and the reason
+    given. Still apply 019 — without it the feature is unavailable — but
+    a missing migration no longer takes the page off the air.
 
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
@@ -6049,3 +6050,64 @@ Merged into `main`, pushed; branch `schedule-template-fixes` deleted,
 both remote and local. See the "Merge status as of this snapshot"
 paragraph near the top of this file — including the deployment-ordering
 warning, which is a harder prerequisite than any previous migration.
+
+## 2026-08-19 (continued): the deployed page went down, and it was not the Python version
+
+`migrations/019` applied to Supabase cleanly (`Applied: 20, Pending: 0`),
+and the deployed Schedule Templates page then crashed on render with
+`AttributeError` at the deletability lookup. The page was **down for the
+operator** — unable to view, create, expand or review anything, and
+unable to clean up the very templates the delete feature exists to
+remove.
+
+**The reported hypothesis was that `pandas 3.0.5` behaves differently at
+`versions.iloc[0]["id"]` on Streamlit Cloud's Python 3.12 than on the
+local venv's 3.14. That is disproven.** A 3.12 venv built from
+`requirements.lock` gives byte-identical results for `read_sql`,
+`.iloc[0]["id"]`, `int()`, and `_deletability()`'s `.mappings().first()`
+row access. The full suite also passes on 3.12 with exactly the same
+numbers as on 3.14 (238 passed, 357 skipped). The DataFrame layer and
+the interpreter version are both uninvolved.
+
+**What actually fits every fact.** `get_versions()` and
+`get_template_legs()` on the same `rts` module succeed earlier in the
+same render, so the module imported fine — which leaves
+`rts.get_template_deletability` itself absent at runtime. Both files ship
+in the same commit (`4a646da`), so they agree on disk. The mechanism is a
+**stale module object**: Streamlit re-executes the page script on every
+rerun but keeps imported modules in `sys.modules` for the life of the
+process, so a page updated without a full process restart calls into the
+previously loaded module. This was the first deploy where a page calls a
+**newly added** service function, which is why it is the first to fail
+this way — earlier deploys changed existing functions' signatures, which
+a restart happened to cover. Confirm from the app log's message text; a
+reboot resolves it.
+
+**The durable fix is not the diagnosis, it's the blast radius.** Whatever
+made the lookup fail, a convenience that decides whether one button is
+greyed out should never be able to take down the page that lists the
+schedules. The lookup is now wrapped: on any failure the delete control
+is shown disabled **with the reason**, and everything else renders. Not
+silent — a degraded control says so rather than looking like an ordinary
+undeletable template.
+
+That also removes the hard migration prerequisite this call had
+introduced, so the deployment-ordering warning near the top of this file
+is now softer than when it was written.
+
+**Why the suite didn't catch it, which is the part worth keeping.** Every
+test covering this page was DB-gated and skips wherever Postgres is
+absent — so nothing anywhere had ever rendered this page in an
+environment without a database, which is precisely the condition that
+broke. The three new regression tests are deliberately **DB-free**: they
+fake the service layer, render the real page, and assert it survives the
+attribute being missing entirely (the actual outage) and a pre-019
+database. Mutation-tested: both fail without the wrap. This is the third
+time in three pieces that the gap was "the test could not run here",
+after the Streamlit version drift and the `openpyxl` absence.
+
+**Python 3.12 alignment** is being handled separately (`runtime.txt` plus
+a version guard) — worth doing on its own merits, since tests running on
+a different interpreter from production is a real latent risk, but it
+would **not** have caught this outage and is not being presented as the
+fix for it.
