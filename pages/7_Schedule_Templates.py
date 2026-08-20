@@ -31,6 +31,55 @@ WEEKDAY_LABELS = {n: label for label, n in WEEKDAY_OPTIONS}
 LEG_ROW_COUNT = 5
 LEG_COLUMN_WIDTHS = [1.3, 1, 1, 1, 1, 0.9, 1.4]
 
+# Bumped after every successful create/version save, and threaded into
+# every leg widget key below. A Streamlit widget's value= is only
+# honored the FIRST time a given key renders, so a fixed key means the
+# NEXT template's form silently opens carrying the PREVIOUS one's
+# values wherever the controller doesn't overwrite every field.
+#
+# That is not hypothetical: on 2026-08-19 an operator created EPE-786-787
+# (2 legs) and then EPE-802-804-805 (3 legs) without reloading, and the
+# second template saved leg 2 with the first's route and times
+# (LHE->KHI 22:00-23:45 domestic instead of LHE->DWC 04:30-08:00
+# international). Recovering from it required manually disabling the
+# database immutability triggers — see migrations/019.
+#
+# Same fix, same reason, as st.session_state.assistant_generation on
+# pages/5_Assistant.py. Both forms share this one counter: they are
+# never on screen for the same submission, and one counter means there
+# is no second place to forget to bump.
+if "template_form_generation" not in st.session_state:
+    st.session_state.template_form_generation = 0
+
+
+def _parse_hhmm(raw: str):
+    """'0905'/'09:05' -> dt.time(9, 5). Returns (time, None) or
+    (None, message).
+
+    Text rather than st.time_input, at the operator's request
+    (2026-08-19): a dropdown is slow for four times per rotation, and
+    controllers already write times as 0905. The empty string is a real
+    value here and NOT an error — it is what makes an untouched leg row
+    distinguishable from a filled one, which st.time_input could never
+    express because it always yields a value (00:00 by default). That
+    distinction is what fixes the silently-skipped leg below.
+    """
+    text_value = (raw or "").strip().replace(":", "")
+    if not text_value:
+        return None, None
+    if not (text_value.isdigit() and len(text_value) == 4):
+        return None, f"{raw.strip()!r} is not a valid time — use 24-hour HHMM, e.g. 0905"
+    hours, minutes = int(text_value[:2]), int(text_value[2:])
+    if hours > 23 or minutes > 59:
+        return None, f"{raw.strip()!r} is not a valid 24-hour time — hours 00-23, minutes 00-59"
+    return dt.time(hours, minutes), None
+
+
+def _format_hhmm(value) -> str:
+    """A stored dt.time back to the HHMM the controller typed, for
+    pre-filling the 'create new version' form."""
+    return value.strftime("%H%M") if value else ""
+
 
 def _render_leg_rows(key_prefix: str, defaults: list | None = None) -> list[dict]:
     """Fixed 5 blank rows, not dynamic add/remove — real rotations are
@@ -60,15 +109,16 @@ def _render_leg_rows(key_prefix: str, defaults: list | None = None) -> list[dict
         flight_no = cols[0].text_input("Flight no.", value=d.get("flight_no", "") or "", key=f"{key_prefix}_flightno_{i}")
         origin = cols[1].text_input("Origin", value=d.get("origin", "") or "", key=f"{key_prefix}_origin_{i}")
         destination = cols[2].text_input("Destination", value=d.get("destination", "") or "", key=f"{key_prefix}_dest_{i}")
-        dep_time = cols[3].time_input("Dep time", value=d.get("dep_time") or dt.time(0, 0), key=f"{key_prefix}_dep_{i}")
-        arr_time = cols[4].time_input("Arr time", value=d.get("arr_time") or dt.time(0, 0), key=f"{key_prefix}_arr_{i}")
+        dep_time = cols[3].text_input("Dep (UTC HHMM)", value=_format_hhmm(d.get("dep_time")), key=f"{key_prefix}_dep_{i}")
+        arr_time = cols[4].text_input("Arr (UTC HHMM)", value=_format_hhmm(d.get("arr_time")), key=f"{key_prefix}_arr_{i}")
         day_offset = cols[5].number_input("Day offset", min_value=0, value=int(d.get("day_offset", 0)), step=1, key=f"{key_prefix}_offset_{i}")
         domestic_index = 0 if d.get("domestic", True) else 1
         domestic = cols[6].radio("Domestic/Intl", ["Domestic", "International"], index=domestic_index,
                                   key=f"{key_prefix}_domestic_{i}", horizontal=True)
         rows.append({
             "flight_no": flight_no.strip(), "origin": origin.strip(),
-            "destination": destination.strip(), "dep_time": dep_time, "arr_time": arr_time,
+            "destination": destination.strip(),
+            "dep_time_raw": dep_time, "arr_time_raw": arr_time,
             "day_offset": int(day_offset), "domestic": domestic == "Domestic",
         })
     return rows
@@ -86,17 +136,53 @@ def _collect_and_validate_legs(rows: list[dict]):
     broken template and only discover it when expansion fails, possibly
     days later (confirmed directly: a template with dep 20:00/arr 19:00
     is accepted at creation and only fails at expand_and_persist() with
-    "arr_time 19:00 is not after dep_time 20:00")."""
+    "arr_time 19:00 is not after dep_time 20:00").
+
+    "Filled" counts the TIME fields too, as of 2026-08-19. It used to
+    mean flight_no/origin/destination only, so a row with times entered
+    but empty text fields read as blank and was skipped in silence —
+    the leg simply did not appear in the saved template, with no error
+    and nothing to see. That is what made the widget-key bug in the
+    same release so hard to spot: leg 3 of a 3-leg rotation had its
+    times typed and its text fields left stale-empty, so it vanished
+    rather than complaining. A partially-filled row is now always an
+    error naming the row. This only became expressible once the time
+    fields became text (_parse_hhmm) — st.time_input always yields a
+    value, so a row could never be "empty" in the time columns."""
     legs = []
     for i, row in enumerate(rows, start=1):
-        filled = bool(row["flight_no"] or row["origin"] or row["destination"])
+        dep_raw, arr_raw = row["dep_time_raw"], row["arr_time_raw"]
+        filled = bool(row["flight_no"] or row["origin"] or row["destination"]
+                      or dep_raw.strip() or arr_raw.strip())
         if not filled:
             continue
-        if not (row["flight_no"] and row["origin"] and row["destination"]):
-            return None, f"Leg {i}: flight number, origin, and destination are all required."
-        if row["arr_time"] <= row["dep_time"]:
+
+        dep_time, dep_error = _parse_hhmm(dep_raw)
+        if dep_error:
+            return None, f"Leg {i} departure time: {dep_error}"
+        arr_time, arr_error = _parse_hhmm(arr_raw)
+        if arr_error:
+            return None, f"Leg {i} arrival time: {arr_error}"
+
+        missing = [name for name, value in (
+            ("flight number", row["flight_no"]), ("origin", row["origin"]),
+            ("destination", row["destination"]), ("departure time", dep_time),
+            ("arrival time", arr_time)) if not value]
+        if missing:
+            return None, (
+                f"Leg {i} is partially filled — missing {', '.join(missing)}. "
+                f"Complete the row, or clear it entirely to leave it unused."
+            )
+
+        if arr_time <= dep_time:
             return None, f"Leg {i}: arrival time must be after departure time."
-        legs.append(row)
+
+        legs.append({
+            "flight_no": row["flight_no"], "origin": row["origin"],
+            "destination": row["destination"], "dep_time": dep_time,
+            "arr_time": arr_time, "day_offset": row["day_offset"],
+            "domestic": row["domestic"],
+        })
     if not legs:
         return None, "At least one leg is required."
     for order, leg in enumerate(legs, start=1):
@@ -147,19 +233,83 @@ else:
                     vlegs = rts.get_template_legs(int(v["id"]))
                     st.dataframe(vlegs[LEG_DISPLAY_COLUMNS], width="stretch", hide_index=True)
 
+            # Delete, only for a template that has produced nothing —
+            # undoing a mistaken creation, not a retirement mechanism.
+            # A rotation that has run and should stop is closed with
+            # effective_until; one being replaced is superseded by a new
+            # version. This covers only the remaining case: a template
+            # referenced by nothing at all, where there is no history to
+            # protect. See migrations/019 for why the rule lives in the
+            # database trigger rather than here.
+            #
+            # The control is shown DISABLED with the specific reason
+            # rather than hidden, so "why can't I remove this?" is
+            # answered in place instead of looking like a missing
+            # feature.
+            if len(versions) == 1:
+                deletability = rts.get_template_deletability(int(versions.iloc[0]["id"]))
+            else:
+                deletability = {
+                    "deletable": False,
+                    "reason": (
+                        f"{code} has {len(versions)} versions. Only a sole-version template "
+                        f"can be deleted — removing one version of a chain would leave its "
+                        f"predecessor permanently closed, since effective_until can only be "
+                        f"closed once. Supersede it with a new version instead."
+                    ),
+                }
+            if not deletability["deletable"]:
+                st.caption(f"Cannot delete: {deletability['reason']}")
+            if st.button("Delete template", key=f"delete_{code}",
+                         disabled=not deletability["deletable"]):
+                try:
+                    rts.delete_template(int(versions.iloc[0]["id"]), app_user=app_user)
+                except ValueError as e:
+                    # Already a controller-facing sentence naming the
+                    # actual blocker — same handling as every other
+                    # ValueError on this page. Reachable even though the
+                    # button is disabled when undeletable: the disabled
+                    # state is computed on the previous render, so an
+                    # instance created in between lands here.
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Could not delete {code}: {e}")
+                else:
+                    st.success(f"Template {code} deleted — it had produced no rotations.")
+                    st.rerun()
+
 st.subheader("Create a new template")
 with st.form("create_template_form"):
-    ct_rotation_code = st.text_input("Rotation code *")
-    ct_description = st.text_input("Description")
-    ct_weekday_labels = st.multiselect("Days of week *", [label for label, _ in WEEKDAY_OPTIONS])
+    # Generation-keyed like the leg rows, and for the same reason: these
+    # fields were previously unkeyed, which does NOT mean stateless —
+    # Streamlit auto-keys them, so after a save the form still held the
+    # previous template's code, description and weekdays. The reported
+    # corruption was in the legs, but "wherever the controller didn't
+    # overwrite every field" applies just as much here; a description or
+    # a day-of-week silently carried into the next template is the same
+    # defect with a quieter symptom.
+    #
+    # Explicit keys also disambiguate these from the "create new
+    # version" form below, which renders widgets with identical labels
+    # ("Description", "Days of week *"). Label-based lookup cannot tell
+    # them apart once a template exists.
+    ct_prefix = f"ct_{st.session_state.template_form_generation}"
+
+    ct_rotation_code = st.text_input("Rotation code *", key=f"{ct_prefix}_rotation_code")
+    ct_description = st.text_input("Description", key=f"{ct_prefix}_description")
+    ct_weekday_labels = st.multiselect(
+        "Days of week *", [label for label, _ in WEEKDAY_OPTIONS], key=f"{ct_prefix}_days")
     ct_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in ct_weekday_labels]
-    ct_effective_from = st.date_input("Effective from *", value=dt.date.today())
-    ct_open_ended = st.checkbox("Open-ended (no end date)", value=True)
-    ct_effective_until = None if ct_open_ended else st.date_input("Effective until", value=dt.date.today())
-    ct_meal_provided = st.checkbox("Meal provided", value=True)
-    ct_snack_provided = st.checkbox("Snack provided", value=True)
+    ct_effective_from = st.date_input(
+        "Effective from *", value=dt.date.today(), key=f"{ct_prefix}_effective_from")
+    ct_open_ended = st.checkbox(
+        "Open-ended (no end date)", value=True, key=f"{ct_prefix}_open_ended")
+    ct_effective_until = None if ct_open_ended else st.date_input(
+        "Effective until", value=dt.date.today(), key=f"{ct_prefix}_effective_until")
+    ct_meal_provided = st.checkbox("Meal provided", value=True, key=f"{ct_prefix}_meal")
+    ct_snack_provided = st.checkbox("Snack provided", value=True, key=f"{ct_prefix}_snack")
     st.markdown("**Legs**")
-    ct_leg_rows = _render_leg_rows("ct")
+    ct_leg_rows = _render_leg_rows(ct_prefix)
 
     ct_submitted = st.form_submit_button("Create template")
 
@@ -193,6 +343,10 @@ with st.form("create_template_form"):
                     st.error(f"Could not create template: {e}")
                 else:
                     st.success(f"Template {ct_rotation_code.strip()} v1 created with {len(ct_legs)} leg(s).")
+                    # Retire this form's widget keys so the next
+                    # template starts genuinely blank rather than
+                    # inheriting whatever was just saved.
+                    st.session_state.template_form_generation += 1
                     st.rerun()
 
 st.subheader("Create a new version")
@@ -213,18 +367,37 @@ else:
         # the preview below updates on every change.
         st.info(f"This will end version {int(cv_current['version'])} (currently open-ended) on {cv_day_before}.")
 
-        cv_description = st.text_input("Description", key="cv_description")
+        # One prefix for EVERY widget in this section, so they can't
+        # drift into being keyed differently from each other. It carries
+        # both the rotation_code (switching codes must honor THAT code's
+        # own defaults) and the form generation (after a save, every
+        # default in here changes, because cv_current is now the version
+        # that was just created — meal/snack/days/legs all read from it).
+        # Keying on the code alone left these showing the previous
+        # submission's values instead of the newly-current version's.
+        #
+        # The line drawn here: a widget whose DEFAULT comes from the
+        # template (days, meal, snack, legs) is regenerated, because
+        # that default changes the moment a version is saved. Widgets
+        # holding the controller's own transient choice are not —
+        # "cv_code" must persist or the section would jump back to the
+        # first rotation on every rerun, and "cv_effective_from"
+        # defaults to today() rather than to anything template-derived,
+        # so it has no stale default to carry.
+        cv_prefix = f"cv_{cv_code}_{st.session_state.template_form_generation}"
+
+        cv_description = st.text_input("Description", key=f"{cv_prefix}_description")
         cv_default_days = [WEEKDAY_LABELS[d] for d in cv_current["days_of_week"] if d in WEEKDAY_LABELS]
         cv_weekday_labels = st.multiselect(
             "Days of week *", [label for label, _ in WEEKDAY_OPTIONS],
-            default=cv_default_days, key=f"cv_days_{cv_code}",
+            default=cv_default_days, key=f"{cv_prefix}_days",
         )
         cv_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in cv_weekday_labels]
-        cv_open_ended = st.checkbox("Open-ended (no end date)", value=True, key=f"cv_open_ended_{cv_code}")
+        cv_open_ended = st.checkbox("Open-ended (no end date)", value=True, key=f"{cv_prefix}_open_ended")
         cv_effective_until = None if cv_open_ended else st.date_input(
-            "Effective until", value=dt.date.today(), key=f"cv_effective_until_{cv_code}")
-        cv_meal_provided = st.checkbox("Meal provided", value=bool(cv_current["meal_provided"]), key=f"cv_meal_{cv_code}")
-        cv_snack_provided = st.checkbox("Snack provided", value=bool(cv_current["snack_provided"]), key=f"cv_snack_{cv_code}")
+            "Effective until", value=dt.date.today(), key=f"{cv_prefix}_effective_until")
+        cv_meal_provided = st.checkbox("Meal provided", value=bool(cv_current["meal_provided"]), key=f"{cv_prefix}_meal")
+        cv_snack_provided = st.checkbox("Snack provided", value=bool(cv_current["snack_provided"]), key=f"{cv_prefix}_snack")
 
         st.markdown("**Legs**")
         cv_default_legs = rts.get_template_legs(int(cv_current["id"])).to_dict("records")
@@ -236,7 +409,15 @@ else:
         # reset back to the template's defaults — a deliberate, minor,
         # non-destructive quirk (preserving in-progress edits), not
         # fixed further.
-        cv_leg_rows = _render_leg_rows(f"cv_{cv_code}", defaults=cv_default_legs)
+        #
+        # The generation is here for a DIFFERENT case the cv_code alone
+        # never covered (2026-08-19): versioning the SAME code twice in
+        # one session. The prefix would be identical both times, so the
+        # second form opened carrying the first submission's legs
+        # instead of the newly-current version's — the same class of bug
+        # as the create form's, just needing two saves of one code to
+        # show itself rather than two different templates.
+        cv_leg_rows = _render_leg_rows(cv_prefix, defaults=cv_default_legs)
 
         if st.button("Create new version"):
             cv_legs, cv_leg_error = _collect_and_validate_legs(cv_leg_rows)
@@ -268,6 +449,11 @@ else:
                         f"New version created for {cv_code} — version "
                         f"{int(cv_current['version'])} now ends {cv_day_before}."
                     )
+                    # Same reason as the create form: the next render of
+                    # this section must honor the NEW current version's
+                    # legs as defaults, which stale widget keys would
+                    # silently ignore.
+                    st.session_state.template_form_generation += 1
                     st.rerun()
 
 st.divider()

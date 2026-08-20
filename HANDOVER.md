@@ -305,8 +305,52 @@ buried inside one does, once several branches are in flight from
 different points in history. Keep merge status here only, going
 forward.
 
-- **No outstanding branches as of this snapshot (2026-08-18).
-  `auth-and-attribution` merged into `main`.** Authentication for
+- **⚠ DEPLOYMENT ORDERING — READ BEFORE DEPLOYING ANYTHING (2026-08-19).**
+  Two migrations are pending on the real Supabase database, and the
+  second one is a HARDER prerequisite than any migration before it:
+
+  - `migrations/018_users.sql` — every page now requires a login.
+    Deploying without also seeding the three OCC accounts via
+    `scripts/seed_users.py` locks the app for everyone.
+  - `migrations/019_allow_delete_unused_templates.sql` — **the page
+    calls `rotation_template_is_deletable()` on every render that lists
+    a sole-version template.** Against a pre-019 database
+    `pages/7_Schedule_Templates.py` **fails to render at all** — not
+    merely fails to delete. This is unlike 016/017 (new columns, absent
+    features degraded quietly) and unlike 018 (a gate that simply
+    blocks): here a missing migration takes a working page off the air.
+
+  Apply 018 and 019, then seed the accounts, then deploy. Production was
+  at 017 as of the flight-deck merge.
+
+- **No outstanding branches as of this snapshot (2026-08-19).
+  `schedule-template-fixes` merged into `main`.** Schedule Templates:
+  the widget-key data corruption that saved one template's legs into
+  another, HHMM UTC time entry replacing `st.time_input`, route
+  continuity validated at creation instead of days later at expansion,
+  and delete-when-unused for recovering from a mistaken creation. See
+  the dated log entry at the end of this file, including why the delete
+  needed no trigger bypass. **592/592 verified against real Postgres
+  16**, reachability clean. Merged, pushed; branch deleted, both remote
+  and local.
+
+  Took three real-Postgres rounds. The first (13 failures) and second
+  (1 failure) were entirely test-side — `migrations/019` was sound from
+  the first application, and the trigger rewrite never relaxed anything.
+  Round one's cause is the one worth remembering: a test helper omitted
+  two required arguments, so the whole delete and trigger-regression
+  suite failed at setup and **never executed**, which locally is
+  indistinguishable from skipping for want of Postgres. Same shape as
+  the two environment failures logged on 2026-08-18. Every service call
+  in the changed test files is now bind-checked against the real
+  signatures before pushing.
+
+  The database-level guarantee is proven still database-level:
+  `test_the_trigger_still_refuses_a_delete_that_bypasses_the_service`
+  issues a raw DELETE with no help from the service layer and expects
+  the database to refuse it.
+
+- **`auth-and-attribution` merged into `main` (2026-08-18).** Authentication for
   attribution — three fixed OCC accounts, PBKDF2 via stdlib `hashlib`,
   a `require_login()` gate in all 8 page files, and `app_user` threaded
   through 18 page call sites and 36 service-internal forwards, closing
@@ -5743,3 +5787,265 @@ read as a code regression. Realigning took one command.
 Merged into `main`, pushed; branch `auth-and-attribution` deleted, both
 remote and local. See the "Merge status as of this snapshot" paragraph
 near the top of this file.
+
+## 2026-08-19: Schedule Templates — widget-key data corruption, HHMM
+## times, leg continuity, delete-when-unused. MERGED into `main`
+## 2026-08-19.
+
+Found in real use. An operator created EPE-786-787 (2 legs), then
+EPE-802-804-805 (3 legs) without reloading the page. The second
+template saved **leg 2 carrying the first template's values** — LHE→KHI
+22:00-23:45 domestic instead of LHE→DWC 04:30-08:00 international — and
+**leg 3 was missing entirely**. This is silent data corruption in the
+schedule that later becomes real flights, so it is the most serious
+defect found in this project to date.
+
+**One root cause, two symptoms.** The leg widgets used fixed keys
+(`{key_prefix}_flightno_{i}` etc.) with no generation counter. Streamlit
+ignores `value=` once a widget with that key exists, so the second
+submission inherited the first's values wherever the controller didn't
+overwrite every field. Leg 3's disappearance was NOT a separate
+continuity problem: `_collect_and_validate_legs()` treated a row as
+"filled" only if `flight_no`/`origin`/`destination` had content, ignoring
+times. Leg 3 had times entered but its text fields still stale-empty, so
+it was silently skipped as blank. Same single cause — the time widgets
+updated, the text widgets didn't.
+
+The fix is the generation counter already used for
+`st.session_state.assistant_generation` on `pages/5_Assistant.py`,
+threaded into every leg widget key and bumped after each successful
+save. Applied to the create form and the "create new version" form.
+
+**On the "create new version" form, honestly stated:** the same pattern
+was there (prefix varied by `rotation_code` but not by submission) and
+is now fixed, but I could not construct a single-user flow where it
+corrupts data. Its stale content always equals the last saved content
+for that code, so the wrong value and the right value coincide. What it
+DID affect is every widget whose default comes from `cv_current` —
+days/meal/snack/legs — which all change the moment a version is saved,
+so the form showed the previous submission rather than the newly-current
+version. Those are regenerated now. `cv_code` (the selector, which must
+persist) and `cv_effective_from` (defaults to `today()`, nothing
+template-derived to go stale) deliberately are not; the reasoning is in
+the page comment so it reads as a decision rather than an oversight.
+
+**Silent skip replaced by a named error.** A partially-filled row now
+reports which fields are missing instead of vanishing. This only became
+expressible because of the next item: `st.time_input` always yields a
+value, so a row could never be "empty" in the time columns.
+
+**HHMM text entry replaces `st.time_input`** (operator request): a
+dropdown is slow for four times per rotation and controllers already
+write times as `0905`. Accepts `0905` or `09:05`, rejects anything else
+with a message naming the value, labels say UTC explicitly.
+
+**Route continuity now checked at creation.** `_validate_legs()` gained
+the destination→next-origin check that `core/duty_builder.py`'s
+`build_duty()` has always had. Previously a disconnected template saved
+cleanly and only failed at expansion, days later and far from the
+mistake. It lives in the service, not the page, so a non-UI caller
+can't sidestep it, and the message echoes `build_duty()`'s so the two
+never disagree.
+
+### Delete, and why it needed no trigger bypass
+
+Recovering from the corrupted template required manually disabling the
+immutability triggers on the live database, which is not an acceptable
+workflow. The question posed was how to scope a bypass so it couldn't
+become a general escape hatch. **The premise was wrong: no bypass is
+needed.** `migrations/019` moves the condition INSIDE the guard —
+"DELETE is never allowed" becomes "DELETE is allowed only when no
+`rotation_instances` reference this template". There is then nothing to
+bypass, and the rule applies identically to the service layer and to a
+hand-written `DELETE` in psql. The guard gets narrower in scope and
+stronger in kind. Every alternative was an escape hatch by construction:
+`session_replication_role = replica` disables all triggers session-wide;
+`ALTER TABLE ... DISABLE TRIGGER` is global rather than session-scoped,
+leaving concurrent sessions unprotected (this is what the manual
+recovery used); a session GUC flag is a reusable "turn the guard off"
+switch.
+
+**Sole-version only, and this is a real limitation.**
+`create_new_version()` closes the previous row's `effective_until` and
+sets `superseded_by`, and the guard permits that exactly once. Deleting
+a v2 would require reopening v1's `effective_until`, which the guard
+forbids — correctly. So deletion covers a template that is the only
+version of its code: precisely the "just created it by mistake" case. A
+bad v2 is superseded by a v3.
+
+**The foreign-key audit is load-bearing.** "Unused" is only a true
+statement if the set of things that can reference a template is the set
+the trigger checks. Confirmed before implementing:
+`rotation_templates.superseded_by` (self), `rotation_template_legs.
+template_id`, `rotation_instances.template_id`, and nothing at all
+referencing `rotation_template_legs`. Since `flights.rotation_instance_id`
+points at instances, "no instances" implies no flights. That set is now
+pinned by a test against `pg_constraint`, so a future migration adding a
+referencing table fails loudly rather than letting a delete orphan it.
+
+**Explicitly rejected: a separate "dormant" state.** Recording this so
+it isn't re-proposed. Versioning already covers retirement-with-
+replacement, and `effective_until` covers a rotation stopping
+permanently. Delete-when-unused covers the only remaining case, a
+template that never produced anything. Three mechanisms for what is
+really one question — "is this schedule still in use?" — would be two
+too many, and each additional state multiplies the combinations every
+expansion and generation path has to reason about.
+
+**Also worth recording: the guards were not the problem.** The
+immutability trigger and the version-overlap EXCLUDE constraint both
+fired correctly throughout. The fault was a guard applied where there
+was no history to protect, which `migrations/019` fixes without
+weakening either.
+
+**Verification status.** 235 passed, 0 failed, 355 skipped locally;
+reachability clean. Every new DB-backed test skips here — this machine
+still has no Postgres, and `DATABASE_URL` is the production Supabase
+pooler. **`migrations/019` has never been executed anywhere.** It
+rewrites two guard functions that have been protecting live data since
+`migrations/011`, so roughly half of
+`tests/test_rotation_template_delete.py` asserts the OLD rules still
+hold — legs `UPDATE` still refused (including when the parent is
+deletable, since deletable and mutable must not be conflated), immutable
+template columns still refused, `effective_until` still closable exactly
+once. A rewrite of a guard is exactly where an unintended relaxation
+hides, and none of that would show up in a test of the new behaviour.
+Needs a real-Postgres run against a database already carrying 018 and
+real data before it goes near Supabase.
+
+### 2026-08-19 (continued): first real-Postgres round — 577 passed, 13 failed, all test-side
+
+**`migrations/019` is sound.** It applies cleanly, and the
+UPDATE-on-legs case was tested directly against the live rewritten
+trigger and is still refused, from
+`reject_rotation_template_legs_mutation()`. The silent relaxation that
+was the whole reason for pinning the old rules did not happen. All 13
+failures were in test code, from three causes:
+
+1. **The `_create()` helper omitted `meal_provided`/`snack_provided`,
+   which are REQUIRED parameters of `create_template()`.** Every test in
+   `test_rotation_template_delete.py` failed at setup, so **the entire
+   delete and trigger-regression suite never executed** — including the
+   test written specifically for the deletable-but-still-immutable leak.
+   This is the same shape as the two environment failures logged on
+   2026-08-18: a suite that cannot run reports nothing, and locally it
+   was indistinguishable from a suite that skipped for want of Postgres.
+   Every `rts.*` call across the changed test files is now bind-checked
+   against the real signatures with `inspect.signature().bind()` — the
+   technique that caught two such bugs during the auth work, applied
+   this time to all calls rather than only the reported one.
+
+2. **`test_rotation_template_legs_delete_is_rejected` encoded behaviour
+   `migrations/019` deliberately changed** — it asserted legs deletion
+   is refused unconditionally. Rewritten as a pair, so the file
+   documents the new rule in both directions: refused once the template
+   has instances, permitted while it has none.
+
+   Found while fixing it: **`test_rotation_templates_delete_is_rejected`
+   was still PASSING, for the wrong reason.** It deleted the template
+   while its legs were still present, so the legs' foreign key raised
+   before the guard was ever consulted. It read as proof the guard
+   refuses and was actually proof that a foreign key does. Now it
+   removes the legs first so the DELETE reaches the guard, and asserts
+   the guard's own message.
+
+3. **Label lookup was ambiguous.** The create form and the
+   "create new version" form both render "Description" and
+   "Days of week *", so the regression test for the reported bug — the
+   one that most needed to run — failed on `found 2`. The create form's
+   non-leg widgets had no keys at all, which is not the same as being
+   stateless: Streamlit auto-keys them, so after a save the form still
+   held the previous template's code, description and weekdays. That is
+   the reported defect with a quieter symptom, so they are now
+   generation-keyed like everything else, which fixes the staleness and
+   the ambiguity together.
+
+**Verified DB-free before pushing**, since the tests that matter still
+skip locally: the real page was run through AppTest with
+`rotation_template_service` faked in memory, in both states (no
+templates, and one existing template). That reproduces the exact
+ambiguity — 2 widgets per label once a template exists — and confirms
+every key lookup the tests use resolves to exactly one widget. A wrong
+key pattern would otherwise have failed the same way on the next round.
+
+### 2026-08-19 (continued): second round — 590 passed, 1 failed, and the message came from the wrong guard
+
+The delete and trigger-regression suite executed properly for the first
+time, including
+`test_updating_a_template_leg_is_refused_even_when_the_template_is_deletable`,
+which passes: an unused template is deletable and its legs are still
+immutable, which was the leak worth pinning.
+
+The single failure was not a security gap. Deleting a template that HAS
+instances was correctly refused — but by the **legs** trigger
+(`rotation_template_legs rows are immutable — create a new template
+version instead`), because `delete_template()` removes legs first and
+so never reached the template DELETE. The invariant held perfectly; the
+explanation was about the wrong guard. A controller clicking Delete on a
+rotation that is in use would have been told about leg immutability,
+which is true and says nothing about why that template can't go.
+
+**Fixed by checking deletability before touching anything**, which
+means reversing reasoning previously written into
+`delete_template()`'s own docstring — it argued against a pre-check on
+TOCTOU grounds and because it would imply Python enforces the rule. That
+was half right, and the half it got wrong is the direction the race can
+fail in: **a pre-check can only ever produce a better error message,
+never a permission.** If an instance appears between the check and the
+DELETE, the trigger still refuses and the caller sees the trigger's
+message — exactly the old behaviour. The check can never turn a "no"
+into a "yes". So the layering is: the check exists for the message, the
+trigger is the truth.
+
+To keep that claim honest rather than asserted,
+`test_the_trigger_still_refuses_a_delete_that_bypasses_the_service`
+issues the DELETE directly, as a hand-written recovery would, and
+expects the database to refuse with no help from the service layer.
+Without it, moving the check into Python would quietly turn a
+database-level guarantee into an application-level convention any other
+caller could sidestep.
+
+The decision itself now comes from `migrations/019`'s own
+`rotation_template_is_deletable()` rather than a Python
+reimplementation, so the message a controller sees cannot describe a
+different rule from the one enforced. Python's remaining job is turning
+"false" into a sentence, which is the one thing a BOOLEAN can't carry.
+
+**Deployment consequence, stronger than before:**
+`pages/7_Schedule_Templates.py` now calls that SQL function on every
+render that lists a sole-version template, so the page **requires
+`migrations/019`** — against a pre-019 database it fails to render at
+all, not merely to delete. 019 must be applied before this page is
+deployed.
+
+### 2026-08-19 (continued): green, and merged
+
+**592 passed, 0 failed against real Postgres 16.** Reachability clean.
+The four that carried the most risk all pass:
+
+- `test_the_trigger_still_refuses_a_delete_that_bypasses_the_service` —
+  the database guarantee is still enforced by the database, not
+  downgraded to an application convention when the pre-check moved into
+  the service.
+- `test_updating_a_template_leg_is_refused_even_when_the_template_is_deletable`
+  — deletable and mutable stayed separate; the relaxation the guard
+  rewrite could most easily have introduced did not occur.
+- `test_immutable_template_columns_are_still_refused` — the pre-existing
+  rule survived the rewrite.
+- `test_second_template_created_without_reload_does_not_inherit_the_first`
+  — the reported corruption, genuinely fixed, on the test that took two
+  rounds to actually execute.
+
+**Three real-Postgres rounds, and none of them found a fault in
+`migrations/019`.** It was sound from first application. Round 1 (13
+failures) and round 2 (1 failure) were both test-side. That is worth
+recording because it is the same lesson as 2026-08-18 from a different
+angle: the risk in this project has repeatedly been in whether a test
+*ran* and whether it asserted the *right thing*, not in the change under
+review. Round 1's helper-arity bug meant an entire suite never executed;
+round 2's failure was a correct refusal reported by the wrong guard.
+
+Merged into `main`, pushed; branch `schedule-template-fixes` deleted,
+both remote and local. See the "Merge status as of this snapshot"
+paragraph near the top of this file — including the deployment-ordering
+warning, which is a harder prerequisite than any previous migration.
