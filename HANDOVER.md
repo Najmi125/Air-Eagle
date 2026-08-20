@@ -324,8 +324,34 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
-- **No outstanding branches as of this snapshot (2026-08-19).
-  `schedule-template-fixes` merged into `main`.** Schedule Templates:
+- **⚠ ONE OUTSTANDING BRANCH, HELD DELIBERATELY (2026-08-19):
+  `pin-python-version`.** Not merged, not abandoned. It adds
+  `runtime.txt` declaring `python-3.12` and a guard asserting the suite
+  runs on the declared interpreter. **Held because the problem it solves
+  is not currently live:** the verification sandbox is already on 3.12
+  and matches Streamlit Cloud. Merging it would also turn the suite red
+  on any local venv still on 3.14 until that venv is rebuilt:
+
+      py -3.12 -m venv venv
+      venv/Scripts/python -m pip install -r requirements.lock
+
+  Merge it when a machine that runs the suite is on a different Python
+  from Cloud, or when Cloud's default moves. Note explicitly, so it is
+  not merged under a false premise: **this guard would NOT have caught
+  the 2026-08-19 outage** — that was investigated as a suspected
+  3.12-vs-3.14 `pandas` difference and was neither.
+
+- **`hotfix-schedule-templates-render` and `review-table-duty-window`
+  merged into `main` (2026-08-19).** The first restored the deployed
+  page after a delete affordance took it down; the second replaced
+  first-departure/last-arrival with the real duty window in draft
+  review. **595/595 and 600/600 verified against real Postgres 16**,
+  the second including `compute_duty_window()` checked directly against
+  independently derived production figures (domestic 18:15 → 00:00,
+  international 00:45 → 11:30). Both merged, pushed; branches deleted,
+  remote and local. See the dated log entries at the end of this file.
+
+- **`schedule-template-fixes` merged into `main` (2026-08-19).** Schedule Templates:
   the widget-key data corruption that saved one template's legs into
   another, HHMM UTC time entry replacing `st.time_input`, route
   continuity validated at creation instead of days later at expansion,
@@ -6181,3 +6207,60 @@ appeared until after a first submit.
 destructive action read as part of a display toggle — and the expander
 itself is labelled only with the rotation code. Now separated by a
 divider under its own "Delete this template" heading.
+
+## 2026-08-19 (continued): st.form and widget commit timing — a known wart, recorded so it isn't rediscovered
+
+Recorded as its own entry because it is a **live, un-fixed behaviour**
+in the create form, deliberately left alone, and it will otherwise be
+found again and filed as a bug.
+
+**The rule.** A widget inside an `st.form` does not take effect until
+the form is submitted — that is what makes text fields commit together.
+Outside a form, an `st.text_input` commits only on Enter or blur.
+Neither is a defect; they are the same mechanism seen from two sides,
+and each is wrong for the other's use case.
+
+**What was fixed (2026-08-19).** The "create new version" section used a
+bare `st.button`, so filling several leg fields and clicking submit
+without pressing Enter on the last left it uncommitted, and the page
+reported *"Leg 1 is partially filled — missing origin, destination,
+departure time, arrival time"*. The message was accurate and pointed at
+the wrong cause. That section is now an `st.form`.
+
+Worth stating precisely, because it was reported more widely than it
+was: **the create form was never affected.** It has been an `st.form`
+since it was written, which is why the same leg widgets behaved
+correctly there. Replacing `st.time_input` with HHMM text entry is what
+exposed the gap — a time input commits on selection, a text input does
+not — so the fault was introduced by that change but only in the one
+section that lacked a form.
+
+**What is deliberately NOT fixed, in both forms.** Toggling
+"Open-ended (no end date)" does not reveal the "Effective until" date
+field until after a submit, because the checkbox is inside the form and
+so does not take effect until then. This is pre-existing in the create
+form and was not reported; fixing it means moving the checkbox and its
+dependent date field outside the form, which is what the new-version
+section now does:
+
+    # outside the form — a checkbox inside one does not take effect
+    # until submit, so the conditional field would not appear
+    cv_open_ended = st.checkbox("Open-ended (no end date)", ...)
+    cv_effective_until = None if cv_open_ended else st.date_input(...)
+
+    with st.form(...):
+        ...everything else...
+
+So the two forms now differ: the new-version section reveals the date
+field immediately, the create form does not until a submit has
+happened. That inconsistency is known and accepted rather than
+overlooked. Applying the same treatment to the create form is a small,
+safe change whenever it is worth a verification round — it was out of
+scope for a fix to a different section.
+
+**General principle for this page.** Anything whose VISIBILITY depends
+on another widget belongs outside the form; anything that is just a
+value to submit belongs inside it. `cv_effective_from` is outside for
+the same family of reasons — it drives the live "this will end version
+N on …" preview, which has to update before submit to be a preview at
+all.
