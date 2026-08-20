@@ -93,3 +93,90 @@ def test_flight_no_still_required():
         _validate_legs([_leg(1, "", "KHI", "LHE")])
 
     assert "flight_no is required" in str(excinfo.value)
+
+
+# ------------------------------------------------------------------
+# compute_duty_window() — the review table's Report/Debrief columns
+# ------------------------------------------------------------------
+#
+# Pure: takes a DataFrame, returns a tuple. No database, so these run
+# everywhere — which matters, because the bug they cover reached
+# production and the review table's own tests are all DB-gated.
+
+import pandas as pd  # noqa: E402
+
+from services.rotation_template_service import compute_duty_window  # noqa: E402
+
+
+def _instance_legs(rows):
+    return pd.DataFrame([
+        {"leg_order": i, "flight_no": f"EPE {700 + i}",
+         "origin": o, "destination": d,
+         "dep_time_planned": dep, "arr_time_planned": arr, "domestic": dom}
+        for i, (o, d, dep, arr, dom) in enumerate(rows, start=1)
+    ])
+
+
+def test_domestic_duty_window_matches_the_reported_production_rotation():
+    """The operator's real domestic rotation (2026-08-19). The review
+    table displayed 19:00->23:45, which is first-departure and
+    last-arrival; the actual duty is 18:15->00:00 under D7.1.2's 45/15
+    buffers. Asserted with the reported figures so a regression is
+    recognisable as the same defect."""
+    legs = _instance_legs([
+        ("KHI", "LHE", dt.datetime(2026, 9, 1, 19, 0), dt.datetime(2026, 9, 1, 20, 45), True),
+        ("LHE", "KHI", dt.datetime(2026, 9, 1, 22, 0), dt.datetime(2026, 9, 1, 23, 45), True),
+    ])
+
+    report, debrief = compute_duty_window(legs)
+
+    assert report == dt.datetime(2026, 9, 1, 18, 15), "45 min before first departure"
+    assert debrief == dt.datetime(2026, 9, 2, 0, 0), "15 min after last arrival"
+
+
+def test_international_duty_window_matches_the_reported_production_rotation():
+    """The operator's real international rotation: displayed
+    01:45->11:00, actual duty 00:45->11:30 under the 60/30 buffers."""
+    legs = _instance_legs([
+        ("KHI", "DWC", dt.datetime(2026, 9, 1, 1, 45), dt.datetime(2026, 9, 1, 5, 0), False),
+        ("DWC", "KHI", dt.datetime(2026, 9, 1, 7, 0), dt.datetime(2026, 9, 1, 11, 0), False),
+    ])
+
+    report, debrief = compute_duty_window(legs)
+
+    assert report == dt.datetime(2026, 9, 1, 0, 45), "60 min before first departure"
+    assert debrief == dt.datetime(2026, 9, 1, 11, 30), "30 min after last arrival"
+
+
+def test_a_single_international_leg_makes_the_whole_duty_international():
+    """build_duty() takes one duty-level flag while legs carry one each.
+    assignment_service resolves that with all(...) at five sites: any
+    international sector applies the longer 60/30 buffers to the WHOLE
+    duty. Getting this backwards would understate the window, which is
+    the same direction of error this function exists to correct — so it
+    is pinned rather than left to the aggregation being read correctly."""
+    legs = _instance_legs([
+        ("KHI", "LHE", dt.datetime(2026, 9, 1, 19, 0), dt.datetime(2026, 9, 1, 20, 45), True),
+        ("LHE", "DWC", dt.datetime(2026, 9, 1, 22, 0), dt.datetime(2026, 9, 1, 23, 45), False),
+    ])
+
+    report, debrief = compute_duty_window(legs)
+
+    assert report == dt.datetime(2026, 9, 1, 18, 0), "60 min, not 45 — one leg is international"
+    assert debrief == dt.datetime(2026, 9, 2, 0, 15), "30 min, not 15"
+
+
+def test_empty_legs_return_none_rather_than_raising():
+    assert compute_duty_window(pd.DataFrame()) is None
+
+
+def test_unbuildable_legs_return_none_rather_than_raising():
+    """A display value must never be able to take the review table down.
+    build_duty() raises on out-of-order legs, and a draft is exactly
+    where odd data can appear — the caller shows a placeholder."""
+    legs = _instance_legs([
+        ("KHI", "LHE", dt.datetime(2026, 9, 1, 22, 0), dt.datetime(2026, 9, 1, 23, 45), True),
+        ("LHE", "KHI", dt.datetime(2026, 9, 1, 19, 0), dt.datetime(2026, 9, 1, 20, 45), True),
+    ])
+
+    assert compute_duty_window(legs) is None

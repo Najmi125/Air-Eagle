@@ -233,6 +233,15 @@ else:
                     vlegs = rts.get_template_legs(int(v["id"]))
                     st.dataframe(vlegs[LEG_DISPLAY_COLUMNS], width="stretch", hide_index=True)
 
+            # Separated and labelled (2026-08-19). This control sat
+            # immediately below the "Show all versions' legs" checkbox
+            # with nothing between them, so it read as belonging to that
+            # checkbox — a destructive action appearing to be part of a
+            # display toggle. The expander itself is labelled only with
+            # the rotation code, which gives no hint it contains one.
+            st.divider()
+            st.markdown("**Delete this template**")
+
             # Delete, only for a template that has produced nothing —
             # undoing a mistaken creation, not a retirement mechanism.
             # A rotation that has run and should stop is closed with
@@ -421,40 +430,61 @@ else:
         # so it has no stale default to carry.
         cv_prefix = f"cv_{cv_code}_{st.session_state.template_form_generation}"
 
-        cv_description = st.text_input("Description", key=f"{cv_prefix}_description")
-        cv_default_days = [WEEKDAY_LABELS[d] for d in cv_current["days_of_week"] if d in WEEKDAY_LABELS]
-        cv_weekday_labels = st.multiselect(
-            "Days of week *", [label for label, _ in WEEKDAY_OPTIONS],
-            default=cv_default_days, key=f"{cv_prefix}_days",
-        )
-        cv_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in cv_weekday_labels]
+        # Deliberately OUTSIDE the form below, alongside
+        # cv_effective_from: a checkbox inside a form doesn't take
+        # effect until submit, so "Effective until" would not appear
+        # until after the controller had already submitted once.
         cv_open_ended = st.checkbox("Open-ended (no end date)", value=True, key=f"{cv_prefix}_open_ended")
         cv_effective_until = None if cv_open_ended else st.date_input(
             "Effective until", value=dt.date.today(), key=f"{cv_prefix}_effective_until")
-        cv_meal_provided = st.checkbox("Meal provided", value=bool(cv_current["meal_provided"]), key=f"{cv_prefix}_meal")
-        cv_snack_provided = st.checkbox("Snack provided", value=bool(cv_current["snack_provided"]), key=f"{cv_prefix}_snack")
 
-        st.markdown("**Legs**")
-        cv_default_legs = rts.get_template_legs(int(cv_current["id"])).to_dict("records")
-        # key_prefix includes cv_code so switching rotation codes always
-        # gets fresh widgets honoring THAT code's own current legs as
-        # defaults (the staleness gotcha described in _render_leg_rows'
-        # own docstring). Returning to a code already visited this
-        # session shows whatever was last typed for it, not a fresh
-        # reset back to the template's defaults — a deliberate, minor,
-        # non-destructive quirk (preserving in-progress edits), not
-        # fixed further.
+        # Everything else goes in a form so the text fields COMMIT
+        # TOGETHER on submit (2026-08-19). Outside a form a text_input
+        # only commits on Enter or blur, so filling several leg fields
+        # and clicking submit without pressing Enter on the last one
+        # left it uncommitted — and the page then correctly but
+        # confusingly reported "Leg 1 is partially filled", pointing the
+        # controller at their data rather than at the real cause.
         #
-        # The generation is here for a DIFFERENT case the cv_code alone
-        # never covered (2026-08-19): versioning the SAME code twice in
-        # one session. The prefix would be identical both times, so the
-        # second form opened carrying the first submission's legs
-        # instead of the newly-current version's — the same class of bug
-        # as the create form's, just needing two saves of one code to
-        # show itself rather than two different templates.
-        cv_leg_rows = _render_leg_rows(cv_prefix, defaults=cv_default_legs)
+        # This only ever affected THIS section: the create form above
+        # has always been an st.form, which is why the same leg widgets
+        # behave correctly there. Replacing st.time_input with text
+        # entry is what exposed it — a time_input commits on selection,
+        # a text_input does not.
+        with st.form(f"create_version_form_{cv_code}"):
+            cv_description = st.text_input("Description", key=f"{cv_prefix}_description")
+            cv_default_days = [WEEKDAY_LABELS[d] for d in cv_current["days_of_week"] if d in WEEKDAY_LABELS]
+            cv_weekday_labels = st.multiselect(
+                "Days of week *", [label for label, _ in WEEKDAY_OPTIONS],
+                default=cv_default_days, key=f"{cv_prefix}_days",
+            )
+            cv_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in cv_weekday_labels]
+            cv_meal_provided = st.checkbox("Meal provided", value=bool(cv_current["meal_provided"]), key=f"{cv_prefix}_meal")
+            cv_snack_provided = st.checkbox("Snack provided", value=bool(cv_current["snack_provided"]), key=f"{cv_prefix}_snack")
 
-        if st.button("Create new version"):
+            st.markdown("**Legs**")
+            cv_default_legs = rts.get_template_legs(int(cv_current["id"])).to_dict("records")
+            # key_prefix includes cv_code so switching rotation codes always
+            # gets fresh widgets honoring THAT code's own current legs as
+            # defaults (the staleness gotcha described in _render_leg_rows'
+            # own docstring). Returning to a code already visited this
+            # session shows whatever was last typed for it, not a fresh
+            # reset back to the template's defaults — a deliberate, minor,
+            # non-destructive quirk (preserving in-progress edits), not
+            # fixed further.
+            #
+            # The generation is here for a DIFFERENT case the cv_code alone
+            # never covered (2026-08-19): versioning the SAME code twice in
+            # one session. The prefix would be identical both times, so the
+            # second form opened carrying the first submission's legs
+            # instead of the newly-current version's — the same class of bug
+            # as the create form's, just needing two saves of one code to
+            # show itself rather than two different templates.
+            cv_leg_rows = _render_leg_rows(cv_prefix, defaults=cv_default_legs)
+
+            cv_submitted = st.form_submit_button("Create new version")
+
+        if cv_submitted:
             cv_legs, cv_leg_error = _collect_and_validate_legs(cv_leg_rows)
             if not cv_days_of_week:
                 st.error("At least one day of week is required.")
@@ -579,8 +609,24 @@ else:
         legs = rts.get_instance_legs(instance_id)
         flights = ", ".join(legs["flight_no"].fillna("").tolist())
         route = " -> ".join([legs.iloc[0]["origin"]] + legs["destination"].tolist())
-        report = legs.iloc[0]["dep_time_planned"]
-        debrief = legs.iloc[-1]["arr_time_planned"]
+        # The REAL duty window, not first-departure/last-arrival. Those
+        # were displayed under these headings until 2026-08-19 and are
+        # not the same thing: ANO-012 D7.1.2 adds a pre-flight and
+        # post-flight buffer either side. A domestic rotation showed
+        # 19:00->23:45 where the duty is 18:15->00:00, and an
+        # international showed 01:45->11:00 where it is 00:45->11:30, so
+        # a controller judging a draft read the FDP an hour shorter than
+        # it is — and the draft disagreed with what the Roster page
+        # showed for the same rotation once crewed.
+        #
+        # The calculation lives in the service, not here: it needs the
+        # duty-level `domestic` aggregation (all legs domestic, or the
+        # longer international buffers apply to the whole duty), which
+        # is a rule this page has no business re-deriving. Going through
+        # build_duty() is what makes this and the Roster page agree by
+        # construction rather than by two copies of the same arithmetic.
+        duty_window = rts.compute_duty_window(legs)
+        report, debrief = duty_window if duty_window else ("—", "—")
 
         cols = st.columns(row_widths)
         cols[0].checkbox("select", key=f"select_{instance_id}", label_visibility="collapsed")
