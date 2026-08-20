@@ -961,6 +961,24 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
 # Atomic flight-creation + assignment (Control Room, ad-hoc/charter)
 # ------------------------------------------------------------------
 
+# NO UI PATH AS OF 2026-08-20 — deliberately kept, do not delete as
+# dead code.
+#
+# pages/1_Control_Room.py's single-crew branch was its only caller and
+# was removed: there is no such thing as a flight operated by one crew
+# member, and the one combination that still worked ("Other" crew member
+# assigned role "Other") created a flight with no flight deck at all.
+#
+# This function stays because its TESTS are the explicit statement of a
+# guarantee the pair model depends on, and they document it by contrast
+# rather than by assertion elsewhere:
+# test_assign_crew_to_new_flights_rejects_pilots_outright pins that a
+# solo pilot assignment cannot bypass pair-atomicity. Delete the
+# function and that assertion has nowhere to live.
+#
+# If a future client genuinely needs single-crew ad-hoc flights (FTLguard
+# still supports LM/ENGR crew records generally), this is the path — it
+# is unreachable from Air Eagle's UI, not unsupported.
 def assign_crew_to_new_flights(crew_id: str, flights_data: List[dict], role_assigned: str,
                                 app_user: Optional[str] = None):
     """

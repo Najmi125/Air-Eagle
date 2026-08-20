@@ -51,6 +51,18 @@ with st.form("add_flight_form", clear_on_submit=True):
         arr_time = st.time_input("Arrival time (UTC) *", value=dt.time(7, 0))
 
     cargo_dg = st.checkbox("Carries dangerous goods (DG)")
+
+    # Free text by design — the system does not classify why someone is
+    # aboard, and never parses these into crew records. The columns have
+    # existed since migrations/010 and reports.roster_coverage() has
+    # always displayed them, but until 2026-08-20 no page wrote them, so
+    # the LM and AMEs aboard every real Air Eagle flight could not be
+    # recorded anywhere.
+    other_occupants_operating = st.text_input(
+        "Other occupants — operating (aboard and working, e.g. 'Abdulghani (LM), 2x AME')")
+    other_occupants_non_operating = st.text_input(
+        "Other occupants — non-operating (aboard, not operating — reason in Remarks)")
+
     remarks = st.text_area("Remarks")
 
     submitted = st.form_submit_button("Add flight")
@@ -66,6 +78,8 @@ with st.form("add_flight_form", clear_on_submit=True):
                 "arr_time_planned": dt.datetime.combine(arr_date, arr_time),
                 "domestic": domestic == "Domestic",
                 "cargo_dg": cargo_dg,
+                "other_occupants_operating": other_occupants_operating or None,
+                "other_occupants_non_operating": other_occupants_non_operating or None,
                 "remarks": remarks or None,
             }, app_user=app_user)
             st.success(f"Added flight {new_id}")
@@ -96,9 +110,20 @@ else:
                 actual_arr_time = st.time_input("Actual arrival time (UTC)", value=None)
                 cancel_reason = st.text_input("Cancellation reason (if cancelling)")
 
+            # Pre-filled from the flight, unlike the actual-time fields
+            # above (which are blank because entering one is an event,
+            # not a correction). Editing these is how an occupant list
+            # gets corrected after the fact — a late AME swap, say.
+            edit_occupants_operating = st.text_input(
+                "Other occupants — operating",
+                value=selected["other_occupants_operating"] or "")
+            edit_occupants_non_operating = st.text_input(
+                "Other occupants — non-operating",
+                value=selected["other_occupants_non_operating"] or "")
+
             col_save, col_cancel = st.columns(2)
             with col_save:
-                save_submitted = st.form_submit_button("Save actual times")
+                save_submitted = st.form_submit_button("Save changes")
             with col_cancel:
                 cancel_submitted = st.form_submit_button("Cancel this flight")
 
@@ -107,6 +132,27 @@ else:
                               if actual_dep_date and actual_dep_time else None)
                 arr_actual = (dt.datetime.combine(actual_arr_date, actual_arr_time)
                               if actual_arr_date and actual_arr_time else None)
+
+                # Occupants go through the plain update_flight() path,
+                # kept SEPARATE from the actual-times call below rather
+                # than folded into it. That call is
+                # update_flight_actual_times_and_revalidate(), which
+                # re-runs the legality gate on every affected duty —
+                # correcting a name on an occupant list must not drag a
+                # crew member's duty back through FDP revalidation.
+                # Only written when changed, so an untouched edit form
+                # produces no write and no audit row.
+                occupants_changed = (
+                    (edit_occupants_operating or None) != selected["other_occupants_operating"]
+                    or (edit_occupants_non_operating or None) != selected["other_occupants_non_operating"]
+                )
+                if occupants_changed:
+                    flight_service.update_flight(selected_id, {
+                        "other_occupants_operating": edit_occupants_operating or None,
+                        "other_occupants_non_operating": edit_occupants_non_operating or None,
+                    }, app_user=app_user)
+                    st.success(f"Updated occupants for flight {selected_id}")
+
                 if dep_actual or arr_actual:
                     outcomes = assignment_service.update_flight_actual_times_and_revalidate(
                         selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual,
@@ -135,8 +181,11 @@ else:
                                        if conflict.candidates else "**no legal candidates found**")
                                 )
                     st.rerun()
-                else:
-                    st.warning("No actual times entered.")
+                elif not occupants_changed:
+                    # Only when NOTHING was submitted. Saving an
+                    # occupant change alone is a complete action, and
+                    # must not be told it did nothing.
+                    st.warning("Nothing to save — enter actual times or change occupants.")
 
             if cancel_submitted:
                 assignment_service.cancel_flight_and_roster(
