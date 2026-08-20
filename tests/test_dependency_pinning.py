@@ -40,6 +40,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 REQUIREMENTS = ROOT / "requirements.txt"
 LOCKFILE = ROOT / "requirements.lock"
+RUNTIME = ROOT / "runtime.txt"
 
 # "name==1.2.3" -> ("name", "1.2.3"); ignores blanks and # comments.
 _PIN = re.compile(r"^([A-Za-z0-9._-]+)==([^\s;#]+)")
@@ -132,4 +133,68 @@ def test_installed_version_matches_the_pin(name, pinned):
         "`pip install -r requirements.lock`, or change the pin "
         "deliberately if you are testing an upgrade."
         % (name, installed, pinned)
+    )
+
+
+# ------------------------------------------------------------------
+# The interpreter, not just the packages (2026-08-19)
+# ------------------------------------------------------------------
+#
+# The package pins closed one drift (streamlit 1.60 -> 1.61.1) but left
+# a wider one open: nothing said which PYTHON the code runs on.
+# Streamlit Cloud was on 3.12 while the local venv was on 3.14, so the
+# suite was proving the code works on an interpreter nobody deploys to.
+#
+# Stated plainly, because it would be easy to imply otherwise: this
+# guard would NOT have caught the 2026-08-19 outage. That was
+# investigated as a suspected 3.12-vs-3.14 pandas difference and turned
+# out to be neither — the full suite passes identically on both. This
+# exists on its own merits, not as the fix for that.
+#
+# runtime.txt is what Streamlit Community Cloud reads to choose the
+# deployed interpreter, so it is the declaration and this test asserts
+# the suite agrees with it. Only major.minor is compared: patch releases
+# are not something to pin a test to.
+
+def _declared_python_version() -> str:
+    """major.minor from runtime.txt's "python-3.12" form."""
+    raw = RUNTIME.read_text(encoding="utf-8").strip()
+    m = re.match(r"^python-(\d+\.\d+)$", raw)
+    assert m, (
+        "runtime.txt must contain exactly one line of the form "
+        "'python-3.12' (Streamlit Community Cloud's format); found %r" % raw
+    )
+    return m.group(1)
+
+
+def test_runtime_txt_declares_the_deployed_python_version():
+    assert RUNTIME.is_file(), (
+        "runtime.txt is missing — without it the deployed interpreter is "
+        "whatever Streamlit Cloud defaults to that month, which is the "
+        "same class of drift the package pins exist to prevent."
+    )
+    _declared_python_version()  # asserts the format
+
+
+def test_tests_run_on_the_python_version_that_gets_deployed():
+    """The suite must run on the interpreter production uses.
+
+    If this fails, do NOT relax it. Either rebuild the local venv on the
+    declared version:
+
+        py -3.12 -m venv venv
+        venv/Scripts/python -m pip install -r requirements.lock
+
+    or, if the deployment target genuinely changed, update runtime.txt
+    AND Streamlit Cloud's Python-version setting together — they are two
+    halves of one decision.
+    """
+    declared = _declared_python_version()
+    running = "%d.%d" % (sys.version_info.major, sys.version_info.minor)
+
+    assert running == declared, (
+        "Tests are running on Python %s but runtime.txt declares %s, so this "
+        "run proves nothing about the deployed environment. Rebuild the venv "
+        "on %s, or change runtime.txt and Streamlit Cloud's setting together."
+        % (running, declared, declared)
     )

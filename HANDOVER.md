@@ -6111,3 +6111,36 @@ a version guard) — worth doing on its own merits, since tests running on
 a different interpreter from production is a real latent risk, but it
 would **not** have caught this outage and is not being presented as the
 fix for it.
+
+## 2026-08-19 (continued): pinning the interpreter, not just the packages
+
+`requirements.txt`/`requirements.lock` closed package drift on
+2026-08-18 but left a wider gap open: nothing declared which **Python**
+the code runs on. Streamlit Cloud was on 3.12 while the local venv was
+on 3.14, so the suite was proving the code works on an interpreter
+nobody deploys to.
+
+`runtime.txt` now declares `python-3.12` — what Cloud already runs, so
+this changes nothing about the deployment — and
+`tests/test_dependency_pinning.py` asserts the suite is running on the
+declared version (major.minor only; patch releases are not worth pinning
+a test to). **Local venvs must be rebuilt on 3.12**:
+
+    py -3.12 -m venv venv
+    venv/Scripts/python -m pip install -r requirements.lock
+
+**Stated plainly, because it would be easy to imply otherwise: this
+guard would NOT have caught the outage that prompted it.** The crash was
+investigated as a suspected 3.12-vs-3.14 `pandas` difference and turned
+out to be neither. The full suite passes identically on both
+interpreters — 238 passed / 357 skipped on 3.14 and on 3.12, and 240 on
+3.12 once these two guards are added. This is worth having on its own
+merits; it is not the fix for that outage, and presenting it as one
+would be the same mistake as fixing the message instead of the fault.
+
+What DID close that gap is the three DB-free rendering tests added with
+the hotfix. The pattern across three consecutive pieces is consistent
+enough to name: **the failures have not been in the code under review,
+they have been in whether a test could run at all** — DB-gated tests
+skipping, `openpyxl` absent, a resolver picking a different Streamlit,
+and a page nothing had ever rendered without Postgres.
