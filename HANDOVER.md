@@ -6264,3 +6264,159 @@ value to submit belongs inside it. `cv_effective_from` is outside for
 the same family of reasons — it drives the live "this will end version
 N on …" preview, which has to update before submit to be a preview at
 all.
+
+## 2026-08-20: first operational-use findings — renewal, occupants, Control Room, home banner
+
+Six findings from the operator's first real use of the deployed app,
+ordered by whether they blocked work.
+
+**Qualification renewal was impossible through the UI (blocking).**
+`crew_service.UPDATABLE_FIELDS` has always accepted all eight expiry
+fields, but the Crew Data edit form exposed only phone, email and base,
+so renewing a medical or licence required raw SQL. Documents renew
+constantly; this blocked normal operation. All eight plus date of birth
+are now on the form.
+
+Expired dates are marked in the label and **stay editable** — renewing
+one is the entire purpose, so `disabled=True` would lock the operator
+out of exactly the field they came to change. The marking uses the
+legality gate's boundary (`expiry <= today` is already expired), not the
+everyday reading: a field saying "valid" while the roster refuses the
+assignment would be worse than no marking at all.
+
+**These widgets deliberately carry NO `key=`.** They use
+`value=selected[...]` and rely on Streamlit deriving the widget id from
+its parameters, `value` included, so switching crew member re-renders
+correctly — verified by driving the real page with two crew members and
+switching between them. Adding a stable key would BREAK it: a keyed
+widget ignores `value=` once it exists, so the form would show the
+previous member's data while writing to the newly selected `crew_id`.
+This is the exact OPPOSITE of the Schedule Templates fix, where keys are
+stable across submissions and needed a generation counter. Same
+mechanism, opposite correct answer, and the difference is only whether
+the intended reset is driven by `value=` or by a key. Worth reading both
+comments together before touching either.
+
+**Other occupants could not be recorded anywhere.** The columns have
+existed since `migrations/010`, `flight_service.UPDATABLE_FIELDS`
+accepts them and `reports.roster_coverage()` has always displayed them —
+but no page ever wrote them, so the LM and AMEs aboard every real Air
+Eagle flight had nowhere to go. Added to Flight Log (add and edit) and
+Control Room. Free text by design. In Flight Log's edit form they go
+through `update_flight()`, kept deliberately separate from
+`update_flight_actual_times_and_revalidate()`: correcting a name on an
+occupant list must not drag a crew member's duty back through FDP
+revalidation.
+
+**Control Room's single-crew path removed.** There is no such thing as a
+flight operated by one crew member. It predated the pair model, from
+when LM and AME were crew records assigned individually. It was already
+nearly unreachable — Crew Data creates CPT/FO/Other, the branch offered
+LM/ENGR/Other, and `assign_crew_to_new_flights()` rejects CPT/FO
+outright AND requires role to match the person's registered role — but
+one combination still worked: an "Other" crew member assigned role
+"Other", creating a flight with no flight deck at all.
+
+`assign_crew_to_new_flights()` itself is **kept**, with a comment on it
+saying why, because its tests state a pair-model guarantee by contrast
+that has nowhere else to live:
+`test_assign_crew_to_new_flights_rejects_pilots_outright` pins that a
+solo pilot assignment cannot bypass pair-atomicity. Deleting the
+function would delete that assertion. It has no UI path, and that is
+recorded on the function so the next reader doesn't find an uncalled
+function and remove it.
+
+**Control Room crew is now optional.** "Charter confirmed, crew TBC" had
+no path, which forced the operator into Flight Log for the same job and
+made this page read as redundant. Checked before building: nothing
+downstream assumes a Control Room flight has crew. Flight Log has always
+created uncrewed flights, every flights-to-roster join is roster-driven
+so one simply doesn't appear, and `roster_coverage()` already reports an
+empty seat as UNCOVERED. The pair path calls
+`assign_pair_to_new_flights()` **unchanged** and the flight-only path
+calls `add_flight()` — deliberately different calls, so the "illegal
+pair leaves no orphan flight" guarantee is preserved by not being
+touched. Requesting a pair that cannot be formed refuses rather than
+silently downgrading to an uncrewed flight.
+
+### The home-page ops banner, and the boundary in its count
+
+Two counts on landing: uncovered seats today, and documents expired /
+expiring within 7 days. Presentation over existing services.
+
+**`crew_qualifications()` was the wrong shape and is not what the banner
+calls.** It takes a `query_parser.ReportRequest` and returns an
+exportable `Dataset` — the assistant's natural-language surface. A
+landing page should not construct an NL request object to learn a count.
+Rather than duplicate the query, the expiry-window predicate now lives
+once in `assignment_service.expiry_in_window()`, and
+`reports._expiry_in_window()` delegates to it — so the banner and the
+report can never disagree about the same crew member. Same reasoning as
+`compute_duty_window()` routing through `build_duty()`.
+
+**Expired and expiring are counted separately and never summed.** The
+legality gate treats `expiry <= duty_date` as already expired, so a
+document expiring TODAY is blocking assignments right now rather than
+"due soon". One combined number would hide that behind a word implying
+there is still time.
+
+**Recorded so a future reader doesn't treat it as a bug: the uncovered
+count is rotation-only.** `get_open_uncovered_seats()` reads the
+`uncovered_seats` table, which ONLY the roster generator populates, and
+only for rotation instances. An ad-hoc flight saved with crew TBC never
+appears there — which is precisely the flight the crew-optional change
+above makes easy to create. The count is therefore labelled "Uncovered
+rotation seats today" with a caption saying ad-hoc flights are excluded,
+rather than being widened.
+
+**Trigger for revisiting:** if the operator reports ad-hoc gaps going
+unseen, the fix is to widen the count to flights with an empty cockpit
+seat, accepting the per-flight roster lookup on every home page load
+that `roster_coverage()` does. That cost is the only reason it is not
+already done.
+
+**The banner is SKIPPED, not merely wrapped, when the DB is
+unreachable.** Found while building it: `try/except` catches a failing
+query but not a hanging one, and against an unreachable database the two
+queries sat in connection retries until the page took over three seconds
+to render. It was still correct and still rendered — it just stopped
+being usable at the moment an operator most needs to see something.
+`db_status` is already known one line above, so the banner is gated on
+it. Each half is still independently wrapped for the case where the
+connection is up but one query fails on its own.
+
+### Two smaller items
+
+**Crew and flight identity display.** A controller thinks "AE92" and
+"EPE 786", not `CPT-01` and `#4242`. `services/display_labels.py` is now
+the single home for how both are named on screen — nine `format_func`
+call sites across four pages each used to roll their own. `crew_id` and
+`flight_id` are unchanged and remain the identifiers; only the label
+moves. The fallbacks are the whole difficulty, and are why this is one
+module rather than nine copies: one real crew member has no
+`operator_staff_id`, and every ad-hoc flight has a null `flight_no`.
+Flight labels carry the date because flight numbers repeat daily.
+
+**The UTC clock read as stale.** It was a render-time snapshot displayed
+as a clock face, so a page left open showed a time ten minutes old.
+Static would have been tolerable; wrong is not, on a system where times
+drive legality and a controller reads UTC off the screen while entering
+duty times. Relabelled to "checked {time} UTC" rather than removed:
+worded as the moment the check happened, it does a real job — it says
+how fresh the connection status beside it is. No auto-refresh; that is a
+dependency and a wakeup cycle for one line of text.
+
+### Not a bug: Control Room's pair fields
+
+Reported as a possible gap — that Control Room showed only a "Role *"
+selectbox rather than Commander and Second Pilot. It was fully migrated
+in the flight-deck package. "Role *" appeared only in the single-crew
+mode of the "Crew type" radio, whose selection persisted across sessions
+via `key="control_room_crew_type"`. Investigated before building, and it
+reordered nothing — but the finding did lead directly to removing that
+mode entirely, above.
+
+### Explicitly not doing: duty swap in Control Room
+
+Swap stays a Roster operation. One write path through the legality gate,
+not two. Operator agrees; recorded so it isn't re-proposed.

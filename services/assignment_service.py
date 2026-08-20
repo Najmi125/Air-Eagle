@@ -2264,3 +2264,65 @@ def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = No
         query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY r.report_time, r.duty_id"
     return pd.read_sql(text(query), engine, params=params)
+
+
+def expiry_in_window(crew_row, date_from: Optional[dt.date], date_to: Optional[dt.date]) -> bool:
+    """True if ANY of the eight tracked documents expires inside
+    [date_from, date_to]. Either bound may be None for open-ended.
+
+    The single implementation of "expiring in this window". Lives here
+    because this module owns QUALIFICATION_EXPIRY_FIELDS and the
+    qualification gate that acts on it; services/assistant/reports.py
+    delegates to it rather than keeping its own copy, so the ops banner
+    on the home page and the crew_qualifications report can never come
+    to different conclusions about the same crew member.
+    """
+    for field_name in QUALIFICATION_EXPIRY_FIELDS:
+        value = crew_row[field_name]
+        if value is None or pd.isna(value):
+            continue
+        expiry = value.date() if hasattr(value, "date") else value
+        if date_from and expiry < date_from:
+            continue
+        if date_to and expiry > date_to:
+            continue
+        return True
+    return False
+
+
+def qualification_expiry_counts(as_of: Optional[dt.date] = None, horizon_days: int = 7) -> dict:
+    """Counts for the home-page ops banner:
+    {"expired": int, "expiring": int, "horizon_days": int}.
+
+    Deliberately returns COUNTS, not a report. reports.crew_qualifications()
+    covers the same ground but takes a query_parser.ReportRequest and
+    returns an exportable Dataset — the assistant's natural-language
+    surface. A landing page should not have to construct an NL request
+    object to learn how many documents need attention, and duplicating
+    the query would risk the two disagreeing, so this shares the
+    predicate above instead.
+
+    "expired" and "expiring" are counted SEPARATELY and are disjoint,
+    because the boundary is not the obvious one: the legality gate
+    treats expiry <= duty_date as already expired, so a document
+    expiring TODAY is invalid today, not "expiring soon". Folding them
+    into one number would let a controller read a document that is
+    already blocking assignments as one they still have time to renew.
+
+    Counts CREW MEMBERS, not documents — one person with three lapsed
+    documents is one row to action, and is what the Crew Data page will
+    show them.
+    """
+    as_of = as_of or dt.date.today()
+    crew = crew_service.get_all_crew(active_only=True)
+    if crew.empty:
+        return {"expired": 0, "expiring": 0, "horizon_days": horizon_days}
+
+    expired = crew.apply(lambda row: expiry_in_window(row, None, as_of), axis=1).sum()
+    expiring = crew.apply(
+        lambda row: expiry_in_window(
+            row, as_of + dt.timedelta(days=1), as_of + dt.timedelta(days=horizon_days)),
+        axis=1,
+    ).sum()
+
+    return {"expired": int(expired), "expiring": int(expiring), "horizon_days": horizon_days}

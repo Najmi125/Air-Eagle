@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from services import crew_service, auth_service
+from services.display_labels import crew_label
 
 st.set_page_config(page_title="Crew Data", page_icon="👨‍✈️", layout="wide")
 app_user = auth_service.require_login()
@@ -138,7 +139,10 @@ st.subheader("Edit or deactivate existing crew")
 if crew_df.empty:
     st.info("No crew records yet.")
 else:
-    selected_id = st.selectbox("Select crew member", crew_df["crew_id"])
+    selected_id = st.selectbox(
+        "Select crew member", crew_df["crew_id"],
+        format_func=lambda cid: crew_label(crew_df[crew_df["crew_id"] == cid].iloc[0]),
+    )
     selected = crew_service.get_crew(selected_id)
 
     if selected is not None:

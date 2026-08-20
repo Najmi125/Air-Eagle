@@ -26,7 +26,7 @@ import datetime as dt
 
 import streamlit as st
 from db.db import test_connection
-from services import auth_service
+from services import assignment_service, auth_service, roster_generator_service
 
 st.set_page_config(page_title="Air Eagle OCC", page_icon="✈️", layout="wide")
 app_user = auth_service.require_login()
@@ -88,10 +88,85 @@ db_status = test_connection()
 if db_status is True:
     # The leading emoji (only) gets extracted into st.success()'s own
     # icon slot, not left in the body -- confirmed directly (2026-08-11).
-    # The clock emoji further into the string stays as literal text.
-    st.success(f"🟢 Database connected — 🕐 {now_utc:%d-%m-%Y %H%M} UTC")
+    #
+    # "checked", not a clock face (2026-08-20). This was rendered as
+    # "🕐 {time} UTC" and read as a live UTC clock, which it never was —
+    # it is a render-time snapshot, so on a page left open it showed a
+    # time ten minutes stale. Static would have been tolerable; WRONG is
+    # not, on a system where times drive legality and a controller reads
+    # UTC off the screen while entering duty times.
+    #
+    # Relabelled rather than removed: worded as the moment the check
+    # happened, the timestamp does a real job — it says how fresh the
+    # connection status beside it is. Removing it would lose that. No
+    # auto-refresh: this page does no other work, and a refresh loop is
+    # a dependency and a wakeup cycle for a line of text.
+    st.success(f"🟢 Database connected — checked {now_utc:%d-%m-%Y %H%M} UTC")
 else:
     st.error(f"Database error: {db_status}")
+
+
+# ================= OPS STATUS =================
+# Two things the operator wants on landing. Presentation over existing
+# services — no query logic here.
+#
+# Gated on db_status, which was just established one line above. Not
+# merely an optimisation: try/except catches a FAILING query but not a
+# HANGING one, and against an unreachable database these two queries sit
+# in connection retries until they time out. That took the home page
+# from instant to over three seconds when the DB was down — the page was
+# still correct and still rendered, it just stopped being usable at the
+# moment the operator most needs to see something. Asking a database we
+# have already been told is unreachable was never going to work; not
+# asking is both faster and simpler than making the failure prettier.
+#
+# Each half is ALSO wrapped independently, for the case where the
+# connection is up but one query fails on its own (a missing table, a
+# migration not yet applied). This page's job is to load and point at
+# the other pages, and a status banner must never be what stops it doing
+# that — same rule as the Schedule Templates delete affordance that took
+# its page down on 2026-08-19.
+st.subheader("Today")
+
+if db_status is not True:
+    st.caption("Ops status unavailable while the database is unreachable.")
+else:
+    ops_col1, ops_col2 = st.columns(2)
+
+    with ops_col1:
+        try:
+            today = dt.date.today()
+            uncovered = roster_generator_service.get_open_uncovered_seats(today, today)
+            st.metric("Uncovered rotation seats today", len(uncovered))
+            # Precise on purpose. get_open_uncovered_seats() reads the
+            # uncovered_seats table, which ONLY the roster generator
+            # populates and only for rotation instances. An ad-hoc flight
+            # saved without crew never appears there, so this is not "all
+            # uncovered work" — see HANDOVER.md for why that boundary
+            # exists and what would trigger widening it.
+            st.caption(
+                "Rotation-generated seats only. Ad-hoc flights saved with crew TBC "
+                "are not counted here — check Flight Log for those."
+            )
+        except Exception as e:
+            st.caption(f"Uncovered seats unavailable ({type(e).__name__}).")
+
+    with ops_col2:
+        try:
+            expiry = assignment_service.qualification_expiry_counts()
+            # Split, never summed. The legality gate treats expiry <=
+            # duty_date as already expired, so a document expiring TODAY is
+            # blocking assignments right now rather than "due soon". One
+            # combined number would hide that distinction behind a word
+            # that implies there is still time.
+            st.metric("Crew with expired documents", expiry["expired"])
+            st.metric(
+                f"Crew with documents expiring in {expiry['horizon_days']} days",
+                expiry["expiring"],
+            )
+            st.caption("Renew in Crew Data — expiry fields are on the edit form.")
+        except Exception as e:
+            st.caption(f"Document expiry unavailable ({type(e).__name__}).")
 
 st.write("Use the sidebar to navigate.")
 # Page-link buttons (2026-08-12: added, then removed same day) were

@@ -14,6 +14,7 @@ import streamlit as st
 
 from services import flight_service, assignment_service, auth_service
 from services.alert_summary import format_alert_lines
+from services.display_labels import flight_label
 
 st.set_page_config(page_title="Flight Log", page_icon="📘", layout="wide")
 app_user = auth_service.require_login()
@@ -94,7 +95,13 @@ st.subheader("Record actuals, update status, or cancel a flight")
 if flights_df.empty:
     st.info("No flights yet.")
 else:
-    selected_id = st.selectbox("Select flight", flights_df["flight_id"])
+    # Labelled by flight number and date; flight_id stays the
+    # identifier and the selection value.
+    selected_id = st.selectbox(
+        "Select flight", flights_df["flight_id"],
+        format_func=lambda fid: flight_label(
+            flights_df[flights_df["flight_id"] == fid].iloc[0], include_route=True),
+    )
     selected = flight_service.get_flight(selected_id)
 
     if selected is not None:

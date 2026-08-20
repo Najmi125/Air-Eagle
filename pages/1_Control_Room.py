@@ -40,6 +40,7 @@ import datetime as dt
 import streamlit as st
 
 from services import crew_service, assignment_service, auth_service, flight_service
+from services.display_labels import crew_label
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
 from services.alert_summary import format_alert_lines
 
@@ -103,13 +104,13 @@ second_pilot_id = None
 if assign_pair and pair_possible:
     commander_id = st.selectbox(
         "Commander (must be CPT) *", options=commander_pool["crew_id"],
-        format_func=lambda cid: f"{cid} — {commander_pool[commander_pool['crew_id'] == cid]['name'].values[0]}",
+        format_func=lambda cid: crew_label(commander_pool[commander_pool["crew_id"] == cid].iloc[0]),
         key="control_room_commander",
     )
     second_pilot_options = second_pilot_pool_full[second_pilot_pool_full["crew_id"] != commander_id]
     second_pilot_id = st.selectbox(
         "Second Pilot (CPT or FO) *", options=second_pilot_options["crew_id"],
-        format_func=lambda cid: f"{cid} — {second_pilot_options[second_pilot_options['crew_id'] == cid]['name'].values[0]}",
+        format_func=lambda cid: crew_label(second_pilot_options[second_pilot_options["crew_id"] == cid].iloc[0]),
         key="control_room_second_pilot",
     ) if not second_pilot_options.empty else None
     if second_pilot_id is None:
