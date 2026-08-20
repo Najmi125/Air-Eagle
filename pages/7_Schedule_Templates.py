@@ -246,16 +246,51 @@ else:
             # rather than hidden, so "why can't I remove this?" is
             # answered in place instead of looking like a missing
             # feature.
-            if len(versions) == 1:
-                deletability = rts.get_template_deletability(int(versions.iloc[0]["id"]))
-            else:
+            # Wrapped because this whole block is an AFFORDANCE, not the
+            # page's job. Everything above it — the version table, the
+            # current legs, and further down the expand and review
+            # workflows — is what a controller actually comes here for.
+            # A convenience that decides whether one button is greyed
+            # out must never be able to take that off the air.
+            #
+            # It did, on 2026-08-19: the deployed page raised
+            # AttributeError here and the entire Schedule Templates page
+            # stopped rendering, leaving the operator unable to view,
+            # create, expand or review anything, and unable to clean up
+            # the very templates this feature exists to remove.
+            #
+            # Degrading also removes the hard migration prerequisite
+            # this call had introduced. get_template_deletability()
+            # calls migrations/019's rotation_template_is_deletable(),
+            # so against a pre-019 database the page previously failed
+            # to render at all rather than merely failing to delete.
+            # Now it renders with delete unavailable, which is the
+            # correct behaviour for a database that predates the
+            # feature.
+            #
+            # Deliberately NOT silent: the reason is shown, so a
+            # degraded delete control is visibly degraded rather than
+            # looking like a template that happens to be undeletable.
+            try:
+                if len(versions) == 1:
+                    deletability = rts.get_template_deletability(int(versions.iloc[0]["id"]))
+                else:
+                    deletability = {
+                        "deletable": False,
+                        "reason": (
+                            f"{code} has {len(versions)} versions. Only a sole-version template "
+                            f"can be deleted — removing one version of a chain would leave its "
+                            f"predecessor permanently closed, since effective_until can only be "
+                            f"closed once. Supersede it with a new version instead."
+                        ),
+                    }
+            except Exception as e:
                 deletability = {
                     "deletable": False,
                     "reason": (
-                        f"{code} has {len(versions)} versions. Only a sole-version template "
-                        f"can be deleted — removing one version of a chain would leave its "
-                        f"predecessor permanently closed, since effective_until can only be "
-                        f"closed once. Supersede it with a new version instead."
+                        f"delete availability could not be determined ({type(e).__name__}: {e}). "
+                        f"The rest of this page is unaffected. If this persists, check that "
+                        f"migrations/019 has been applied and reboot the app."
                     ),
                 }
             if not deletability["deletable"]:
