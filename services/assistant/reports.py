@@ -156,17 +156,18 @@ def flight_records(request: query_parser.ReportRequest) -> Dataset:
 
 
 def _expiry_in_window(row: pd.Series, qual_fields: list[str], date_from, date_to) -> bool:
-    for field_name in qual_fields:
-        value = row[field_name]
-        if value is None or pd.isna(value):
-            continue
-        expiry = value.date() if hasattr(value, "date") else value
-        if date_from and expiry < date_from:
-            continue
-        if date_to and expiry > date_to:
-            continue
-        return True
-    return False
+    """Delegates to assignment_service.expiry_in_window() (2026-08-20).
+
+    Was an independent implementation until the home-page ops banner
+    needed the same question answered. One predicate, so the banner and
+    this report can never disagree about whether a given crew member's
+    documents are expiring — the same reasoning as compute_duty_window()
+    routing through build_duty(). qual_fields is retained in the
+    signature for call-site compatibility but is now always the full
+    tracked set the shared function reads from
+    QUALIFICATION_EXPIRY_FIELDS.
+    """
+    return assignment_service.expiry_in_window(row, date_from, date_to)
 
 
 def crew_qualifications(request: query_parser.ReportRequest) -> Dataset:

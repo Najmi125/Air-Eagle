@@ -1,13 +1,22 @@
 """
 tests/test_control_room_page.py
 
-Rebuilt for the flight-deck crew package (2026-08-13): the page now
-has a "Crew type" radio (defaults to the flight-deck pair path) that
-determines which fields render — Commander/Second Pilot selectboxes
-live OUTSIDE the form (read before submission, same reasoning as
-every other live-updating control in this codebase), the single
-crew_id/role selectboxes for LM/ENGR/Other live INSIDE the form and
-only render when "Single crew" is selected.
+Rebuilt for the flight-deck crew package (2026-08-13): Commander/Second
+Pilot selectboxes live OUTSIDE the form (read before submission, same
+reasoning as every other live-updating control in this codebase).
+
+Updated 2026-08-20. The "Crew type" radio and the single-crew
+(LM/ENGR/Other) path are GONE — there is no such thing as a flight
+operated by one crew member, and the one combination that still worked
+created a flight with no flight deck. Crew is now OPTIONAL instead: an
+"Assign a flight-deck pair now" checkbox, ticked by default, gates the
+pair selectors. Unticked, only the flight is created.
+
+The tests below split into two groups. The DB-backed ones at the top
+exercise the legality gate and need real Postgres. The DB-free ones at
+the bottom fake the service layer — added because every operational
+finding on this page so far was found on a live deployment rather than
+by this suite, which skips entirely wherever Postgres is absent.
 """
 import os
 import sys
@@ -67,9 +76,15 @@ def test_page_loads_without_exception(page_app):
     assert not at.exception
 
 
-def test_no_active_crew_shows_warning(page_app):
+def test_no_active_crew_is_informational_not_fatal(page_app):
+    """Was a warning + st.stop() until 2026-08-20. An empty crew list is
+    the state a fresh deployment is in, and a flight with crew TBC must
+    still be recordable then — so it is now an st.info and the form
+    still renders."""
     at = page_app.run()
-    assert any("No active crew" in w.value for w in at.warning)
+    assert not at.exception
+    assert any("No active crew" in i.value for i in at.info)
+    assert any(b.label == "Check legality and save" for b in at.button)
 
 
 def test_no_eligible_pair_shows_warning(page_app):
@@ -191,29 +206,170 @@ def test_needs_review_pair_assignment_shows_warning_not_success(page_app):
     assert len(fs.get_all_flights()) == 0  # nothing saved
 
 
-def test_single_crew_path_still_works_for_lm(page_app):
-    """The unaffected LM/ENGR/Other path — switching Crew type off
-    the default pair option renders the single crew_id/role form
-    instead."""
-    lm = _seed_crew("LM")
+def test_single_crew_path_is_gone(page_app):
+    """REPLACES test_single_crew_path_still_works_for_lm (2026-08-20).
+
+    That test asserted the LM/ENGR/Other single-crew path worked. It is
+    deliberately removed: there is no such thing as a flight operated by
+    one crew member. The path predated the pair model, and its one live
+    combination — an "Other" crew member assigned role "Other" — created
+    a flight with no flight deck at all.
+
+    Kept as an assertion of the new rule rather than deleted, so the
+    absence is pinned and can't quietly come back."""
+    _seed_crew("LM")
     at = page_app.run()
 
-    at.radio[0].set_value("Single crew (LM / ENGR / Other)")
-    at = at.run()
+    assert not at.exception
+    assert not any("Crew type" in r.label for r in at.radio), (
+        "the Crew type radio should be gone — there is no single-crew mode"
+    )
+    assert not any("Role" in s.label for s in at.selectbox), (
+        "a bare Role selectbox means the single-crew path is still reachable"
+    )
 
-    at.text_input[0].input("KHI")
-    at.text_input[1].input("LHE")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.time_input[0].set_value(dt.time(5, 45))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(7, 45))
-    at.selectbox[0].select(lm)     # Crew member
-    at.selectbox[1].select("LM")   # Role
-    at.button[0].click()
+
+# ------------------------------------------------------------------
+# Crew-optional and single-crew removal (2026-08-20) — DB-free
+# ------------------------------------------------------------------
+#
+# No database: crew_service/flight_service are faked, so these run
+# everywhere. Deliberate — every other test of this page is DB-gated,
+# and the operational findings that produced these changes were all
+# found on a live deployment rather than by the suite.
+
+import pandas as pd  # noqa: E402
+from streamlit.testing.v1 import AppTest  # noqa: E402
+
+from tests.conftest import page_path  # noqa: E402
+
+_CREW_COLUMNS = ["crew_id", "name", "role", "is_active"]
+_PAIR_CREW = pd.DataFrame([
+    {"crew_id": "CPT-01", "name": "Alpha", "role": "CPT", "is_active": True},
+    {"crew_id": "FO-01", "name": "Bravo", "role": "FO", "is_active": True},
+], columns=_CREW_COLUMNS)
+
+
+@pytest.fixture
+def faked_services(monkeypatch):
+    """crew list + a capturing add_flight. Returns the list of flights
+    written, so a test can assert exactly what reached the service."""
+    from services import crew_service as cs
+    from services import flight_service as fs
+
+    written = []
+    monkeypatch.setattr(cs, "get_all_crew", lambda active_only=True: _PAIR_CREW.copy())
+    monkeypatch.setattr(fs, "add_flight",
+                        lambda data, app_user=None: (written.append(data), 4242)[1])
+    return written
+
+
+def _render(assign_pair=True):
+    at = AppTest.from_file(str(page_path("pages/1_Control_Room.py")))
+    at.session_state["app_user"] = "occ1"
+    at.session_state["control_room_assign_pair"] = assign_pair
+    at.run()
+    return at
+
+
+def _fill_flight(at, operating="", non_operating=""):
+    """Exact-prefix matching, NOT substring: the non-operating label
+    contains the operating one ("...non-operating (aboard" contains
+    "operating (aboard"), so a substring match fills both fields with
+    the same value."""
+    for t in at.text_input:
+        if t.label.startswith("Origin"):
+            t.input("KHI")
+        elif t.label.startswith("Destination"):
+            t.input("LHE")
+        elif t.label.startswith("Other occupants — non-operating"):
+            t.input(non_operating)
+        elif t.label.startswith("Other occupants — operating"):
+            t.input(operating)
+
+
+def test_no_single_crew_controls_in_any_mode(faked_services):
+    """Item A: the single-crew path must be unreachable regardless of
+    the crew-optional toggle."""
+    for assign_pair in (True, False):
+        at = _render(assign_pair=assign_pair)
+        assert not at.exception
+        assert not any("Crew type" in r.label for r in at.radio)
+        assert not any("Role" in s.label for s in at.selectbox), (
+            f"Role selectbox present with assign_pair={assign_pair}"
+        )
+
+
+def test_pair_selectors_render_when_assigning_and_vanish_when_not(faked_services):
+    """Item C: the pair controls are the thing being made optional."""
+    labels = [s.label for s in _render(assign_pair=True).selectbox]
+    assert any(l.startswith("Commander") for l in labels)
+    assert any(l.startswith("Second Pilot") for l in labels)
+
+    assert _render(assign_pair=False).selectbox == []
+
+
+def test_flight_saves_with_no_crew_when_pair_is_not_assigned(faked_services):
+    """The whole point of item C: 'charter confirmed, crew TBC' now has
+    a path that doesn't go through Flight Log."""
+    at = _render(assign_pair=False)
+    _fill_flight(at, operating="Abdulghani (LM), 2x AME")
+    [b for b in at.button if "Check legality" in b.label][0].click()
     at = at.run()
 
     assert not at.exception
-    assert any("ALLOWED" in s.value for s in at.success)
+    assert any("no crew assigned" in s.value for s in at.success)
+    assert len(faked_services) == 1
+    assert faked_services[0]["origin"] == "KHI"
 
-    from services import assignment_service
-    assert len(assignment_service.get_roster_for_crew(lm)) == 1
+
+def test_occupant_fields_are_recorded_and_independent(faked_services):
+    """Item B: both columns have existed since migrations/010 and
+    roster_coverage() has always displayed them, but nothing wrote
+    them. Asserted independently because the two labels overlap."""
+    at = _render(assign_pair=False)
+    _fill_flight(at, operating="OPERATING-VALUE", non_operating="NONOP-VALUE")
+    [b for b in at.button if "Check legality" in b.label][0].click()
+    at = at.run()
+
+    written = faked_services[0]
+    assert written["other_occupants_operating"] == "OPERATING-VALUE"
+    assert written["other_occupants_non_operating"] == "NONOP-VALUE"
+
+
+def test_page_still_renders_with_no_crew_on_file(monkeypatch):
+    """Previously st.stop()'d on an empty crew list, which is the state
+    a fresh deployment is in. A flight with crew TBC must still be
+    recordable then — that is when it is most likely."""
+    from services import crew_service as cs
+    monkeypatch.setattr(cs, "get_all_crew",
+                        lambda active_only=True: pd.DataFrame(columns=_CREW_COLUMNS))
+
+    at = _render(assign_pair=True)
+
+    assert not at.exception
+    assert any(b.label == "Check legality and save" for b in at.button), (
+        "the flight form must still be reachable with no crew on file"
+    )
+
+
+def test_requesting_a_pair_that_cannot_be_formed_saves_nothing(monkeypatch):
+    """Must not silently downgrade to an uncrewed flight: the
+    controller asked for crew. Refuse, and say how to proceed."""
+    from services import crew_service as cs
+    from services import flight_service as fs
+
+    written = []
+    monkeypatch.setattr(cs, "get_all_crew",
+                        lambda active_only=True: pd.DataFrame(columns=_CREW_COLUMNS))
+    monkeypatch.setattr(fs, "add_flight",
+                        lambda data, app_user=None: (written.append(data), 1)[1])
+
+    at = _render(assign_pair=True)
+    _fill_flight(at)
+    [b for b in at.button if "Check legality" in b.label][0].click()
+    at = at.run()
+
+    assert not at.exception
+    assert any("Nothing was saved" in e.value for e in at.error)
+    assert written == [], "an uncrewed flight must not be created when a pair was requested"

@@ -23,6 +23,7 @@ import streamlit as st
 from services import crew_service, flight_service, assignment_service, auth_service
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
 from services.alert_summary import format_alert_lines
+from services.display_labels import crew_label, flight_labels as build_flight_labels
 
 st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
 app_user = auth_service.require_login()
@@ -68,11 +69,11 @@ commander_pool = commander_pool[commander_pool["role"].isin(SEAT_ELIGIBLE_GRADES
 second_pilot_pool_full = crew_service.get_all_crew(active_only=True)
 second_pilot_pool_full = second_pilot_pool_full[second_pilot_pool_full["role"].isin(SEAT_ELIGIBLE_GRADES["SECOND_PILOT"])]
 
-flight_labels = {
-    row["flight_id"]: f"#{row['flight_id']} {row['origin']}→{row['destination']} "
-                       f"{row['dep_time_planned']} ({'domestic' if row['domestic'] else 'international'})"
-    for _, row in flights_df.iterrows()
-}
+# Flight number leading, not flight_id: a controller thinks "EPE 786".
+# The date is part of it because numbers repeat daily, and the route
+# distinguishes two same-numbered options. flight_id stays the
+# identifier — it is only the LABEL that changes.
+flight_labels = build_flight_labels(flights_df, include_route=True)
 
 if commander_pool.empty or second_pilot_pool_full.empty:
     st.warning("Need at least one active CPT (Commander) and one active CPT/FO (Second Pilot) on file.")
@@ -87,12 +88,12 @@ else:
         col1, col2 = st.columns(2)
         commander_id = col1.selectbox(
             "Commander (must be CPT) *", options=commander_pool["crew_id"],
-            format_func=lambda cid: f"{cid} — {commander_pool[commander_pool['crew_id'] == cid]['name'].values[0]}",
+            format_func=lambda cid: crew_label(commander_pool[commander_pool["crew_id"] == cid].iloc[0]),
         )
         second_pilot_options = second_pilot_pool_full[second_pilot_pool_full["crew_id"] != commander_id]
         second_pilot_id = col2.selectbox(
             "Second Pilot (CPT or FO) *", options=second_pilot_options["crew_id"],
-            format_func=lambda cid: f"{cid} — {second_pilot_options[second_pilot_options['crew_id'] == cid]['name'].values[0]}",
+            format_func=lambda cid: crew_label(second_pilot_options[second_pilot_options["crew_id"] == cid].iloc[0]),
         ) if not second_pilot_options.empty else None
 
         pair_submitted = st.form_submit_button("Check legality and assign pair")
@@ -180,7 +181,7 @@ else:
         crew_id = st.selectbox(
             "Crew member *",
             options=crew_df["crew_id"],
-            format_func=lambda cid: f"{cid} — {crew_df[crew_df['crew_id'] == cid]['name'].values[0]}",
+            format_func=lambda cid: crew_label(crew_df[crew_df["crew_id"] == cid].iloc[0]),
             key="other_crew",
         )
         role_choice = st.selectbox("Role for this assignment *", OTHER_ROLE_OPTIONS)

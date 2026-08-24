@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
 import pytest
 from db.db import get_engine
 from tests.conftest import authed_app_test
@@ -89,9 +90,92 @@ def test_page_loads_without_exception_when_db_unreachable():
 def test_router_loads_the_default_home_page_without_exception():
     """app.py itself -- confirms every st.Page() path resolves (no
     typo'd filename) and st.navigation()/pg.run() correctly renders
-    the default=True page (home.py) with no exception."""
-    with patch("db.db.test_connection", return_value=True):
+    the default=True page (home.py) with no exception.
+
+    The two ops-banner services are patched alongside test_connection
+    (2026-08-20). Patching test_connection alone tells home.py the
+    database is reachable, which is exactly the branch that then runs
+    the banner's real queries — against no database, so they sit in
+    connection retries until AppTest times out. That is a TEST
+    dependency, not a page fault: this test is about the router
+    resolving its pages, and it should not be making network calls to
+    find that out.
+    """
+    with patch("db.db.test_connection", return_value=True), \
+         patch("services.roster_generator_service.get_open_uncovered_seats",
+               return_value=pd.DataFrame()), \
+         patch("services.assignment_service.qualification_expiry_counts",
+               return_value={"expired": 0, "expiring": 0, "horizon_days": 7}):
         at = authed_app_test("app.py")
         at.run()
         assert not at.exception
         assert any("Database connected" in s.value for s in at.success)
+
+
+# ------------------------------------------------------------------
+# Ops status banner (2026-08-20) — DB-free
+# ------------------------------------------------------------------
+
+def test_ops_banner_does_not_query_a_database_known_to_be_unreachable():
+    """Regression: the banner must be SKIPPED, not merely wrapped, when
+    the connection check has already failed.
+
+    try/except catches a failing query but not a hanging one. With the
+    queries unconditional, an unreachable database left them sitting in
+    connection retries and the home page took over three seconds to
+    render — it was still correct, it just stopped being usable at the
+    moment an operator most needs to see something. Asserted by making
+    either query an outright failure: if the page reaches them at all,
+    this test fails."""
+    called = []
+
+    def must_not_run(*args, **kwargs):
+        called.append(args)
+        raise AssertionError("ops banner queried an unreachable database")
+
+    with patch("db.db.test_connection", return_value="connection refused"), \
+         patch("services.roster_generator_service.get_open_uncovered_seats", must_not_run), \
+         patch("services.assignment_service.qualification_expiry_counts", must_not_run):
+        at = authed_app_test("home.py")
+        at.run()
+
+    assert not at.exception
+    assert called == [], "no ops query may run when the DB is unreachable"
+    assert any("Ops status unavailable" in c.value for c in at.caption)
+
+
+def test_ops_banner_renders_counts_when_the_database_is_up():
+    """The healthy path — and that the two document counts stay
+    SEPARATE. A document expiring today is already expired under the
+    legality gate's boundary, so folding them into one number would let
+    a controller read a blocking document as one they still have time to
+    renew."""
+    with patch("db.db.test_connection", return_value=True), \
+         patch("services.roster_generator_service.get_open_uncovered_seats",
+               return_value=pd.DataFrame([{"x": 1}, {"x": 2}])), \
+         patch("services.assignment_service.qualification_expiry_counts",
+               return_value={"expired": 3, "expiring": 1, "horizon_days": 7}):
+        at = authed_app_test("home.py")
+        at.run()
+
+    assert not at.exception
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Uncovered rotation seats today"] == "2"
+    assert metrics["Crew with expired documents"] == "3"
+    assert metrics["Crew with documents expiring in 7 days"] == "1"
+
+
+def test_ops_banner_survives_one_query_failing_on_its_own():
+    """Connection up, one query broken — a missing table, a migration
+    not yet applied. The other half must still render."""
+    with patch("db.db.test_connection", return_value=True), \
+         patch("services.roster_generator_service.get_open_uncovered_seats",
+               side_effect=RuntimeError("relation uncovered_seats does not exist")), \
+         patch("services.assignment_service.qualification_expiry_counts",
+               return_value={"expired": 2, "expiring": 0, "horizon_days": 7}):
+        at = authed_app_test("home.py")
+        at.run()
+
+    assert not at.exception
+    assert any("Uncovered seats unavailable" in c.value for c in at.caption)
+    assert {m.label: m.value for m in at.metric}["Crew with expired documents"] == "2"
