@@ -324,6 +324,29 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`ops-findings-round-1` merged into `main` (2026-08-20).** The first
+  operational-use findings: qualification renewal through the UI (which
+  was blocking — renewing a medical previously required raw SQL), other
+  occupants recordable at last, Control Room's single-crew path removed
+  and crew made optional, a home-page ops banner, crew/flight display
+  labels, and an honest UTC timestamp. **621/621 verified against real
+  Postgres 16**, reachability clean, including the three paths that
+  could not run locally: a 2020 medical renewing to 2030 through
+  `update_crew`, occupant free text round-tripping, and the label
+  fallbacks for a null staff ID and a null `flight_no`. See the dated
+  log entry at the end of this file. Merged, pushed; branch deleted,
+  remote and local.
+
+  **⚠ Needs a reboot from Manage app after deploying** — it adds
+  `services/display_labels.py`, a new module imported by four pages.
+  This is the second time: the same stale-`sys.modules` condition took
+  the Schedule Templates page down on 2026-08-19. Streamlit re-executes
+  page scripts on every rerun but keeps imported modules for the life of
+  the process, so a page calling into a module the running process never
+  imported raises `AttributeError`/`ImportError` until restarted. Treat
+  "this change adds or newly imports a service module" as meaning
+  "reboot after deploy", every time.
+
 - **⚠ ONE OUTSTANDING BRANCH, HELD DELIBERATELY (2026-08-19):
   `pin-python-version`.** Not merged, not abandoned. It adds
   `runtime.txt` declaring `python-3.12` and a guard asserting the suite
@@ -6265,7 +6288,8 @@ the same family of reasons — it drives the live "this will end version
 N on …" preview, which has to update before submit to be a preview at
 all.
 
-## 2026-08-20: first operational-use findings — renewal, occupants, Control Room, home banner
+## 2026-08-20: first operational-use findings — renewal, occupants,
+## Control Room, home banner. MERGED into `main` 2026-08-20.
 
 Six findings from the operator's first real use of the deployed app,
 ordered by whether they blocked work.
@@ -6420,3 +6444,25 @@ mode entirely, above.
 
 Swap stays a Roster operation. One write path through the legality gate,
 not two. Operator agrees; recorded so it isn't re-proposed.
+
+### 2026-08-20 (continued): verified green, merged, and a deployment rule worth naming
+
+**621 passed, 0 failed against real Postgres 16.** Reachability clean.
+The three paths that could not run locally were checked directly: a
+medical expired in 2020 renewing to 2030-06-01 through `update_crew`
+(the blocking gap genuinely closed), occupant free text round-tripping
+as an operator would type it, and the label fallbacks for a null staff
+ID and a null `flight_no`.
+
+**A deployment rule, now that it has happened twice.** This change adds
+`services/display_labels.py`, a new module imported by four pages, so it
+needs a **reboot from Manage app after deploying**. The same
+stale-`sys.modules` condition took the Schedule Templates page down on
+2026-08-19: Streamlit re-executes page scripts on every rerun but keeps
+imported modules for the life of the process, so a page calling into a
+module the running process never imported fails until restarted.
+
+The rule to apply without thinking about it: **if a change adds a
+service module, or makes a page import one it did not import before,
+reboot after deploying.** Both incidents fit it, and neither was
+detectable from the diff alone — the code was correct in both cases.
