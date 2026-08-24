@@ -90,8 +90,22 @@ def test_page_loads_without_exception_when_db_unreachable():
 def test_router_loads_the_default_home_page_without_exception():
     """app.py itself -- confirms every st.Page() path resolves (no
     typo'd filename) and st.navigation()/pg.run() correctly renders
-    the default=True page (home.py) with no exception."""
-    with patch("db.db.test_connection", return_value=True):
+    the default=True page (home.py) with no exception.
+
+    The two ops-banner services are patched alongside test_connection
+    (2026-08-20). Patching test_connection alone tells home.py the
+    database is reachable, which is exactly the branch that then runs
+    the banner's real queries — against no database, so they sit in
+    connection retries until AppTest times out. That is a TEST
+    dependency, not a page fault: this test is about the router
+    resolving its pages, and it should not be making network calls to
+    find that out.
+    """
+    with patch("db.db.test_connection", return_value=True), \
+         patch("services.roster_generator_service.get_open_uncovered_seats",
+               return_value=pd.DataFrame()), \
+         patch("services.assignment_service.qualification_expiry_counts",
+               return_value={"expired": 0, "expiring": 0, "horizon_days": 7}):
         at = authed_app_test("app.py")
         at.run()
         assert not at.exception
