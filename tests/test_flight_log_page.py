@@ -38,40 +38,26 @@ def test_empty_flight_log_shows_info_message(page_app):
     assert any("No flights yet" in info.value for info in at.info)
 
 
-def test_add_flight_via_form_succeeds_and_shows_in_log(page_app):
-    at = page_app.run()
+def test_flight_log_no_longer_offers_flight_creation(page_app):
+    """REPLACES test_add_flight_via_form_succeeds_and_shows_in_log and
+    test_add_flight_missing_origin_shows_error (2026-08-21). Both moved
+    to tests/test_control_room_page.py — same coverage, different page.
 
-    at.text_input[1].input("KHI")   # Origin *
-    at.text_input[2].input("LHE")   # Destination *
-    at.date_input[0].set_value(dt.date(2026, 7, 20))   # Departure date
-    at.time_input[0].set_value(dt.time(5, 0))           # Departure time
-    at.date_input[1].set_value(dt.date(2026, 7, 20))   # Arrival date
-    at.time_input[1].set_value(dt.time(7, 0))           # Arrival time
-    at.button[0].click()
-    at = at.run()
+    This page and Control Room carried identical seven-field add-flight
+    forms, so "where do I add a flight?" had two answers. Creation now
+    belongs to Control Room (where a controller ACTS); this page is the
+    record (what happened, and where actuals are entered).
+
+    Pinned as an absence, the way test_single_crew_path_is_gone pins
+    the removed single-crew path — a duplicate form is the kind of
+    thing that gets helpfully re-added."""
+    at = page_app.run()
 
     assert not at.exception
-    assert any("Added flight" in s.value for s in at.success)
-
-    at = at.run()
-    df = at.dataframe[0].value
-    assert "KHI" in list(df["origin"])
-    assert "LHE" in list(df["destination"])
-
-
-def test_add_flight_missing_origin_shows_error(page_app):
-    at = page_app.run()
-
-    # Destination filled, origin left blank
-    at.text_input[2].input("LHE")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.time_input[0].set_value(dt.time(5, 0))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(7, 0))
-    at.button[0].click()
-    at = at.run()
-
-    assert any("Missing required flight field" in e.value for e in at.error)
+    assert not any(b.label == "Add flight" for b in at.button), (
+        "flight creation belongs to Control Room, not here"
+    )
+    assert not any("Add flight" in h.value for h in at.subheader)
 
 
 def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):

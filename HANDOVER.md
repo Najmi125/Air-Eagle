@@ -6466,3 +6466,107 @@ The rule to apply without thinking about it: **if a change adds a
 service module, or makes a page import one it did not import before,
 reboot after deploying.** Both incidents fit it, and neither was
 detectable from the diff alone — the code was correct in both cases.
+
+## 2026-08-21: Control Room / Flt Schedule restructure — act vs. record
+
+Control Room and Flight Log both carried an identical seven-field
+add-flight form, so "where do I add a flight?" had two answers and
+neither page had a clear job. The split now follows what a controller is
+doing:
+
+* **Control Room is where you ACT** — see the operation, create work.
+* **Flt Schedule is the RECORD** — what happened, searchable, and where
+  actuals are entered.
+
+**Control Room is three sections.** Operational status; add a flight;
+crew it, optionally. Flight creation moved here in full, gaining
+"Flight No (optional)" (which Flight Log's form had and this one didn't)
+and HHMM UTC times.
+
+**Home reverts to the DB status line and navigation.** The ops banner
+moved to Control Room and was extended with today's flights. Home is the
+page every session starts on and should stay the cheapest in the app;
+`test_home_makes_no_service_queries_at_all` pins that by patching both
+services to raise.
+
+### The column this section was nearly built on
+
+Section 1's flight board shows whether each cockpit seat is filled. The
+obvious source is `role_assigned` — and it is **wrong**. Under the pair
+model a Captain can legitimately occupy the SECOND_PILOT seat, so
+reading coverage off the grade reports the Commander seat filled twice
+and the Second Pilot seat empty. `operating_position` is the seat.
+
+That grade-versus-position conflation is exactly what the flight-deck
+crew package existed to remove, so building a status board on it would
+have reintroduced the defect in the one place a controller looks to
+decide whether a flight is crewed.
+
+`search_roster()` did not expose `operating_position`; it now does. The
+change is additive — no consumer selects columns positionally — and it
+is what lets the board read a whole day's seats in ONE query instead of
+a `get_roster_for_flight()` per flight, on a page that has to render
+under pressure. `test_status_board_reports_seats_from_operating_position`
+pins it with a deliberately CPT/CPT pair, which is the case that would
+pass if the wrong column were used and the seats happened to line up.
+
+### An ordering trap in the section layout
+
+Section 3 (crew) renders BELOW section 2 (the form) for the operator,
+but the submit handler needs `commander_id` — which section 3 defines.
+The naive layout puts the handler inside the form, where it runs before
+section 3 has executed: a `NameError` on the first click, from code that
+reads as correct.
+
+The form now declares `submitted` only, and the handler sits after
+section 3. Both ordering rules — crew controls outside the form, handler
+after section 3 — are in the page's module docstring, because each looks
+like a mistake until you hit the failure it prevents.
+
+### `services/time_entry.py`
+
+`_parse_hhmm`/`_format_hhmm` were page-local in Schedule Templates. Two
+consumers is where a page-local helper stops being page-local: a second
+copy would be a second place for the accepted formats and the error
+wording to drift. Moved to `services/time_entry.py` as `parse_hhmm` /
+`format_hhmm`, following the precedent `display_labels.py` set.
+
+Its blank-is-not-an-error contract matters in both callers and for
+opposite reasons: Schedule Templates needs blank to distinguish an
+untouched leg row from a filled one, and Flt Schedule needs blank to
+mean "this hasn't happened yet" rather than midnight. Callers that
+REQUIRE a time check for `None` themselves — Control Room does.
+
+### The rename is display-only
+
+"Flight Log" → **"Flt Schedule"** (operator's wording). The sidebar label
+comes from `app.py`'s `st.Page(title=...)`, so no file rename was
+needed — renaming `pages/3_Flight_Log.py` would have touched every
+`AppTest.from_file()` in the tests and `check_reachability.py`'s
+entry-point handling, for a label. The `flights` table and
+`flight_service` are untouched.
+
+Stale references were checked. `pages/4_Roster.py` said *"No flights in
+Flight Log yet — add one there first"*, which after this change was both
+mislabelled AND factually wrong — flights are created in Control Room
+now. It points there instead.
+
+### Tests moved, not deleted
+
+Flight Log's two add-flight tests moved to
+`tests/test_control_room_page.py` — same coverage, different page — and
+`test_flight_log_no_longer_offers_flight_creation` pins the absence, the
+way `test_single_crew_path_is_gone` does. A duplicate form is exactly
+the kind of thing that gets helpfully re-added.
+
+The three DB-backed pair tests on Control Room filled the form by
+POSITION (`text_input[0]`, `time_input[0]`). Both are now wrong — the
+form gained a field and the times became text — so they were switched to
+label-based filling. They skip locally, so this would otherwise have
+surfaced as three failures on the next real-Postgres round.
+
+Section 1 also broke three existing DB-free tests, because the page now
+calls `test_connection()` at module level and those fixtures did not
+fake it — so they reached for a real database. Their fixtures now report
+the DB down, which skips the board and keeps those tests on sections 2
+and 3 where they belong.
