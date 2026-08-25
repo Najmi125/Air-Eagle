@@ -324,6 +324,32 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`flight-status-transitions` merged into `main` (2026-08-21).**
+  `flights.status` could previously only ever become `CANCELLED`, so a
+  flight that flew stayed `PLANNED` forever and `DISRUPTED` was
+  unreachable. OPERATED is now automatic (both actual times recorded),
+  DISRUPTED is a manual label with a required reason in both
+  directions. **647/647 verified against real Postgres 16**,
+  reachability clean — every transition run end to end, including the
+  split-shift case where the two actuals arrive on separate calls, which
+  is the one a page-level rule would have got wrong. See the dated log
+  entry at the end of this file.
+
+  **⚠ TWO SEPARATE DEPLOYMENT REQUIREMENTS — do not conflate them:**
+
+  - **`migrations/020` must be applied BEFORE the deploy** that ships
+    the rule. Otherwise freshly-recorded actuals set `OPERATED` while
+    older rows with identical data still read `PLANNED`, and the record
+    goes inconsistent in a way that looks like the bug rather than the
+    fix.
+  - **No reboot is needed for this one.** It adds no module and no new
+    import edge, so the stale-`sys.modules` rule does not apply. The two
+    requirements are independent and only the first applies here.
+
+  **Before writing any report on `status`:** it does NOT mean "flew" —
+  see the dated entry. The honest test is
+  `dep_time_actual IS NOT NULL AND arr_time_actual IS NOT NULL`.
+
 - **`control-room-restructure` merged into `main` (2026-08-21).**
   Control Room and Flight Log both carried an identical add-flight form;
   the split now follows what a controller is doing — Control Room is
@@ -6811,7 +6837,8 @@ watching it get flagged. The success message is now built FROM
 naming three directories after a fourth was added, which is the same
 class of stale-statement problem in the guard's own output.
 
-## 2026-08-21 (continued): flight status transitions — OPERATED automatic, DISRUPTED manual
+## 2026-08-21 (continued): flight status transitions — OPERATED automatic,
+## DISRUPTED manual. MERGED into `main` 2026-08-21.
 
 Closes the gap the UPDATABLE_FIELDS sweep found. `flights.status` could
 only ever become `CANCELLED`: `cancel_flight()` was its sole writer, and
@@ -6920,3 +6947,29 @@ requirements are independent and only one applies here.
 Backfilling rather than leaving history was a decision: `PLANNED` on
 those rows was never a judgement anyone made, only the absence of any
 way to record one.
+
+### 2026-08-21 (continued): verified green, merged
+
+**647 passed, 0 failed against real Postgres 16.** Reachability clean.
+Every transition was run end to end, including the split-shift case
+where departure and arrival actuals arrive on separate calls — the one a
+page-level rule would have got wrong, and the reason the merge lives in
+`update_flight()`. Both audit action types confirmed written, in both
+directions.
+
+Two refinements from review that improved the design rather than just
+the code:
+
+* The un-disrupt control **names its outcome** (`Clear DISRUPTED →
+  OPERATED`) instead of warning about an unexpected destination. A
+  control that says what it does removes the surprise rather than
+  announcing it.
+* The automatic transition is an **invariant, not a default**.
+  `test_explicit_planned_on_a_flown_flight_is_refused` is what makes it
+  a rule: without it, any caller could assert `PLANNED` over two
+  recorded actuals and have it stick.
+
+Merged into `main`, pushed; branch `flight-status-transitions`
+deleted, remote and local. See the "Merge status as of this snapshot"
+paragraph near the top of this file for the two deployment requirements,
+which are independent of each other.
