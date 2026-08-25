@@ -6570,3 +6570,54 @@ calls `test_connection()` at module level and those fixtures did not
 fake it — so they reached for a real database. Their fixtures now report
 the DB down, which skips the board and keeps those tests on sections 2
 and 3 where they belong.
+
+### 2026-08-21 (continued): positional widget access, and the rule that stops it
+
+The restructure's real-Postgres round found two more failures, both the
+same shape as two I had already caught and fixed in the same change:
+
+* `test_roster_page.py` pinned the OLD wording of the Roster info
+  message ("No flights in Flight Log"). The message was correctly
+  changed — it was mislabelled and factually wrong — but the assertion
+  still held the old string. Now asserts on "create one in Control
+  Room", the part that carries the meaning.
+* `test_flight_log_page.py`'s cancel test filled `at.text_input[4]` and
+  clicked `at.button[2]`. Removing the add-flight section shifted every
+  index on the page. Switched to label-based.
+
+**Four instances, one cause: a test addressing a widget by POSITION in a
+list whose order is a property of the page layout.** Indices describe a
+layout; labels describe intent. When the layout moves, positional tests
+break in files nobody opened — which is exactly why two of the four
+survived into a verification round.
+
+**The rule, alongside the reboot rule:**
+
+> When a change alters a page's widget layout — adding, removing or
+> reordering any input — grep that page's test file for
+> `at.text_input[`, `at.button[`, `at.selectbox[`, `at.date_input[`,
+> `at.time_input[` before pushing.
+
+It is a two-second grep and it would have caught all four.
+
+**Converted in this change:** `test_control_room_page.py` and
+`test_flight_log_page.py` are now entirely label-based, via
+`_by_label` / `_select_pair` / `_set_flight_dates` / `_fill_flight_form`
+/ `_click_save`. Those are the two pages that just moved and are most
+likely to move again.
+
+**Deliberately NOT converted, with reasoning** — 49 sites across four
+files, all on pages untouched by this restructure and all passing:
+
+| file | sites | why left |
+|---|---|---|
+| `test_assistant_page.py` | 24 | page unchanged; a mechanical rewrite of 24 DB-gated assertions I cannot run locally risks breaking passing tests for no current benefit |
+| `test_roster_page.py` | 12 | the page has TWO parallel assignment forms with similarly-labelled widgets, so index order is partly load-bearing — one test documents why index 0 is correct. Converting needs keys added to the page first |
+| `test_auth_service.py` | 6 | drives a fixed two-widget inline `AppTest.from_string` script; indices are safe by construction there |
+| `test_crew_data_page.py` | 5 | page unchanged this round |
+| `test_roster_generation_page.py` | 2 | page unchanged |
+
+The honest position: converting all of them is the right end state, but
+blind-converting DB-gated tests I cannot execute is how a third round
+gets spent. Convert each file when its page is next touched — at which
+point the rule above requires opening it anyway.

@@ -73,7 +73,11 @@ def test_page_loads_without_exception(page_app):
 
 def test_no_flights_shows_info_message(page_app):
     at = page_app.run()
-    assert any("No flights in Flight Log" in i.value for i in at.info)
+    # Wording changed 2026-08-21: the old message pointed at "Flight
+    # Log", which after the restructure was both mislabelled (it is
+    # "Flt Schedule" now) and wrong (flights are created in Control
+    # Room). Asserted on the part that carries the meaning.
+    assert any("create one in Control Room" in i.value for i in at.info)
 
 
 def test_legal_pair_assignment_via_form_succeeds(page_app):

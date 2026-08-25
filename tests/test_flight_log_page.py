@@ -28,6 +28,24 @@ def page_app(migrated_db, monkeypatch):
     get_engine.cache_clear()
 
 
+def _by_label(elements, label):
+    matches = [e for e in elements if e.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one element labeled {label!r}, found "
+        f"{[e.label for e in elements]}"
+    )
+    return matches[0]
+
+
+def _click(at, label):
+    matches = [b for b in at.button if b.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one {label!r} button, found {[b.label for b in at.button]}"
+    )
+    matches[0].click()
+    return at.run()
+
+
 def test_page_loads_without_exception(page_app):
     at = page_app.run()
     assert not at.exception
@@ -72,8 +90,13 @@ def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):
     })
 
     at = page_app.run()
-    at.text_input[4].input("Aircraft AOG")  # Cancellation reason
-    at.button[2].click()                     # Cancel this flight
+    # Label-based, not positional. This filled at.text_input[4] and
+    # clicked at.button[2] until 2026-08-21, when removing the
+    # add-flight section shifted every index on the page — the same
+    # breakage the Control Room pair tests hit in the same restructure.
+    # Indices describe a layout; labels describe intent.
+    _by_label(at.text_input, "Cancellation reason (if cancelling)").input("Aircraft AOG")
+    _click(at, "Cancel this flight")
     at = at.run()
 
     assert not at.exception

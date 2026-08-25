@@ -102,16 +102,14 @@ def test_legal_pair_assignment_saves_flight_and_shows_success(page_app):
     at = page_app.run()
 
     # Pair is the default crew type — no radio interaction needed.
-    at.selectbox[0].select(cpt)  # Commander
-    at.selectbox[1].select(fo)   # Second Pilot
-    # Label-based since the 2026-08-21 restructure: the form gained
-    # "Flight No" and the times became HHMM text, so the old
-    # text_input[0]/time_input[0] positions now address other widgets.
+    # Every lookup here is by LABEL, not position. The 2026-08-21
+    # restructure shifted text_input, time_input, date_input and button
+    # indices on this page all at once, and positional versions of these
+    # three tests broke in a file that had not been touched.
+    _select_pair(at, cpt, fo)
     _fill_flight_form(at, dep="0545", arr="0745")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.button[0].click()
-    at = at.run()
+    _set_flight_dates(at, dt.date(2026, 7, 20))
+    at = _click_save(at)
 
     assert not at.exception
     assert any("ALLOWED" in s.value for s in at.success)
@@ -155,13 +153,10 @@ def test_illegal_pair_assignment_shows_rejection_and_saves_nothing(page_app):
         })
 
     at = page_app.run()
-    at.selectbox[0].select(cpt)
-    at.selectbox[1].select(fo)
+    _select_pair(at, cpt, fo)
     _fill_flight_form(at, dep="1745", arr="1945")   # only 5h after prior debrief (12:15)
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.button[0].click()
-    at = at.run()
+    _set_flight_dates(at, dt.date(2026, 7, 20))
+    at = _click_save(at)
 
     assert not at.exception
     assert any("REJECTED" in e.value for e in at.error)
@@ -184,13 +179,10 @@ def test_needs_review_pair_assignment_shows_warning_not_success(page_app):
     crew_service.update_crew(cpt, {"license_expiry": None})
 
     at = page_app.run()
-    at.selectbox[0].select(cpt)
-    at.selectbox[1].select(fo)
+    _select_pair(at, cpt, fo)
     _fill_flight_form(at, dep="0500", arr="0700")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.button[0].click()
-    at = at.run()
+    _set_flight_dates(at, dt.date(2026, 7, 20))
+    at = _click_save(at)
 
     assert not at.exception
     assert any("HELD FOR MANUAL REVIEW" in w.value for w in at.warning)
@@ -396,6 +388,28 @@ def test_requesting_a_pair_that_cannot_be_formed_saves_nothing(monkeypatch):
 # Label-based, not index-based: the form gained "Flight No" and the
 # times became HHMM text, so positional lookups from the old page would
 # silently address the wrong widget.
+
+def _select_pair(at, commander, second_pilot):
+    """Crew selectors by label. They were at.selectbox[0]/[1] until
+    2026-08-21 — correct only while section 1 rendered no selectbox of
+    its own, which is not a property any of these tests assert."""
+    _by_label(at.selectbox, "Commander (must be CPT) *").select(commander)
+    _by_label(at.selectbox, "Second Pilot (CPT or FO) *").select(second_pilot)
+
+
+def _set_flight_dates(at, day):
+    _by_label(at.date_input, "Departure date *").set_value(day)
+    _by_label(at.date_input, "Arrival date *").set_value(day)
+
+
+def _by_label(elements, label):
+    matches = [e for e in elements if e.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one element labeled {label!r}, found "
+        f"{[e.label for e in elements]}"
+    )
+    return matches[0]
+
 
 def _fill_flight_form(at, origin="KHI", destination="LHE",
                       dep="0500", arr="0700", flight_no=None):
