@@ -59,11 +59,6 @@ st.set_page_config(page_title="Control Room", page_icon="🛫", layout="wide")
 app_user = auth_service.require_login()
 st.title("Control Room")
 
-# Air Eagle operates a single B737. The registration hasn't been
-# supplied yet, so the field stays free text and this stays None —
-# set it to the registration and every new flight pre-fills.
-# ONE-LINE CHANGE, deliberately isolated here rather than inlined.
-AIRCRAFT_DEFAULT = None
 
 
 # ==================================================================
@@ -187,7 +182,7 @@ with st.form("control_room_form"):
         flight_no = st.text_input("Flight No (optional — ad-hoc flights may not have one yet)")
         origin = st.text_input("Origin *")
         destination = st.text_input("Destination *")
-        aircraft = st.text_input("Aircraft", value=AIRCRAFT_DEFAULT or "")
+        aircraft = st.text_input("Aircraft", value=flight_service.AIRCRAFT_DEFAULT or "")
         domestic = st.radio("Domestic or international? *", ["Domestic", "International"], horizontal=True)
         cargo_dg = st.checkbox("Carries dangerous goods (DG)")
 

@@ -6692,3 +6692,44 @@ call site rather than fixing the reported one is what found it.
 Merged into `main`, pushed; branch `control-room-restructure` deleted,
 remote and local. See the "Merge status as of this snapshot" paragraph
 near the top of this file.
+
+## 2026-08-21 (continued): aircraft registration AP-BNW
+
+Operator supplied the registration, so the placeholder default is now
+real. Two things came out of it that were not just flipping a constant.
+
+**Flt Schedule had no aircraft field at all.** The question was whether
+its edit form should default the registration too — but there was
+nothing to default: `aircraft` is in
+`flight_service.UPDATABLE_FIELDS` and Control Room sets it at
+creation, and no page exposed it afterwards. A flight recorded without
+one could never be corrected. Small version of the qualification-renewal
+gap, same fix: expose the field.
+
+The default fills an EMPTY value only —
+`selected["aircraft"] or AIRCRAFT_DEFAULT` keeps whatever is stored
+and never overwrites it. A flight against a leased or substituted
+airframe keeps its own registration, and the pre-filled value is visible
+in the field before saving, so a controller sees and clears it rather
+than having it applied behind them.
+`test_aircraft_never_overwrites_a_value_already_set` pins that.
+
+**The constant lives in `flight_service`, not a new module.** Two
+consumers would normally argue for its own home (the
+`display_labels` / `time_entry` precedent), but a new service module
+obliges a Manage-app reboot on deploy under the stale-`sys.modules`
+rule — three occurrences so far — and that is a poor trade for one
+constant. `flight_service` owns the `flights` table and `aircraft`
+in `UPDATABLE_FIELDS`, and both pages already import it, so this adds
+no new import edge and **needs no reboot**.
+
+**Why one default is correct, and what changes it.** Air Eagle operates
+one B737. This is an AIRLINE-CONFIGURATION value, not a platform
+assumption — nothing in `core/` or the legality engine reads it.
+**The trigger is a second aircraft**: at that point a default is the
+wrong shape entirely and becomes a selector over a fleet, because a
+silent default would start attributing flights to the wrong airframe,
+which is worse than an empty field. Do not extend it to a "primary
+aircraft" default; make it a choice. The Control Room test asserts
+against the constant rather than the literal, so the page and the test
+break together when that day comes.

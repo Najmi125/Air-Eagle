@@ -628,3 +628,18 @@ def test_status_board_survives_one_query_failing_on_its_own(status_board, monkey
     assert any("Today's flights unavailable" in c.value for c in at.caption)
     assert {m.label for m in at.metric} >= {"Uncovered rotation seats today"}
     assert any(b.label == "Check legality and save" for b in at.button)
+
+
+def test_aircraft_prefills_the_fleet_registration(faked_services):
+    """Air Eagle operates one B737, so a controller should not retype
+    AP-BNW on every charter. Asserted against flight_service's constant
+    rather than the literal, so the registration lives in exactly one
+    place — and so a second aircraft (which turns this from a default
+    into a selector) breaks the page and this test together rather than
+    silently attributing flights to the wrong airframe."""
+    from services import flight_service
+
+    at = _render(assign_pair=False)
+
+    assert not at.exception
+    assert _by_label(at.text_input, "Aircraft").value == flight_service.AIRCRAFT_DEFAULT

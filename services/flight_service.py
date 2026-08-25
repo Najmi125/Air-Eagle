@@ -22,6 +22,29 @@ from services.audit_service import log_audit
 
 REQUIRED_FIELDS = {"origin", "destination", "dep_time_planned", "arr_time_planned", "domestic"}
 
+# Air Eagle's single B737 (registration supplied by the operator
+# 2026-08-21). Pre-fills the aircraft field on the pages that create or
+# edit a flight, so a controller doesn't retype it on every charter.
+#
+# ONE default is correct here because the airline operates ONE aircraft.
+# This is an AIRLINE-CONFIGURATION value, not a platform assumption —
+# FTLguard itself has no notion of a fleet of one, and nothing in
+# core/ or the legality engine reads it.
+#
+# THE TRIGGER FOR CHANGING THIS: a second aircraft. At that point a
+# default is the wrong shape entirely — it becomes a selector over a
+# fleet, and a silent default would start attributing flights to the
+# wrong airframe, which is worse than an empty field. Do not extend
+# this to a "primary aircraft" default; make it a choice.
+#
+# It lives here, in the module that owns the flights table and has
+# `aircraft` in UPDATABLE_FIELDS, rather than in a new module of its
+# own: both consuming pages already import flight_service, so this adds
+# no new import edge — and a new service module would oblige a
+# Manage-app reboot on deploy (the stale-sys.modules rule, three
+# occurrences so far) for the sake of one constant.
+AIRCRAFT_DEFAULT = "AP-BNW"
+
 UPDATABLE_FIELDS = {
     "flight_no", "origin", "destination", "aircraft",
     "dep_time_planned", "arr_time_planned",

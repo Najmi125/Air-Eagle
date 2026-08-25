@@ -120,3 +120,81 @@ def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):
     # Permanent log requirement, verified at the page level too:
     # the cancelled flight must still be visible, not disappear.
     assert "CANCELLED" in list(df["status"])
+
+
+# ------------------------------------------------------------------
+# Aircraft field (2026-08-21) — DB-free
+# ------------------------------------------------------------------
+#
+# Aircraft was settable only at creation until this change: it is in
+# flight_service.UPDATABLE_FIELDS but no page exposed it afterwards, so
+# a flight recorded without one could never be corrected.
+
+import pandas as pd  # noqa: E402
+from streamlit.testing.v1 import AppTest  # noqa: E402
+
+from tests.conftest import page_path  # noqa: E402
+
+_FLIGHT_COLUMNS = ["flight_id", "flight_no", "origin", "destination", "aircraft",
+                   "dep_time_planned", "arr_time_planned", "status", "domestic",
+                   "other_occupants_operating", "other_occupants_non_operating"]
+
+
+def _fake_flight(aircraft):
+    return {
+        "flight_id": 1, "flight_no": "EPE 786", "origin": "KHI", "destination": "LHE",
+        "aircraft": aircraft,
+        "dep_time_planned": dt.datetime(2026, 8, 20, 19, 0),
+        "arr_time_planned": dt.datetime(2026, 8, 20, 20, 45),
+        "status": "PLANNED", "domestic": True,
+        "other_occupants_operating": None, "other_occupants_non_operating": None,
+    }
+
+
+def _render_with_flight(monkeypatch, aircraft):
+    from services import flight_service as fs
+    row = _fake_flight(aircraft)
+    written = []
+    monkeypatch.setattr(fs, "get_all_flights",
+                        lambda **kw: pd.DataFrame([row], columns=_FLIGHT_COLUMNS))
+    monkeypatch.setattr(fs, "get_flight", lambda fid: row)
+    monkeypatch.setattr(fs, "update_flight",
+                        lambda fid, updates, app_user=None: written.append(updates))
+
+    at = AppTest.from_file(str(page_path("pages/3_Flight_Log.py")))
+    at.session_state["app_user"] = "occ1"
+    at.run()
+    return at, written
+
+
+def _aircraft_field(at):
+    return _by_label(at.text_input, "Aircraft")
+
+
+def test_aircraft_defaults_only_when_the_flight_has_none(monkeypatch):
+    """Backfills the flights recorded before aircraft was editable."""
+    at, _ = _render_with_flight(monkeypatch, aircraft=None)
+
+    assert not at.exception
+    assert _aircraft_field(at).value == "AP-BNW"
+
+
+def test_aircraft_never_overwrites_a_value_already_set(monkeypatch):
+    """The default fills EMPTY only. A flight recorded against a
+    different airframe — a lease, a substitution — must keep it, and
+    must not be quietly reassigned to the fleet default on the next
+    unrelated edit."""
+    at, _ = _render_with_flight(monkeypatch, aircraft="AP-XYZ")
+
+    assert not at.exception
+    assert _aircraft_field(at).value == "AP-XYZ"
+
+
+def test_editing_aircraft_writes_it(monkeypatch):
+    at, written = _render_with_flight(monkeypatch, aircraft=None)
+
+    _aircraft_field(at).input("AP-ABC")
+    at = _click(at, "Save changes")
+
+    assert not at.exception
+    assert written and written[-1]["aircraft"] == "AP-ABC"

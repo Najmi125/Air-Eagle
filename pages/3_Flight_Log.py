@@ -73,6 +73,23 @@ else:
                 actual_arr_time_raw = st.text_input("Actual arrival time (UTC HHMM)")
                 cancel_reason = st.text_input("Cancellation reason (if cancelling)")
 
+            # Aircraft was not editable ANYWHERE before 2026-08-21: it
+            # is in flight_service.UPDATABLE_FIELDS and settable when
+            # Control Room creates a flight, but no page exposed it
+            # afterwards — so a flight recorded without one could never
+            # be corrected. Small version of the qualification-renewal
+            # gap, and the same fix: expose the field.
+            #
+            # The default fills an EMPTY value only. `selected["aircraft"]
+            # or AIRCRAFT_DEFAULT` keeps whatever is already stored and
+            # never overwrites it, and the pre-filled registration is
+            # visible in the field before saving, so a controller
+            # correcting a genuinely different airframe sees and clears
+            # it rather than having it applied behind them.
+            edit_aircraft = st.text_input(
+                "Aircraft",
+                value=selected["aircraft"] or flight_service.AIRCRAFT_DEFAULT or "")
+
             # Pre-filled from the flight, unlike the actual-time fields
             # above (which are blank because entering one is an event,
             # not a correction). Editing these is how an occupant list
@@ -115,6 +132,7 @@ else:
                 occupants_changed = (
                     (edit_occupants_operating or None) != selected["other_occupants_operating"]
                     or (edit_occupants_non_operating or None) != selected["other_occupants_non_operating"]
+                    or (edit_aircraft or None) != selected["aircraft"]
                 )
                 # A malformed time short-circuits everything: showing
                 # both "bad time" and "nothing to save" for one submit
@@ -124,10 +142,11 @@ else:
                 else:
                     if occupants_changed:
                         flight_service.update_flight(selected_id, {
+                            "aircraft": edit_aircraft or None,
                             "other_occupants_operating": edit_occupants_operating or None,
                             "other_occupants_non_operating": edit_occupants_non_operating or None,
                         }, app_user=app_user)
-                        st.success(f"Updated occupants for flight {selected_id}")
+                        st.success(f"Updated flight {selected_id} details")
 
                     if dep_actual or arr_actual:
                         outcomes = assignment_service.update_flight_actual_times_and_revalidate(
@@ -161,7 +180,7 @@ else:
                         # Only when NOTHING was submitted. Saving an
                         # occupant change alone is a complete action, and
                         # must not be told it did nothing.
-                        st.warning("Nothing to save — enter actual times or change occupants.")
+                        st.warning("Nothing to save — enter actual times, or change aircraft or occupants.")
 
             if cancel_submitted:
                 assignment_service.cancel_flight_and_roster(
