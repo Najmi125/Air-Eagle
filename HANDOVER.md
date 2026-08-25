@@ -324,6 +324,26 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`control-room-restructure` merged into `main` (2026-08-21).**
+  Control Room and Flight Log both carried an identical add-flight form;
+  the split now follows what a controller is doing — Control Room is
+  where you ACT (operational status, create a flight, crew it), Flt
+  Schedule is the RECORD. Home reverts to the DB status line and
+  navigation. **626/626 verified against real Postgres 16**,
+  reachability clean, including the moved add-flight tests, the status
+  board reading seats from `operating_position` (CPT/CPT case included),
+  both DB-failure paths, and `search_roster()`'s new column. Merged,
+  pushed; branch deleted, remote and local.
+
+  **⚠ Needs a reboot from Manage app after deploying** — adds
+  `services/time_entry.py`, imported by two pages. **Third occurrence**
+  of the stale-`sys.modules` condition; the rule is recorded below and
+  in the 2026-08-20 entry.
+
+  Took three real-Postgres rounds, all test-side, all one theme: tests
+  addressing widgets by POSITION, plus one helper with an invisible
+  side effect. Nothing in the pages themselves was wrong on any round.
+
 - **`ops-findings-round-1` merged into `main` (2026-08-20).** The first
   operational-use findings: qualification renewal through the UI (which
   was blocking — renewing a medical previously required raw SQL), other
@@ -6467,7 +6487,8 @@ service module, or makes a page import one it did not import before,
 reboot after deploying.** Both incidents fit it, and neither was
 detectable from the diff alone — the code was correct in both cases.
 
-## 2026-08-21: Control Room / Flt Schedule restructure — act vs. record
+## 2026-08-21: Control Room / Flt Schedule restructure — act vs. record.
+## MERGED into `main` 2026-08-21.
 
 Control Room and Flight Log both carried an identical seven-field
 add-flight form, so "where do I add a flight?" had two answers and
@@ -6642,3 +6663,32 @@ changed is that the contract is now stated in each helper's docstring
 with the wrong form shown explicitly, because a helper that runs the
 script INVISIBLY is easy to misuse and being right by accident at 32
 sites is not the same as the contract being clear.
+
+### 2026-08-21 (continued): green, and merged
+
+**626 passed, 0 failed against real Postgres 16.** Reachability clean.
+Everything that could not run locally was checked: the moved add-flight
+tests on Control Room, the status board reading seats from
+`operating_position` (including the CPT/CPT pairing that is the only
+one where reading `role_assigned` could accidentally look right), both
+DB-failure paths, and `search_roster()` exposing the new column.
+
+**Three real-Postgres rounds, all test-side, all one theme.** Nothing in
+the pages was wrong on any round:
+
+1. Two stale test assumptions — a pinned message string, and positional
+   widget access broken by removing a page section.
+2. The label conversion that fixed round 1 introduced a hidden-side-
+   effect bug: `_click()` runs the script and returns the new state,
+   and two call sites discarded it.
+3. Green.
+
+Worth keeping from round 2: one of the two discarding call sites passed
+anyway, because it asserted on the SERVICE rather than on `at`. A latent
+trap, not an absent one — it would have surfaced later, for someone
+else, looking unrelated to the change that introduced it. Auditing every
+call site rather than fixing the reported one is what found it.
+
+Merged into `main`, pushed; branch `control-room-restructure` deleted,
+remote and local. See the "Merge status as of this snapshot" paragraph
+near the top of this file.
