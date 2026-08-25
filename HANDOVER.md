@@ -6810,3 +6810,113 @@ watching it get flagged. The success message is now built FROM
 `WATCHED_DIRS` rather than hardcoded — it had already drifted, still
 naming three directories after a fourth was added, which is the same
 class of stale-statement problem in the guard's own output.
+
+## 2026-08-21 (continued): flight status transitions — OPERATED automatic, DISRUPTED manual
+
+Closes the gap the UPDATABLE_FIELDS sweep found. `flights.status` could
+only ever become `CANCELLED`: `cancel_flight()` was its sole writer, and
+recording actual times wrote the two timestamps and nothing else.
+
+**The operational consequence, which explains why this mattered more
+than it read:** a flight that had flown stayed `PLANNED` forever and
+`DISRUPTED` was unreachable entirely, while the Flt Schedule filter
+offered all four states as if they were real. Every report keyed on
+status returned nothing for `OPERATED`, and the shadow trial's
+end-of-period reconciliation — "which flights actually flew" — had no
+answer at all. That section's own subheader had been promising "update
+status" for a control the page did not have.
+
+### status is NOT the answer to "did it fly" — read this before writing a report
+
+The most important thing in this entry, and it corrects the framing the
+work started from.
+
+Status is ONE column, so `OPERATED` and `DISRUPTED` are mutually
+exclusive. A flight marked disrupted keeps that label after it flies —
+deliberately, because "it flew" is recoverable from the actual times and
+"it was disrupted" is recoverable from nothing else. **So some flown
+flights will always carry a label other than OPERATED, under any rule
+set.** No transition design fixes this; it is a property of storing one
+value.
+
+    -- "which flights actually flew" — the honest test
+    WHERE dep_time_actual IS NOT NULL AND arr_time_actual IS NOT NULL
+
+    -- NOT this: under-counts every disrupted flight that still flew
+    WHERE status = 'OPERATED'
+
+The status rule earns its place for a **different job**: making the
+filter meaningful and the record readable. Two jobs, and they were
+conflated when this work was scoped. Someone will eventually write a
+report keyed on `status = 'OPERATED'` believing it means "flew" — the
+note is repeated in `migrations/020`, in `_apply_operated_rule()`'s
+docstring, and in the shadow-trial guide's Stage 2 reconciliation
+exercise, so it is findable from wherever that person is standing.
+
+### The rule
+
+`services/flight_service._apply_operated_rule()`, called from
+`update_flight()` — the single generic UPDATE on `flights` and the only
+writer of the actual-time columns.
+
+It has to live there rather than in a page for a reason beyond layering:
+**the updates dict alone cannot answer the question.** Departure actual
+is commonly recorded on one shift and arrival on the next, so any given
+call sees only one column. `update_flight()` already loads the stored
+row, so it can merge. A page-level rule would look correct and fail
+silently in exactly the normal case.
+
+An INVARIANT, not a default:
+
+1. **CANCELLED is terminal** — actuals never revive a cancelled flight,
+   and an explicit status change away from CANCELLED is refused.
+2. **Explicit status wins, except `PLANNED` on a flown flight, which
+   raises.** Without that exception the rule would be optional: a caller
+   could assert PLANNED over two recorded actuals and have it stick.
+3. **The automatic transition fires only from PLANNED**, so a manual
+   DISRUPTED survives.
+
+### Transitions
+
+| from | to | trigger |
+|---|---|---|
+| PLANNED | OPERATED | automatic — both actuals present |
+| PLANNED | DISRUPTED | manual, reason required |
+| DISRUPTED | PLANNED | manual, when actuals incomplete |
+| DISRUPTED | OPERATED | manual, when both actuals present |
+| PLANNED / DISRUPTED | CANCELLED | existing cancel control |
+| OPERATED, CANCELLED | — | terminal |
+
+**The un-disrupt control names its outcome rather than warning about
+it.** Clearing the label on a flight with both actual times yields
+OPERATED, so the button says `Clear DISRUPTED → OPERATED`. Offering
+"PLANNED" there and letting the automatic rule move it afterwards would
+be a control that says one thing and does another — the edge case that
+surfaced while planning, where an undo produced a status the controller
+never chose.
+
+**Both directions are audited with a required reason.**
+`FLIGHT_DISRUPTED` populates `linked_disruption_event` — the column
+already designed for this, rather than adding one — and
+`FLIGHT_DISRUPTION_CLEARED` records the undo. An unaudited undo would
+leave a record showing a flight that was never disrupted, when it was
+labelled and then relabelled, which is precisely what an auditor asks
+about.
+
+### migrations/020 — apply BEFORE deploying, and this is NOT the reboot rule
+
+`020_backfill_operated_status.sql` sets `OPERATED` on rows that
+demonstrably flew, scoped to `status = 'PLANNED'` so CANCELLED and
+DISRUPTED are untouched, and idempotent.
+
+**It must be applied before the deploy that ships the rule.** A separate
+requirement from the reboot rule and not a variant of it: if the code
+lands first, freshly-recorded actuals start setting OPERATED while older
+rows with identical data still read PLANNED, and the record becomes
+inconsistent in a way that looks like the bug rather than the fix. This
+change adds no new module, so **no reboot is needed** — the two
+requirements are independent and only one applies here.
+
+Backfilling rather than leaving history was a decision: `PLANNED` on
+those rows was never a judgement anyone made, only the absence of any
+way to record one.

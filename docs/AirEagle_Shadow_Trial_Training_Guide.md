@@ -71,6 +71,22 @@ Tick all of these. Do not begin until every line is true.
 - [ ] For a rotation with two sectors, confirm you can see both as separate flights
 - [ ] Enter an aircraft registration and DG flag where they apply
 - [ ] Cancel a flight. Confirm it stays visible with status CANCELLED rather than disappearing
+- [ ] Record BOTH actual departure and arrival on a flight. Confirm the status becomes **OPERATED** on its own — there is no separate button, because recording both actuals *is* the statement that the flight flew
+- [ ] Record only ONE actual time on another flight. Confirm the status does **not** change — one time means in progress, not complete
+- [ ] Mark a flight **DISRUPTED** with a reason, then clear it. Note that clearing a flight which has both actual times returns it to OPERATED, not PLANNED
+
+> **Reading the status column — important for reconciliation.**
+> `status = 'OPERATED'` does **not** mean "this flight flew", and cannot.
+> Status is one column, so OPERATED and DISRUPTED are mutually exclusive:
+> a flight you marked disrupted keeps that label even after it flies, because
+> "it was disrupted" is recoverable from nothing else, while "it flew" is
+> recoverable from the actual times.
+>
+> So when you reconcile the period — *which flights actually operated?* — the
+> honest test is **both actual times being present**, not the status label.
+> Status is there to make the list readable and the filter meaningful. Those
+> are two different jobs, and a report that confuses them will under-count
+> every disrupted flight that still flew.
 
 **Check yourself:** for the nightly pair departing 1900Z — which UTC *date* does it belong to? It departs at midnight local, so the answer is the day before the local date. If that catches you out, it will catch you out again on a report.
 
