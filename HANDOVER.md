@@ -6733,3 +6733,80 @@ which is worse than an empty field. Do not extend it to a "primary
 aircraft" default; make it a choice. The Control Room test asserts
 against the constant rather than the literal, so the page and the test
 break together when that day comes.
+
+## 2026-08-21 (continued): the UPDATABLE_FIELDS sweep, and an unwatched directory
+
+Two follow-ups from the aircraft work, both cheap, both worth having
+done deliberately rather than by accident.
+
+### Sweep: can a page actually set every field a service will write?
+
+Twice a column had been in `UPDATABLE_FIELDS` with no UI path —
+qualification expiries (renewing a medical needed raw SQL) and
+`flights.aircraft` (a flight recorded without one could never be
+corrected). Both were found by accident, so the whole set was checked.
+
+A first pass matched field names anywhere in `pages/` and reported only
+one gap; that was too generous, since a template's `meal_provided`
+falsely cleared `flight_service`'s. The tightened pass attributes a dict
+literal to a service only when its keys are a subset of that service's
+own `REQUIRED ∪ UPDATABLE` fields. Results, after verifying each flagged
+field by hand:
+
+**`crew_service` — 18/18 reachable.** Clean.
+
+**`flight_service` — 17 fields:**
+
+* 11 reachable through Control Room / Flt Schedule payload dicts.
+* `dep_time_actual` / `arr_time_actual` — reachable, flagged only
+  because they are passed as KEYWORD ARGS to
+  `update_flight_actual_times_and_revalidate()` rather than in a dict.
+  A limitation of the sweep, not a gap.
+* `rotation_instance_id` — correctly unreachable. It is provenance, set
+  only by `approve_instance()` at promotion time; a controller setting
+  it by hand would be falsifying which rotation produced a flight.
+* `meal_provided` / `snack_provided` — no UI on FLIGHTS. Set from the
+  template at promotion; an ad-hoc Control Room flight takes the column
+  DEFAULT TRUE. Arguable rather than clearly wrong (the operator has
+  confirmed a meal is universal), but an ad-hoc flight where a meal was
+  NOT provided currently cannot be recorded as such.
+* **`status` — a real gap.** The only write is `cancel_flight()` setting
+  `'CANCELLED'`. Recording actual times writes the two timestamps and
+  nothing else. So a flight that has flown stays `PLANNED` forever, and
+  `DISRUPTED` is unreachable entirely — while the Flt Schedule filter
+  offers `PLANNED / OPERATED / CANCELLED / DISRUPTED` as if they were
+  all real states, and that section's own subheader says "Record
+  actuals, **update status**, or cancel a flight".
+
+**Not fixed here, deliberately.** When a flight becomes `OPERATED` is an
+operator policy question — automatically once actual times are recorded,
+or an explicit control — and `DISRUPTED` needs a definition before it
+needs a widget. Flagged for a decision rather than guessed at. The
+subheader is currently promising something the page does not do, which
+is the part worth fixing first whichever way the decision goes.
+
+**The pattern is worth naming**, since this is the third instance: a
+column being writable by a service says nothing about whether any human
+can set it. The service layer and the UI were built at different times,
+and `UPDATABLE_FIELDS` is the service's statement of intent, not
+evidence of a path. Re-run the sweep after adding columns.
+
+### An unwatched directory is a blind spot
+
+`configs/` was not in `check_reachability.py`'s `WATCHED_DIRS`, so
+anything placed there would never be flagged as orphaned — the precise
+failure that script exists to prevent, in a directory the script could
+not see.
+
+It is NOT dead space, which is why it was watched rather than removed:
+`README.md` lists it in the project structure, and
+`services/reporting.py` names a planned `configs/airlines/AEAGLE/`
+layout for multi-tenant airline configuration. Removing it would have
+contradicted both; the blind spot was the problem, not the directory.
+
+`WATCHED_DIRS` now includes it. A no-op today (only `__init__.py`, which
+the scan skips), verified active by planting an orphan there and
+watching it get flagged. The success message is now built FROM
+`WATCHED_DIRS` rather than hardcoded — it had already drifted, still
+naming three directories after a fourth was added, which is the same
+class of stale-statement problem in the guard's own output.

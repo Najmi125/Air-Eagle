@@ -1,9 +1,9 @@
 """
 scripts/check_reachability.py
 
-Flags any .py file under core/, services/, db/ that is never
-imported by app.py, anything in pages/, or any other file in those
-same directories.
+Flags any .py file under the WATCHED_DIRS (core/, services/, db/,
+configs/) that is never imported by app.py, anything in pages/, or any
+other file in those same directories.
 
 This exists because the old repo had 17 files in utils/ — leave
 checking, location tracking, the actuals engine, config loading,
@@ -27,7 +27,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WATCHED_DIRS = ["core", "services", "db"]
+# configs added 2026-08-21. It holds only __init__.py today, so this is
+# a no-op right now — but it is NOT dead space: README.md lists it in
+# the project structure and services/reporting.py names a planned
+# configs/airlines/AEAGLE/ layout for multi-tenant airline config.
+#
+# An unwatched directory in the repo is a blind spot: anything dropped
+# into it would never be flagged as orphaned, which is exactly the
+# failure this script exists to prevent. Watching it now means the
+# guard is already in place on the day it gets populated, rather than
+# being remembered then.
+WATCHED_DIRS = ["core", "services", "db", "configs"]
 # Root-level entry points ONLY, checked individually below in
 # app_reachable_source_files() — anything under pages/ is already
 # handled generically there via included_top, so it doesn't need
@@ -256,7 +266,11 @@ def main():
     orphaned = find_orphaned(watched, imported)
 
     if not orphaned:
-        print("All files under core/, services/, db/ are reachable from somewhere.")
+        # Built from WATCHED_DIRS rather than hardcoded, so the
+        # message cannot drift from what was actually checked —
+        # it already had, listing three dirs after configs was added.
+        watched = ", ".join(f"{d}/" for d in WATCHED_DIRS)
+        print(f"All files under {watched} are reachable from somewhere.")
         return 0
 
     print(f"{len(orphaned)} file(s) not imported from anywhere in the repo:\n")
