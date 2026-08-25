@@ -436,7 +436,7 @@ def test_add_flight_without_crew_succeeds_and_appears_in_the_record(page_app):
     at = at.run()
 
     _fill_flight_form(at, flight_no="EPE 786")
-    _click_save(at)
+    at = _click_save(at)   # _click_save runs the script; capture it
 
     flights = flight_service.get_all_flights()
     assert len(flights) == 1
@@ -477,6 +477,14 @@ def test_malformed_hhmm_is_rejected_and_saves_nothing(page_app):
 
 
 def _click_save(at):
+    """Submit the add-flight form and return the resulting AppTest.
+
+    RUNS THE SCRIPT — the return value is the new state and callers MUST
+    capture it (`at = _click_save(at)`). Discarding it and calling
+    at.run() separately reruns the STALE object and loses the submit:
+    that shipped once on 2026-08-21 in the sibling _click helper, where
+    it turned a loud IndexError into a quiet assertion failure.
+    """
     [b for b in at.button if b.label == "Check legality and save"][0].click()
     return at.run()
 

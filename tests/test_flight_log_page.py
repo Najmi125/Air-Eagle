@@ -38,6 +38,20 @@ def _by_label(elements, label):
 
 
 def _click(at, label):
+    """Click a button BY LABEL and return the resulting AppTest.
+
+    RUNS THE SCRIPT. The return value is the new state, so callers MUST
+    capture it:
+
+        at = _click(at, "Save")       # correct
+        _click(at, "Save"); at.run()  # WRONG — reruns the stale object
+                                      # and loses the click's effect
+
+    That second form is not hypothetical: it shipped on 2026-08-21 and
+    turned an IndexError into a silent assertion failure, because the
+    cancel never took effect. A helper that runs the script invisibly is
+    easy to misuse, so the contract is stated here rather than implied.
+    """
     matches = [b for b in at.button if b.label == label]
     assert len(matches) == 1, (
         f"expected exactly one {label!r} button, found {[b.label for b in at.button]}"
@@ -96,8 +110,7 @@ def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):
     # breakage the Control Room pair tests hit in the same restructure.
     # Indices describe a layout; labels describe intent.
     _by_label(at.text_input, "Cancellation reason (if cancelling)").input("Aircraft AOG")
-    _click(at, "Cancel this flight")
-    at = at.run()
+    at = _click(at, "Cancel this flight")   # _click runs the script; capture it
 
     assert not at.exception
     assert any("Cancelled flight" in s.value for s in at.success)

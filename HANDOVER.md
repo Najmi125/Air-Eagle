@@ -6621,3 +6621,24 @@ The honest position: converting all of them is the right end state, but
 blind-converting DB-gated tests I cannot execute is how a third round
 gets spent. Convert each file when its page is next touched — at which
 point the rule above requires opening it anyway.
+
+**Follow-up (same day): the label conversion introduced its own bug.**
+The IndexError was gone, but the cancel test then failed on its
+assertion. The new `_click()` helper runs the script and RETURNS the
+new state; the call site discarded it and called `at.run()` separately,
+which reruns the stale object and loses the click. The cancel never took
+effect.
+
+An audit found 32 call sites across the suite capturing the return
+correctly and 2 discarding it — the reported one, and a second in
+`test_control_room_page.py` that passed only because it asserted on the
+service rather than on `at`, so the trap was latent there rather than
+absent.
+
+Convention kept as-is (helper runs, caller captures `at = _click(...)`)
+because 32 sites already follow it; switching would have created a
+second convention, which is worse than the one that exists. What
+changed is that the contract is now stated in each helper's docstring
+with the wrong form shown explicitly, because a helper that runs the
+script INVISIBLY is easy to misuse and being right by accident at 32
+sites is not the same as the contract being clear.
