@@ -1,10 +1,22 @@
 """
 pages/3_Flight_Log.py
 
-Collects input, calls services/flight_service.py, displays output.
+Shown as "Flt Schedule" (operator's wording, 2026-08-21). DISPLAY NAME
+ONLY: the file, the `flights` table and `flight_service` all keep their
+names, and the sidebar label comes from app.py's
+`st.Page(title=...)` — renaming the file would touch every
+AppTest.from_file() in the tests and check_reachability.py's entry-point
+handling, for a label.
+
+The RECORD half of the operation: what happened, searchable, and where
+actuals are entered. Creating a flight belongs to
+pages/1_Control_Room.py, which is where a controller ACTS. Both pages
+carried an identical seven-field add-flight form until 2026-08-21, so
+"where do I add a flight?" had two answers; this page's copy is the one
+that went.
+
 Permanent log — cancelled flights stay visible, never hidden or
-deleted, per the explicit "Flight Log ... a permanent log of all
-flights" requirement.
+deleted, per the explicit "a permanent log of all flights" requirement.
 
 Deliberately unstyled, matches pages/2_Crew_Data.py — the home page
 (home.py) got its own branding pass (2026-08-10/11), this one hasn't.
@@ -15,10 +27,11 @@ import streamlit as st
 from services import flight_service, assignment_service, auth_service
 from services.alert_summary import format_alert_lines
 from services.display_labels import flight_label
+from services.time_entry import parse_hhmm
 
-st.set_page_config(page_title="Flight Log", page_icon="📘", layout="wide")
+st.set_page_config(page_title="Flt Schedule", page_icon="📘", layout="wide")
 app_user = auth_service.require_login()
-st.title("Flight Log")
+st.title("Flt Schedule")
 
 STATUS_OPTIONS = ["All", "PLANNED", "OPERATED", "CANCELLED", "DISRUPTED"]
 
@@ -30,63 +43,6 @@ flights_df = flight_service.get_all_flights(status_filter=status_filter)
 
 st.subheader(f"Flights ({len(flights_df)})")
 st.dataframe(flights_df, width="stretch")
-
-
-# ================= ADD NEW FLIGHT =================
-st.subheader("Add flight")
-
-with st.form("add_flight_form", clear_on_submit=True):
-    col1, col2 = st.columns(2)
-
-    with col1:
-        flight_no = st.text_input("Flight No (optional — ad-hoc flights may not have one yet)")
-        origin = st.text_input("Origin *")
-        destination = st.text_input("Destination *")
-        aircraft = st.text_input("Aircraft")
-        domestic = st.radio("Domestic or international? *", ["Domestic", "International"], horizontal=True)
-
-    with col2:
-        dep_date = st.date_input("Departure date *", value=dt.date.today())
-        dep_time = st.time_input("Departure time (UTC) *", value=dt.time(5, 0))
-        arr_date = st.date_input("Arrival date *", value=dt.date.today())
-        arr_time = st.time_input("Arrival time (UTC) *", value=dt.time(7, 0))
-
-    cargo_dg = st.checkbox("Carries dangerous goods (DG)")
-
-    # Free text by design — the system does not classify why someone is
-    # aboard, and never parses these into crew records. The columns have
-    # existed since migrations/010 and reports.roster_coverage() has
-    # always displayed them, but until 2026-08-20 no page wrote them, so
-    # the LM and AMEs aboard every real Air Eagle flight could not be
-    # recorded anywhere.
-    other_occupants_operating = st.text_input(
-        "Other occupants — operating (aboard and working, e.g. 'Abdulghani (LM), 2x AME')")
-    other_occupants_non_operating = st.text_input(
-        "Other occupants — non-operating (aboard, not operating — reason in Remarks)")
-
-    remarks = st.text_area("Remarks")
-
-    submitted = st.form_submit_button("Add flight")
-
-    if submitted:
-        try:
-            new_id = flight_service.add_flight({
-                "flight_no": flight_no or None,
-                "origin": origin,
-                "destination": destination,
-                "aircraft": aircraft or None,
-                "dep_time_planned": dt.datetime.combine(dep_date, dep_time),
-                "arr_time_planned": dt.datetime.combine(arr_date, arr_time),
-                "domestic": domestic == "Domestic",
-                "cargo_dg": cargo_dg,
-                "other_occupants_operating": other_occupants_operating or None,
-                "other_occupants_non_operating": other_occupants_non_operating or None,
-                "remarks": remarks or None,
-            }, app_user=app_user)
-            st.success(f"Added flight {new_id}")
-            st.rerun()
-        except ValueError as e:
-            st.error(str(e))
 
 
 # ================= UPDATE / CANCEL EXISTING =================
@@ -111,10 +67,10 @@ else:
                 st.write(f"**{selected['origin']} → {selected['destination']}**")
                 st.write(f"Status: {selected['status']}")
                 actual_dep_date = st.date_input("Actual departure date", value=None)
-                actual_dep_time = st.time_input("Actual departure time (UTC)", value=None)
+                actual_dep_time_raw = st.text_input("Actual departure time (UTC HHMM)")
             with col2:
                 actual_arr_date = st.date_input("Actual arrival date", value=None)
-                actual_arr_time = st.time_input("Actual arrival time (UTC)", value=None)
+                actual_arr_time_raw = st.text_input("Actual arrival time (UTC HHMM)")
                 cancel_reason = st.text_input("Cancellation reason (if cancelling)")
 
             # Pre-filled from the flight, unlike the actual-time fields
@@ -135,6 +91,13 @@ else:
                 cancel_submitted = st.form_submit_button("Cancel this flight")
 
             if save_submitted:
+                # parse_hhmm() returns (None, None) for blank, which is
+                # the normal case here: an empty actual-time field means
+                # "this hasn't happened yet", not midnight. Only a
+                # malformed value is an error.
+                actual_dep_time, dep_error = parse_hhmm(actual_dep_time_raw)
+                actual_arr_time, arr_error = parse_hhmm(actual_arr_time_raw)
+
                 dep_actual = (dt.datetime.combine(actual_dep_date, actual_dep_time)
                               if actual_dep_date and actual_dep_time else None)
                 arr_actual = (dt.datetime.combine(actual_arr_date, actual_arr_time)
@@ -153,46 +116,52 @@ else:
                     (edit_occupants_operating or None) != selected["other_occupants_operating"]
                     or (edit_occupants_non_operating or None) != selected["other_occupants_non_operating"]
                 )
-                if occupants_changed:
-                    flight_service.update_flight(selected_id, {
-                        "other_occupants_operating": edit_occupants_operating or None,
-                        "other_occupants_non_operating": edit_occupants_non_operating or None,
-                    }, app_user=app_user)
-                    st.success(f"Updated occupants for flight {selected_id}")
+                # A malformed time short-circuits everything: showing
+                # both "bad time" and "nothing to save" for one submit
+                # would be two messages describing one mistake.
+                if dep_error or arr_error:
+                    st.error(dep_error or arr_error)
+                else:
+                    if occupants_changed:
+                        flight_service.update_flight(selected_id, {
+                            "other_occupants_operating": edit_occupants_operating or None,
+                            "other_occupants_non_operating": edit_occupants_non_operating or None,
+                        }, app_user=app_user)
+                        st.success(f"Updated occupants for flight {selected_id}")
 
-                if dep_actual or arr_actual:
-                    outcomes = assignment_service.update_flight_actual_times_and_revalidate(
-                        selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual,
-                        app_user=app_user)
-                    st.success(f"Updated flight {selected_id}")
-                    for outcome in outcomes:
-                        result = outcome["validation_result"]
-                        if result.status in ("ILLEGAL", "NEEDS_MANUAL_REVIEW"):
-                            st.warning(
-                                f"⚠️ {outcome['crew_id']}'s duty {outcome['duty_id']} "
-                                f"flagged NEEDS_REVIEW after this delay — {result.status.value}."
-                            )
-                            for line in format_alert_lines(outcome["alert_summary"]):
-                                st.write(line)
-                        if outcome["downstream_conflicts"]:
-                            st.error(
-                                f"⚠️ Swap alert — this delay breaks the legality of "
-                                f"{len(outcome['downstream_conflicts'])} already-scheduled "
-                                f"future duty(ies) for {outcome['crew_id']}:"
-                            )
-                            for conflict in outcome["downstream_conflicts"]:
-                                st.write(
-                                    f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
-                                    f"reports {conflict.report_time}): "
-                                    + (f"legal candidates: {', '.join(conflict.candidates)}"
-                                       if conflict.candidates else "**no legal candidates found**")
+                    if dep_actual or arr_actual:
+                        outcomes = assignment_service.update_flight_actual_times_and_revalidate(
+                            selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual,
+                            app_user=app_user)
+                        st.success(f"Updated flight {selected_id}")
+                        for outcome in outcomes:
+                            result = outcome["validation_result"]
+                            if result.status in ("ILLEGAL", "NEEDS_MANUAL_REVIEW"):
+                                st.warning(
+                                    f"⚠️ {outcome['crew_id']}'s duty {outcome['duty_id']} "
+                                    f"flagged NEEDS_REVIEW after this delay — {result.status.value}."
                                 )
-                    st.rerun()
-                elif not occupants_changed:
-                    # Only when NOTHING was submitted. Saving an
-                    # occupant change alone is a complete action, and
-                    # must not be told it did nothing.
-                    st.warning("Nothing to save — enter actual times or change occupants.")
+                                for line in format_alert_lines(outcome["alert_summary"]):
+                                    st.write(line)
+                            if outcome["downstream_conflicts"]:
+                                st.error(
+                                    f"⚠️ Swap alert — this delay breaks the legality of "
+                                    f"{len(outcome['downstream_conflicts'])} already-scheduled "
+                                    f"future duty(ies) for {outcome['crew_id']}:"
+                                )
+                                for conflict in outcome["downstream_conflicts"]:
+                                    st.write(
+                                        f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
+                                        f"reports {conflict.report_time}): "
+                                        + (f"legal candidates: {', '.join(conflict.candidates)}"
+                                           if conflict.candidates else "**no legal candidates found**")
+                                    )
+                        st.rerun()
+                    elif not occupants_changed:
+                        # Only when NOTHING was submitted. Saving an
+                        # occupant change alone is a complete action, and
+                        # must not be told it did nothing.
+                        st.warning("Nothing to save — enter actual times or change occupants.")
 
             if cancel_submitted:
                 assignment_service.cancel_flight_and_roster(

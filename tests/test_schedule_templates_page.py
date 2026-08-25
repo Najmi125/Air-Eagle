@@ -130,6 +130,20 @@ def _fill_leg(at, index, flight_no, origin, destination, dep, arr, prefix="ct"):
 
 
 def _click(at, label):
+    """Click a button BY LABEL and return the resulting AppTest.
+
+    RUNS THE SCRIPT. The return value is the new state, so callers MUST
+    capture it:
+
+        at = _click(at, "Save")       # correct
+        _click(at, "Save"); at.run()  # WRONG — reruns the stale object
+                                      # and loses the click's effect
+
+    That second form is not hypothetical: it shipped on 2026-08-21 and
+    turned an IndexError into a silent assertion failure, because the
+    cancel never took effect. A helper that runs the script invisibly is
+    easy to misuse, so the contract is stated here rather than implied.
+    """
     matches = [b for b in at.button if b.label == label]
     assert len(matches) == 1, f"expected exactly one {label!r} button, found {len(matches)}"
     matches[0].click()

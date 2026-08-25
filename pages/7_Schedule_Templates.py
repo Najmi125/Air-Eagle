@@ -21,6 +21,7 @@ import streamlit as st
 
 from services import auth_service
 from services import rotation_template_service as rts
+from services.time_entry import format_hhmm as _format_hhmm, parse_hhmm as _parse_hhmm
 
 st.set_page_config(page_title="Schedule Templates", page_icon="📋", layout="wide")
 app_user = auth_service.require_login()
@@ -52,33 +53,6 @@ if "template_form_generation" not in st.session_state:
     st.session_state.template_form_generation = 0
 
 
-def _parse_hhmm(raw: str):
-    """'0905'/'09:05' -> dt.time(9, 5). Returns (time, None) or
-    (None, message).
-
-    Text rather than st.time_input, at the operator's request
-    (2026-08-19): a dropdown is slow for four times per rotation, and
-    controllers already write times as 0905. The empty string is a real
-    value here and NOT an error — it is what makes an untouched leg row
-    distinguishable from a filled one, which st.time_input could never
-    express because it always yields a value (00:00 by default). That
-    distinction is what fixes the silently-skipped leg below.
-    """
-    text_value = (raw or "").strip().replace(":", "")
-    if not text_value:
-        return None, None
-    if not (text_value.isdigit() and len(text_value) == 4):
-        return None, f"{raw.strip()!r} is not a valid time — use 24-hour HHMM, e.g. 0905"
-    hours, minutes = int(text_value[:2]), int(text_value[2:])
-    if hours > 23 or minutes > 59:
-        return None, f"{raw.strip()!r} is not a valid 24-hour time — hours 00-23, minutes 00-59"
-    return dt.time(hours, minutes), None
-
-
-def _format_hhmm(value) -> str:
-    """A stored dt.time back to the HHMM the controller typed, for
-    pre-filling the 'create new version' form."""
-    return value.strftime("%H%M") if value else ""
 
 
 def _render_leg_rows(key_prefix: str, defaults: list | None = None) -> list[dict]:

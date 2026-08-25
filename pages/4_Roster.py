@@ -1,7 +1,7 @@
 """
 pages/4_Roster.py
 
-Assigns crew to flights that already exist in Flight Log — the
+Assigns crew to flights that already exist — the
 scheduled-flight path. Ad-hoc flight creation + assignment together
 is Control Room's job (pages/1_Control_Room.py), not this page's.
 
@@ -37,7 +37,7 @@ st.subheader("Current assignments")
 
 flights_df = flight_service.get_all_flights()
 if flights_df.empty:
-    st.info("No flights in Flight Log yet — add one there first.")
+    st.info("No flights yet — create one in Control Room first.")
 else:
     roster_rows = []
     for _, flight in flights_df.iterrows():

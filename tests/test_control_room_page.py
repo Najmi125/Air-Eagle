@@ -102,16 +102,14 @@ def test_legal_pair_assignment_saves_flight_and_shows_success(page_app):
     at = page_app.run()
 
     # Pair is the default crew type — no radio interaction needed.
-    at.selectbox[0].select(cpt)  # Commander
-    at.selectbox[1].select(fo)   # Second Pilot
-    at.text_input[0].input("KHI")   # Origin
-    at.text_input[1].input("LHE")   # Destination
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.time_input[0].set_value(dt.time(5, 45))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(7, 45))
-    at.button[0].click()
-    at = at.run()
+    # Every lookup here is by LABEL, not position. The 2026-08-21
+    # restructure shifted text_input, time_input, date_input and button
+    # indices on this page all at once, and positional versions of these
+    # three tests broke in a file that had not been touched.
+    _select_pair(at, cpt, fo)
+    _fill_flight_form(at, dep="0545", arr="0745")
+    _set_flight_dates(at, dt.date(2026, 7, 20))
+    at = _click_save(at)
 
     assert not at.exception
     assert any("ALLOWED" in s.value for s in at.success)
@@ -155,16 +153,10 @@ def test_illegal_pair_assignment_shows_rejection_and_saves_nothing(page_app):
         })
 
     at = page_app.run()
-    at.selectbox[0].select(cpt)
-    at.selectbox[1].select(fo)
-    at.text_input[0].input("KHI")
-    at.text_input[1].input("LHE")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.time_input[0].set_value(dt.time(17, 45))   # only 5h after prior debrief (12:15)
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(19, 45))
-    at.button[0].click()
-    at = at.run()
+    _select_pair(at, cpt, fo)
+    _fill_flight_form(at, dep="1745", arr="1945")   # only 5h after prior debrief (12:15)
+    _set_flight_dates(at, dt.date(2026, 7, 20))
+    at = _click_save(at)
 
     assert not at.exception
     assert any("REJECTED" in e.value for e in at.error)
@@ -187,16 +179,10 @@ def test_needs_review_pair_assignment_shows_warning_not_success(page_app):
     crew_service.update_crew(cpt, {"license_expiry": None})
 
     at = page_app.run()
-    at.selectbox[0].select(cpt)
-    at.selectbox[1].select(fo)
-    at.text_input[0].input("KHI")
-    at.text_input[1].input("LHE")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.time_input[0].set_value(dt.time(5, 0))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(7, 0))
-    at.button[0].click()
-    at = at.run()
+    _select_pair(at, cpt, fo)
+    _fill_flight_form(at, dep="0500", arr="0700")
+    _set_flight_dates(at, dt.date(2026, 7, 20))
+    at = _click_save(at)
 
     assert not at.exception
     assert any("HELD FOR MANUAL REVIEW" in w.value for w in at.warning)
@@ -253,9 +239,19 @@ _PAIR_CREW = pd.DataFrame([
 @pytest.fixture
 def faked_services(monkeypatch):
     """crew list + a capturing add_flight. Returns the list of flights
-    written, so a test can assert exactly what reached the service."""
+    written, so a test can assert exactly what reached the service.
+
+    test_connection is patched to report the database DOWN, which makes
+    section 1 (the operational status board) skip itself entirely.
+    These tests are about sections 2 and 3; without this they would
+    attempt real connections for the board and sit in retries until
+    AppTest times out. The board has its own fixture, `status_board`.
+    """
+    import db.db as db
     from services import crew_service as cs
     from services import flight_service as fs
+
+    monkeypatch.setattr(db, "test_connection", lambda: "no database (test)")
 
     written = []
     monkeypatch.setattr(cs, "get_all_crew", lambda active_only=True: _PAIR_CREW.copy())
@@ -341,7 +337,10 @@ def test_page_still_renders_with_no_crew_on_file(monkeypatch):
     """Previously st.stop()'d on an empty crew list, which is the state
     a fresh deployment is in. A flight with crew TBC must still be
     recordable then — that is when it is most likely."""
+    import db.db as db
     from services import crew_service as cs
+    # Section 1 skipped: see faked_services' docstring.
+    monkeypatch.setattr(db, "test_connection", lambda: "no database (test)")
     monkeypatch.setattr(cs, "get_all_crew",
                         lambda active_only=True: pd.DataFrame(columns=_CREW_COLUMNS))
 
@@ -356,10 +355,12 @@ def test_page_still_renders_with_no_crew_on_file(monkeypatch):
 def test_requesting_a_pair_that_cannot_be_formed_saves_nothing(monkeypatch):
     """Must not silently downgrade to an uncrewed flight: the
     controller asked for crew. Refuse, and say how to proceed."""
+    import db.db as db
     from services import crew_service as cs
     from services import flight_service as fs
 
     written = []
+    monkeypatch.setattr(db, "test_connection", lambda: "no database (test)")
     monkeypatch.setattr(cs, "get_all_crew",
                         lambda active_only=True: pd.DataFrame(columns=_CREW_COLUMNS))
     monkeypatch.setattr(fs, "add_flight",
@@ -373,3 +374,257 @@ def test_requesting_a_pair_that_cannot_be_formed_saves_nothing(monkeypatch):
     assert not at.exception
     assert any("Nothing was saved" in e.value for e in at.error)
     assert written == [], "an uncrewed flight must not be created when a pair was requested"
+
+
+# ------------------------------------------------------------------
+# Add-flight coverage, MOVED here from test_flight_log_page.py
+# (2026-08-21) — same coverage, different page
+# ------------------------------------------------------------------
+#
+# Both pages carried identical seven-field forms until the restructure.
+# Creation now belongs here (Control Room is where a controller ACTS);
+# Flt Schedule is the record. test_flight_log_page.py pins the absence.
+#
+# Label-based, not index-based: the form gained "Flight No" and the
+# times became HHMM text, so positional lookups from the old page would
+# silently address the wrong widget.
+
+def _select_pair(at, commander, second_pilot):
+    """Crew selectors by label. They were at.selectbox[0]/[1] until
+    2026-08-21 — correct only while section 1 rendered no selectbox of
+    its own, which is not a property any of these tests assert."""
+    _by_label(at.selectbox, "Commander (must be CPT) *").select(commander)
+    _by_label(at.selectbox, "Second Pilot (CPT or FO) *").select(second_pilot)
+
+
+def _set_flight_dates(at, day):
+    _by_label(at.date_input, "Departure date *").set_value(day)
+    _by_label(at.date_input, "Arrival date *").set_value(day)
+
+
+def _by_label(elements, label):
+    matches = [e for e in elements if e.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one element labeled {label!r}, found "
+        f"{[e.label for e in elements]}"
+    )
+    return matches[0]
+
+
+def _fill_flight_form(at, origin="KHI", destination="LHE",
+                      dep="0500", arr="0700", flight_no=None):
+    for t in at.text_input:
+        if t.label.startswith("Flight No") and flight_no is not None:
+            t.input(flight_no)
+        elif t.label.startswith("Origin"):
+            t.input(origin)
+        elif t.label.startswith("Destination"):
+            t.input(destination)
+        elif t.label.startswith("Departure time"):
+            t.input(dep)
+        elif t.label.startswith("Arrival time"):
+            t.input(arr)
+
+
+def test_add_flight_without_crew_succeeds_and_appears_in_the_record(page_app):
+    """MOVED from test_flight_log_page.py::
+    test_add_flight_via_form_succeeds_and_shows_in_log."""
+    from services import flight_service
+
+    at = page_app.run()
+    at.session_state["control_room_assign_pair"] = False
+    at = at.run()
+
+    _fill_flight_form(at, flight_no="EPE 786")
+    at = _click_save(at)   # _click_save runs the script; capture it
+
+    flights = flight_service.get_all_flights()
+    assert len(flights) == 1
+    assert flights.iloc[0]["origin"] == "KHI"
+    assert flights.iloc[0]["flight_no"] == "EPE 786"
+
+
+def test_add_flight_missing_origin_shows_error(page_app):
+    """MOVED from test_flight_log_page.py. Origin/destination are
+    required here, before anything reaches the service."""
+    from services import flight_service
+
+    at = page_app.run()
+    at.session_state["control_room_assign_pair"] = False
+    at = at.run()
+
+    _fill_flight_form(at, origin="")
+    at = _click_save(at)
+
+    assert any("Origin and destination are required" in e.value for e in at.error)
+    assert len(flight_service.get_all_flights()) == 0
+
+
+def test_malformed_hhmm_is_rejected_and_saves_nothing(page_app):
+    """The times became text in this restructure; a bad one must be
+    named, not silently coerced."""
+    from services import flight_service
+
+    at = page_app.run()
+    at.session_state["control_room_assign_pair"] = False
+    at = at.run()
+
+    _fill_flight_form(at, dep="2465")
+    at = _click_save(at)
+
+    assert any("2465" in e.value for e in at.error)
+    assert len(flight_service.get_all_flights()) == 0
+
+
+def _click_save(at):
+    """Submit the add-flight form and return the resulting AppTest.
+
+    RUNS THE SCRIPT — the return value is the new state and callers MUST
+    capture it (`at = _click_save(at)`). Discarding it and calling
+    at.run() separately reruns the STALE object and loses the submit:
+    that shipped once on 2026-08-21 in the sibling _click helper, where
+    it turned a loud IndexError into a quiet assertion failure.
+    """
+    [b for b in at.button if b.label == "Check legality and save"][0].click()
+    return at.run()
+
+
+# ------------------------------------------------------------------
+# Section 1: operational status board (2026-08-21) — DB-free
+# ------------------------------------------------------------------
+
+_TODAY = dt.date.today()
+
+_FLIGHTS_TODAY = pd.DataFrame([
+    {"flight_id": 1, "flight_no": "EPE 786", "origin": "KHI", "destination": "LHE",
+     "dep_time_planned": dt.datetime.combine(_TODAY, dt.time(19, 0)),
+     "arr_time_planned": dt.datetime.combine(_TODAY, dt.time(20, 45)),
+     "status": "PLANNED", "domestic": True},
+    {"flight_id": 2, "flight_no": None, "origin": "LHE", "destination": "DWC",
+     "dep_time_planned": dt.datetime.combine(_TODAY, dt.time(22, 0)),
+     "arr_time_planned": dt.datetime.combine(_TODAY, dt.time(23, 45)),
+     "status": "PLANNED", "domestic": False},
+])
+
+# Flight 1 fully crewed; flight 2 has nothing. Note the Commander of
+# flight 1 is a CPT in the COMMANDER seat and the Second Pilot is ALSO
+# a CPT — legitimate under the pair model, and the reason seat coverage
+# must be read from operating_position rather than role_assigned.
+_ROSTER_TODAY = pd.DataFrame([
+    {"flight_id": 1, "crew_id": "CPT-01", "operating_position": "COMMANDER",
+     "role_assigned": "CPT", "status": "CONFIRMED"},
+    {"flight_id": 1, "crew_id": "CPT-02", "operating_position": "SECOND_PILOT",
+     "role_assigned": "CPT", "status": "CONFIRMED"},
+])
+
+
+@pytest.fixture
+def status_board(monkeypatch):
+    """Everything section 1 reads, faked. Returns a dict the test can
+    mutate before rendering."""
+    import db.db as db
+    from services import assignment_service as asg
+    from services import crew_service as cs
+    from services import flight_service as fs
+    from services import roster_generator_service as rgs
+
+    state = {
+        "connected": True,
+        "flights": _FLIGHTS_TODAY.copy(),
+        "roster": _ROSTER_TODAY.copy(),
+        "uncovered": pd.DataFrame([{"x": 1}]),
+        "expiry": {"expired": 2, "expiring": 1, "horizon_days": 7},
+    }
+    monkeypatch.setattr(db, "test_connection", lambda: state["connected"])
+    monkeypatch.setattr(cs, "get_all_crew", lambda active_only=True: _PAIR_CREW.copy())
+    monkeypatch.setattr(fs, "get_all_flights",
+                        lambda **kw: state["flights"])
+    monkeypatch.setattr(asg, "search_roster", lambda **kw: state["roster"])
+    monkeypatch.setattr(rgs, "get_open_uncovered_seats", lambda a, b: state["uncovered"])
+    monkeypatch.setattr(asg, "qualification_expiry_counts",
+                        lambda *a, **k: state["expiry"])
+    return state
+
+
+def _board_rows(at):
+    """The Today's flights dataframe, as a list of dicts."""
+    assert at.dataframe, "no status board rendered"
+    return at.dataframe[0].value.to_dict("records")
+
+
+def test_status_board_reports_seats_from_operating_position(status_board):
+    """The catch this section was nearly built on the wrong column.
+
+    Flight 1's Second Pilot is a CPT by grade. Reading coverage from
+    role_assigned would report the Commander seat filled twice and the
+    Second Pilot seat empty. operating_position is the seat, and that
+    grade-versus-position split is what the flight-deck crew package
+    existed to establish."""
+    at = _render()
+
+    rows = _board_rows(at)
+    crewed = next(r for r in rows if r["Flight"].startswith("EPE 786"))
+    assert crewed["Commander"] == "CPT-01"
+    assert crewed["Second Pilot"] == "CPT-02"
+
+
+def test_status_board_shows_uncovered_for_an_empty_seat(status_board):
+    """An ad-hoc flight saved with crew TBC — which this page now makes
+    easy to create — must be visibly uncovered here, since the
+    rotation-seat metric above deliberately does not count it."""
+    at = _render()
+
+    rows = _board_rows(at)
+    uncrewed = next(r for r in rows if r["Flight"].startswith("#2"))
+    assert uncrewed["Commander"] == "UNCOVERED"
+    assert uncrewed["Second Pilot"] == "UNCOVERED"
+
+
+def test_status_board_metrics_render(status_board):
+    at = _render()
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Uncovered rotation seats today"] == "1"
+    assert metrics["Crew with expired documents"] == "2"
+    assert metrics["Crew with documents expiring in 7 days"] == "1"
+
+
+def test_status_board_is_skipped_when_the_database_is_unreachable(status_board, monkeypatch):
+    """Skipped, not merely wrapped. try/except catches a failing query
+    but not a hanging one — this cost the home page three seconds to
+    render before the same gate was added there (2026-08-20). Any query
+    running here is a failure."""
+    status_board["connected"] = "connection refused"
+
+    from services import assignment_service as asg
+    from services import flight_service as fs
+    from services import roster_generator_service as rgs
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("status board queried an unreachable database")
+
+    monkeypatch.setattr(rgs, "get_open_uncovered_seats", must_not_run)
+    monkeypatch.setattr(asg, "qualification_expiry_counts", must_not_run)
+    monkeypatch.setattr(fs, "get_all_flights", must_not_run)
+    monkeypatch.setattr(asg, "search_roster", must_not_run)
+
+    at = _render()
+
+    assert not at.exception
+    assert any("Operational status unavailable" in c.value for c in at.caption)
+    # The page's real job must survive.
+    assert any(b.label == "Check legality and save" for b in at.button)
+
+
+def test_status_board_survives_one_query_failing_on_its_own(status_board, monkeypatch):
+    """Connection up, one query broken. The rest of the board, and the
+    add-flight form, must still render."""
+    from services import flight_service as fs
+    monkeypatch.setattr(fs, "get_all_flights",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    at = _render()
+
+    assert not at.exception
+    assert any("Today's flights unavailable" in c.value for c in at.caption)
+    assert {m.label for m in at.metric} >= {"Uncovered rotation seats today"}
+    assert any(b.label == "Check legality and save" for b in at.button)

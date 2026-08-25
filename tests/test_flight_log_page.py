@@ -28,6 +28,38 @@ def page_app(migrated_db, monkeypatch):
     get_engine.cache_clear()
 
 
+def _by_label(elements, label):
+    matches = [e for e in elements if e.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one element labeled {label!r}, found "
+        f"{[e.label for e in elements]}"
+    )
+    return matches[0]
+
+
+def _click(at, label):
+    """Click a button BY LABEL and return the resulting AppTest.
+
+    RUNS THE SCRIPT. The return value is the new state, so callers MUST
+    capture it:
+
+        at = _click(at, "Save")       # correct
+        _click(at, "Save"); at.run()  # WRONG — reruns the stale object
+                                      # and loses the click's effect
+
+    That second form is not hypothetical: it shipped on 2026-08-21 and
+    turned an IndexError into a silent assertion failure, because the
+    cancel never took effect. A helper that runs the script invisibly is
+    easy to misuse, so the contract is stated here rather than implied.
+    """
+    matches = [b for b in at.button if b.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one {label!r} button, found {[b.label for b in at.button]}"
+    )
+    matches[0].click()
+    return at.run()
+
+
 def test_page_loads_without_exception(page_app):
     at = page_app.run()
     assert not at.exception
@@ -38,40 +70,26 @@ def test_empty_flight_log_shows_info_message(page_app):
     assert any("No flights yet" in info.value for info in at.info)
 
 
-def test_add_flight_via_form_succeeds_and_shows_in_log(page_app):
-    at = page_app.run()
+def test_flight_log_no_longer_offers_flight_creation(page_app):
+    """REPLACES test_add_flight_via_form_succeeds_and_shows_in_log and
+    test_add_flight_missing_origin_shows_error (2026-08-21). Both moved
+    to tests/test_control_room_page.py — same coverage, different page.
 
-    at.text_input[1].input("KHI")   # Origin *
-    at.text_input[2].input("LHE")   # Destination *
-    at.date_input[0].set_value(dt.date(2026, 7, 20))   # Departure date
-    at.time_input[0].set_value(dt.time(5, 0))           # Departure time
-    at.date_input[1].set_value(dt.date(2026, 7, 20))   # Arrival date
-    at.time_input[1].set_value(dt.time(7, 0))           # Arrival time
-    at.button[0].click()
-    at = at.run()
+    This page and Control Room carried identical seven-field add-flight
+    forms, so "where do I add a flight?" had two answers. Creation now
+    belongs to Control Room (where a controller ACTS); this page is the
+    record (what happened, and where actuals are entered).
+
+    Pinned as an absence, the way test_single_crew_path_is_gone pins
+    the removed single-crew path — a duplicate form is the kind of
+    thing that gets helpfully re-added."""
+    at = page_app.run()
 
     assert not at.exception
-    assert any("Added flight" in s.value for s in at.success)
-
-    at = at.run()
-    df = at.dataframe[0].value
-    assert "KHI" in list(df["origin"])
-    assert "LHE" in list(df["destination"])
-
-
-def test_add_flight_missing_origin_shows_error(page_app):
-    at = page_app.run()
-
-    # Destination filled, origin left blank
-    at.text_input[2].input("LHE")
-    at.date_input[0].set_value(dt.date(2026, 7, 20))
-    at.time_input[0].set_value(dt.time(5, 0))
-    at.date_input[1].set_value(dt.date(2026, 7, 20))
-    at.time_input[1].set_value(dt.time(7, 0))
-    at.button[0].click()
-    at = at.run()
-
-    assert any("Missing required flight field" in e.value for e in at.error)
+    assert not any(b.label == "Add flight" for b in at.button), (
+        "flight creation belongs to Control Room, not here"
+    )
+    assert not any("Add flight" in h.value for h in at.subheader)
 
 
 def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):
@@ -86,9 +104,13 @@ def test_cancel_flight_via_form_marks_cancelled_and_stays_visible(page_app):
     })
 
     at = page_app.run()
-    at.text_input[4].input("Aircraft AOG")  # Cancellation reason
-    at.button[2].click()                     # Cancel this flight
-    at = at.run()
+    # Label-based, not positional. This filled at.text_input[4] and
+    # clicked at.button[2] until 2026-08-21, when removing the
+    # add-flight section shifted every index on the page — the same
+    # breakage the Control Room pair tests hit in the same restructure.
+    # Indices describe a layout; labels describe intent.
+    _by_label(at.text_input, "Cancellation reason (if cancelling)").input("Aircraft AOG")
+    at = _click(at, "Cancel this flight")   # _click runs the script; capture it
 
     assert not at.exception
     assert any("Cancelled flight" in s.value for s in at.success)

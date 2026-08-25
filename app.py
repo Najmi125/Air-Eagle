@@ -31,7 +31,7 @@ pg = st.navigation([
     st.Page("home.py", title="Home", icon="🏠", default=True),
     st.Page("pages/1_Control_Room.py", title="Control Room", icon="🛫"),
     st.Page("pages/2_Crew_Data.py", title="Crew Data", icon="👨‍✈️"),
-    st.Page("pages/3_Flight_Log.py", title="Flight Log", icon="📘"),
+    st.Page("pages/3_Flight_Log.py", title="Flt Schedule", icon="📘"),
     st.Page("pages/4_Roster.py", title="Roster", icon="🗓️"),
     st.Page("pages/5_Assistant.py", title="OCC Assistant", icon="🤖"),
     st.Page("pages/6_Roster_Generation.py", title="Roster Generation", icon="⚙️"),
