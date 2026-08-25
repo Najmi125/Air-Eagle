@@ -47,6 +47,9 @@ st.dataframe(flights_df, width="stretch")
 
 # ================= UPDATE / CANCEL EXISTING =================
 st.subheader("Record actuals, update status, or cancel a flight")
+# That promise was false until 2026-08-21: status could only ever
+# become CANCELLED, so "update status" described nothing the page
+# could do. The disruption controls below make it true.
 
 if flights_df.empty:
     st.info("No flights yet.")
@@ -101,11 +104,51 @@ else:
                 "Other occupants — non-operating",
                 value=selected["other_occupants_non_operating"] or "")
 
+            # DISRUPTED is a MANUAL label — the system never applies it.
+            # The control offered depends on the flight's current status,
+            # rather than a free dropdown of all four states: PLANNED ->
+            # OPERATED is automatic (both actuals recorded) and needs no
+            # widget, OPERATED and CANCELLED are terminal, and the only
+            # transitions a controller makes by hand are into and out of
+            # DISRUPTED.
+            #
+            # The un-disrupt control names its OUTCOME rather than
+            # offering "PLANNED" and quietly landing somewhere else: on a
+            # flight with both actual times, removing the label yields
+            # OPERATED, because the flight flew. Where it lands is
+            # decided by recorded fact, not by the caller.
+            disruption_reason = None
+            if selected["status"] == "PLANNED":
+                disruption_reason = st.text_input(
+                    "Disruption reason (required to mark DISRUPTED)")
+                disrupt_label = "Mark DISRUPTED"
+                undisrupt_label = None
+            elif selected["status"] == "DISRUPTED":
+                disruption_reason = st.text_input(
+                    "Reason for clearing the DISRUPTED label (required)")
+                disrupt_label = None
+                both_actuals = (selected["dep_time_actual"] is not None
+                                and selected["arr_time_actual"] is not None)
+                undisrupt_label = (
+                    "Clear DISRUPTED → OPERATED" if both_actuals
+                    else "Clear DISRUPTED → PLANNED")
+            else:
+                disrupt_label = undisrupt_label = None
+                st.caption(
+                    f"Status {selected['status']} is final — no manual status "
+                    f"changes are available for this flight."
+                )
+
             col_save, col_cancel = st.columns(2)
             with col_save:
                 save_submitted = st.form_submit_button("Save changes")
             with col_cancel:
                 cancel_submitted = st.form_submit_button("Cancel this flight")
+
+            disrupt_submitted = (
+                st.form_submit_button(disrupt_label) if disrupt_label else False)
+            undisrupt_submitted = (
+                st.form_submit_button(undisrupt_label) if undisrupt_label else False)
 
             if save_submitted:
                 # parse_hhmm() returns (None, None) for blank, which is
@@ -181,6 +224,26 @@ else:
                         # occupant change alone is a complete action, and
                         # must not be told it did nothing.
                         st.warning("Nothing to save — enter actual times, or change aircraft or occupants.")
+
+            if disrupt_submitted:
+                try:
+                    flight_service.set_flight_disrupted(
+                        selected_id, reason=disruption_reason or "", app_user=app_user)
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.success(f"Flight {selected_id} marked DISRUPTED")
+                    st.rerun()
+
+            if undisrupt_submitted:
+                try:
+                    new_status = flight_service.clear_flight_disruption(
+                        selected_id, reason=disruption_reason or "", app_user=app_user)
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.success(f"DISRUPTED cleared — flight {selected_id} is now {new_status}")
+                    st.rerun()
 
             if cancel_submitted:
                 assignment_service.cancel_flight_and_roster(

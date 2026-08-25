@@ -140,31 +140,41 @@ _FLIGHT_COLUMNS = ["flight_id", "flight_no", "origin", "destination", "aircraft"
                    "other_occupants_operating", "other_occupants_non_operating"]
 
 
-def _fake_flight(aircraft):
+def _fake_flight(aircraft=None, status="PLANNED", dep_actual=None, arr_actual=None):
     return {
         "flight_id": 1, "flight_no": "EPE 786", "origin": "KHI", "destination": "LHE",
         "aircraft": aircraft,
         "dep_time_planned": dt.datetime(2026, 8, 20, 19, 0),
         "arr_time_planned": dt.datetime(2026, 8, 20, 20, 45),
-        "status": "PLANNED", "domestic": True,
+        "dep_time_actual": dep_actual, "arr_time_actual": arr_actual,
+        "status": status, "domestic": True,
         "other_occupants_operating": None, "other_occupants_non_operating": None,
     }
 
 
-def _render_with_flight(monkeypatch, aircraft):
+def _render_with_flight(monkeypatch, aircraft=None, status="PLANNED",
+                        dep_actual=None, arr_actual=None):
+    """Renders the page against one faked flight. Returns
+    (AppTest, calls) where calls records what reached the service."""
     from services import flight_service as fs
-    row = _fake_flight(aircraft)
-    written = []
+    row = _fake_flight(aircraft, status, dep_actual, arr_actual)
+    calls = {"update": [], "disrupt": [], "clear": []}
     monkeypatch.setattr(fs, "get_all_flights",
-                        lambda **kw: pd.DataFrame([row], columns=_FLIGHT_COLUMNS))
+                        lambda **kw: pd.DataFrame([row], columns=list(row)))
     monkeypatch.setattr(fs, "get_flight", lambda fid: row)
     monkeypatch.setattr(fs, "update_flight",
-                        lambda fid, updates, app_user=None: written.append(updates))
+                        lambda fid, updates, app_user=None: calls["update"].append(updates))
+    monkeypatch.setattr(fs, "set_flight_disrupted",
+                        lambda fid, reason, app_user=None: calls["disrupt"].append(reason))
+    monkeypatch.setattr(fs, "clear_flight_disruption",
+                        lambda fid, reason, app_user=None: (
+                            calls["clear"].append(reason),
+                            "OPERATED" if (dep_actual and arr_actual) else "PLANNED")[1])
 
     at = AppTest.from_file(str(page_path("pages/3_Flight_Log.py")))
     at.session_state["app_user"] = "occ1"
     at.run()
-    return at, written
+    return at, calls
 
 
 def _aircraft_field(at):
@@ -191,10 +201,91 @@ def test_aircraft_never_overwrites_a_value_already_set(monkeypatch):
 
 
 def test_editing_aircraft_writes_it(monkeypatch):
-    at, written = _render_with_flight(monkeypatch, aircraft=None)
+    at, calls = _render_with_flight(monkeypatch, aircraft=None)
 
     _aircraft_field(at).input("AP-ABC")
     at = _click(at, "Save changes")
 
     assert not at.exception
-    assert written and written[-1]["aircraft"] == "AP-ABC"
+    assert calls["update"] and calls["update"][-1]["aircraft"] == "AP-ABC"
+
+
+# ------------------------------------------------------------------
+# Status transitions (2026-08-21) — DB-free
+# ------------------------------------------------------------------
+#
+# status could ONLY ever become CANCELLED before this: cancel_flight()
+# was its sole writer, so a flight that flew stayed PLANNED forever and
+# DISRUPTED was unreachable, while the filter offered all four states.
+
+_DEP_ACTUAL = dt.datetime(2026, 8, 20, 19, 12)
+_ARR_ACTUAL = dt.datetime(2026, 8, 20, 20, 58)
+
+
+def _button_labels(at):
+    return [b.label for b in at.button]
+
+
+def test_planned_flight_offers_only_the_disrupt_control(monkeypatch):
+    at, _ = _render_with_flight(monkeypatch, status="PLANNED")
+
+    assert not at.exception
+    assert "Mark DISRUPTED" in _button_labels(at)
+    assert not any(b.startswith("Clear DISRUPTED") for b in _button_labels(at))
+
+
+def test_disrupted_flight_that_flew_offers_clearing_to_OPERATED(monkeypatch):
+    """The control names its OUTCOME. Removing the label from a flight
+    with both actual times yields OPERATED, because the flight flew —
+    offering "PLANNED" here would be a control that says one thing and
+    does another, since the automatic rule would move it anyway."""
+    at, _ = _render_with_flight(monkeypatch, status="DISRUPTED",
+                                dep_actual=_DEP_ACTUAL, arr_actual=_ARR_ACTUAL)
+
+    assert "Clear DISRUPTED → OPERATED" in _button_labels(at)
+    assert "Clear DISRUPTED → PLANNED" not in _button_labels(at)
+
+
+def test_disrupted_flight_that_has_not_flown_offers_clearing_to_PLANNED(monkeypatch):
+    at, _ = _render_with_flight(monkeypatch, status="DISRUPTED")
+
+    assert "Clear DISRUPTED → PLANNED" in _button_labels(at)
+    assert "Clear DISRUPTED → OPERATED" not in _button_labels(at)
+
+
+def test_operated_and_cancelled_flights_offer_no_manual_status_change(monkeypatch):
+    """Both are terminal — a flight that flew is not relabelled, and
+    cancellation is a deliberate act."""
+    for status in ("OPERATED", "CANCELLED"):
+        at, _ = _render_with_flight(monkeypatch, status=status,
+                                    dep_actual=_DEP_ACTUAL, arr_actual=_ARR_ACTUAL)
+        labels = _button_labels(at)
+        assert "Mark DISRUPTED" not in labels, status
+        assert not any(b.startswith("Clear DISRUPTED") for b in labels), status
+        assert any("is final" in c.value for c in at.caption), status
+
+
+def test_marking_disrupted_passes_the_reason_through(monkeypatch):
+    """A disruption nobody can explain later is the case an auditor asks
+    about — the reason reaches the service, which requires it."""
+    at, calls = _render_with_flight(monkeypatch, status="PLANNED")
+
+    _by_label(at.text_input, "Disruption reason (required to mark DISRUPTED)").input("Bird strike")
+    at = _click(at, "Mark DISRUPTED")
+
+    assert not at.exception
+    assert calls["disrupt"] == ["Bird strike"]
+
+
+def test_clearing_a_disruption_also_carries_a_reason(monkeypatch):
+    """The undo is audited like the forward transition. Without it the
+    record shows a flight that was never disrupted, when it was labelled
+    and then relabelled."""
+    at, calls = _render_with_flight(monkeypatch, status="DISRUPTED")
+
+    _by_label(at.text_input,
+              "Reason for clearing the DISRUPTED label (required)").input("Labelled in error")
+    at = _click(at, "Clear DISRUPTED → PLANNED")
+
+    assert not at.exception
+    assert calls["clear"] == ["Labelled in error"]
