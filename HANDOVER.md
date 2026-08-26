@@ -7110,3 +7110,51 @@ waste, not round-trips, and was deliberately kept out of this change so
 the measurement stayed clean. It is now the dominant LOCAL cost (the
 6×6 fixture takes ~47s of pure CPU) and is irrelevant to production
 latency. Worth doing on its own terms, measured on its own terms.
+
+### 2026-08-22 (continued): two defects in the fix itself
+
+**1. A NameError shipped in the ad-hoc pair path.**
+`assign_pair_to_new_flights()` referenced `prefetch`, which it never
+received — a global edit matched two functions with identical
+crew-fetch shapes. Control Room could not assign crew at all and showed
+a raw exception.
+
+Exactly the risk flagged when fix 4 was planned: replacing a fetch with
+a parameter means the function stops being self-sufficient, and one
+caller was not threaded. Reverted to direct fetches rather than adding a
+parameter — that path CREATES flights, so it has nothing to prefetch and
+no caller that benefits.
+
+The audit that should have run at the time now has: an AST check that
+every function using `prefetch` has it in scope, and a bind-check of all
+**71 call sites** of every signature changed in this branch. Both clean.
+
+**2. The round-trip guards had never executed anywhere.** They reached
+`get_engine()`, which raises when `DATABASE_URL` is unset — so they
+failed on the verification machine and only ran locally because this
+machine's `.env` happens to point somewhere. They never actually
+queried (engines are lazy and every query function is patched), but
+depending on the variable at all defeated the point.
+
+**Deliberately NOT switched to `TEST_DATABASE_URL` and the standard
+page fixture.** That would make them SKIP wherever Postgres is absent —
+precisely the environment this defect was invisible in, and the whole
+reason they exist. They now patch `get_engine` with a sentinel that
+RAISES if anything tries to use it, so an unpatched query path fails
+loudly instead of quietly opening a connection. Verified passing with
+both `DATABASE_URL` and `TEST_DATABASE_URL` unset.
+
+**Third occurrence of the same shape** (after the auth harness and the
+Streamlit version drift): a test written to catch what local testing
+cannot see, itself unable to run. The lesson that keeps recurring is
+narrower than "test the tests" — it is that a guard which needs the
+environment it is guarding against is not a guard. Run new DB-free
+tests with the environment variables explicitly unset before believing
+them.
+
+**Also added:** a DB-free smoke test for the ad-hoc pair path, which had
+none — every test of it was DB-gated, which is why an 11-test failure
+appeared only on Postgres. Expired-document crew means validation
+rejects before any write, so the whole read path runs without a
+database. Mutation-tested: it catches the shipped NameError in 1.4
+seconds.

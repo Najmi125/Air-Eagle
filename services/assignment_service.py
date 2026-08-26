@@ -1599,10 +1599,10 @@ def assign_pair_to_new_flights(commander_crew_id: str, second_pilot_crew_id: str
     """
     engine = get_engine()
 
-    commander_row = _get_crew_row(commander_crew_id, prefetch)
+    commander_row = crew_service.get_crew(commander_crew_id)
     if commander_row is None:
         raise ValueError(f"No crew member with crew_id={commander_crew_id}")
-    second_pilot_row = _get_crew_row(second_pilot_crew_id, prefetch)
+    second_pilot_row = crew_service.get_crew(second_pilot_crew_id)
     if second_pilot_row is None:
         raise ValueError(f"No crew member with crew_id={second_pilot_crew_id}")
     if commander_crew_id == second_pilot_crew_id:

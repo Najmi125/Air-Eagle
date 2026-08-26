@@ -163,6 +163,31 @@ def run_generation(monkeypatch, commanders, second_pilots, rotations=1):
                         counted("get_instances", lambda: instances.copy()))
     monkeypatch.setattr(rts, "get_promoted_flight_ids",
                         lambda iid: (counts.hit("get_promoted_flight_ids"), [iid * 10, iid * 10 + 1])[1])
+    # NO ENGINE. get_engine() is reached by assign_pair_to_duty() and
+    # friends, and it RAISES when DATABASE_URL is unset — which is how
+    # these tests failed for everyone except a machine whose .env
+    # happens to point somewhere. They never actually queried (engines
+    # are lazy and every query function here is patched), but depending
+    # on the variable at all defeated the point of a DB-free guard.
+    #
+    # Deliberately NOT switched to TEST_DATABASE_URL and the standard
+    # page fixture: that would make these SKIP wherever Postgres is
+    # absent, which is precisely the environment this defect was
+    # invisible in. A sentinel keeps them running everywhere.
+    #
+    # The sentinel raises if anything tries to USE it, so an unpatched
+    # query fails loudly here rather than quietly opening a connection.
+    class _NoEngine:
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"generation reached the database (engine.{name}) — a query "
+                f"path is unpatched, so this count is not measuring what it "
+                f"claims to"
+            )
+
+    monkeypatch.setattr(assignment_service, "get_engine", lambda: _NoEngine())
+    monkeypatch.setattr(rgs, "get_engine", lambda: _NoEngine())
+
     monkeypatch.setattr(audit_service, "log_audit", lambda *a, **k: None)
     monkeypatch.setattr(rgs, "log_audit", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(rgs, "_record_uncovered", lambda *a, **k: None)
@@ -222,3 +247,52 @@ def test_round_trip_budget_for_a_pinned_pool(monkeypatch):
     _, counts = run_generation(monkeypatch, commanders=3, second_pilots=3)
 
     assert counts.total <= 25, counts
+
+
+# ------------------------------------------------------------------
+# The ad-hoc pair path (Control Room) — DB-free smoke
+# ------------------------------------------------------------------
+
+def test_adhoc_pair_path_runs_without_a_stray_name(monkeypatch):
+    """assign_pair_to_new_flights() shipped a NameError on 2026-08-22:
+    it referenced `prefetch`, which it never received, after a global
+    edit matched two functions with identical crew-fetch shapes. The ad-
+    hoc pair path was completely broken — Control Room could not assign
+    crew and showed a raw exception.
+
+    It surfaced only on real Postgres, because every test of that path
+    is DB-gated and skips wherever Postgres is absent. This one is not:
+    the crew rows have expired documents, so validation REJECTS before
+    any flight is written, which exercises the whole read path without
+    needing a database.
+
+    A NameError on a rarely-taken branch is exactly what a smoke test is
+    for — it needs no assertion beyond "it ran"."""
+    from services import assignment_service, crew_service
+
+    crew = {"CPT-01": pd.Series(_crew_row("CPT-01", "CPT")),
+            "FO-01": pd.Series(_crew_row("FO-01", "FO"))}
+
+    class _NoEngine:
+        def __getattr__(self, name):
+            raise AssertionError(f"reached the database (engine.{name})")
+
+    monkeypatch.setattr(crew_service, "get_crew", lambda cid: crew.get(cid))
+    monkeypatch.setattr(assignment_service, "get_engine", lambda: _NoEngine())
+    monkeypatch.setattr(assignment_service, "_read_duty_rows",
+                        lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(assignment_service, "_find_paired_pilot", lambda *a, **k: None)
+
+    flights_data = [{
+        "origin": "KHI", "destination": "LHE",
+        "dep_time_planned": dt.datetime.combine(_ROTATION_DATE, dt.time(19, 0)),
+        "arr_time_planned": dt.datetime.combine(_ROTATION_DATE, dt.time(20, 45)),
+        "domestic": True,
+    }]
+
+    result, flight_ids = assignment_service.assign_pair_to_new_flights(
+        "CPT-01", "FO-01", flights_data, app_user="occ1")
+
+    # Expired documents, so nothing may be written.
+    assert result.status in ("REJECTED", "NEEDS_REVIEW"), result.status
+    assert not flight_ids
