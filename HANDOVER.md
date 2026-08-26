@@ -324,6 +324,64 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`generator-round-trips` merged into `main` (2026-08-26).** Roster
+  generation was unusable in production: **4,822 database round-trips to
+  fill 10 seats**, 7+ minutes against a 23-second estimate. Four stacked
+  multipliers — per-candidate age queries, the second-pilot list rebuilt
+  inside the commander loop, crew/flight rows re-fetched per trial, and
+  duty history reloaded per trial. **651/651 verified against real
+  Postgres 16**, reachability clean, **133 round-trips for 5 rotations
+  measured independently** (from 4,822), and the guards now run with no
+  database at all in 0.54s.
+
+  **No reboot needed.** Verified structurally rather than from memory:
+  the branch adds exactly one file, `tests/test_generation_round_trips.py`,
+  which is a test; every added `import`/`from` line in the whole diff is
+  inside that test file; no page changed. No new service module, no new
+  import edge, so the stale-`sys.modules` rule does not apply. No
+  migration either — this deploy has no ordering requirement of any kind.
+
+  **⚠ THIS BRANCH CAUSED A PRODUCTION INCIDENT — see the dated entry.**
+  Its own tests wrote **2,954 rows into the live `audit_log`**, a table
+  that held 165 before that day. Nothing was deleted; the rows remain,
+  identifiable by `PAIR_ASSIGNMENT_REJECTED` + 2026-08-26 + `app_user=occ1`.
+  **Whether a rejected speculative trial should leave a permanent audit
+  row at all is an OPERATOR decision** about what the regulatory record
+  should contain — it is deliberately NOT being made by whoever next
+  reads this. Left as-is under `test_audit_writes_do_not_grow_quadratically`,
+  `xfail(strict=True)`. Being put to Arif (2026-08-26).
+
+  **`audit_write` is still exactly `C x S`.** Reads are linear and
+  fixed; the quadratic term moved into the audit trail rather than
+  disappearing. Anyone quoting a round-trip figure for this generator
+  should say which of the two they mean.
+
+- **⚠ A PRACTICE THAT WAS RECORDED HERE AND WAS WRONG — `env -u` does
+  NOT isolate a test from the database (2026-08-26).** The advice given
+  on 2026-08-22, to run new DB-free tests with `DATABASE_URL` unset, is
+  worthless as an isolation check: **`db/db.py` calls `load_dotenv()`,
+  which reads `.env` off disk regardless of the process environment.**
+  A test verified that way still wrote thousands of rows to production.
+
+  Two non-obvious causes compound it, and both are easy to repeat:
+
+  - **`from X import y` binds a COPY.** Patching
+    `services.audit_service.log_audit` does nothing to the name
+    `assignment_service` bound at import time. Same for
+    `from db.db import get_engine`. The escaping call was found by
+    tracing it, not by adding patches until the failure went quiet —
+    which is how you get a test that passes for the wrong reason.
+  - **Patch by ENUMERATION, not by name.** Walk every service module and
+    replace the attribute wherever `hasattr` finds it, so a service
+    added later is covered automatically instead of being silently
+    missed.
+
+  **The check that actually works:** make every `get_engine` binding
+  raise on any attribute access, then confirm the tests still pass. If
+  the runtime drops sharply when you do, the earlier run was making real
+  network calls — here it went from 75s to 2.0s, and that 73-second gap
+  was live traffic to production Supabase.
+
 - **`flight-status-transitions` merged into `main` (2026-08-21).**
   `flights.status` could previously only ever become `CANCELLED`, so a
   flight that flew stayed `PLANNED` forever and `DISRUPTED` was
@@ -6973,3 +7031,261 @@ Merged into `main`, pushed; branch `flight-status-transitions`
 deleted, remote and local. See the "Merge status as of this snapshot"
 paragraph near the top of this file for the two deployment requirements,
 which are independent of each other.
+
+## 2026-08-22: roster generation was unusable in production — 4,822 round-trips to fill 10 seats
+
+The system's core function took **7+ minutes** on the deployed app for 7
+rotations, against a 23-second estimate. Not stuck, not slow queries,
+not the expired documents: **4,822 database round-trips to process 10
+seats**, roughly 480 per seat.
+
+Locally that is 7.2 seconds, because a round-trip to a local database
+costs microseconds. Against Supabase from Streamlit Cloud each carries
+50–300ms of network latency, which is where the minutes came from. **The
+only environment where it hurts is the deployed one.**
+
+### Why 647 passing tests did not catch it
+
+Nothing in the suite measured round-trip COUNT — and count is the only
+environment-independent measure of this defect. A timing assertion
+cannot see it, because locally there is nothing to see. Every test
+passed throughout, on every round, while the core function was unusable.
+
+### Where they came from
+
+Four multipliers, stacked:
+
+1. **`_age_of()` queried per candidate.** A database round-trip to read
+   a birthday, for every candidate, on every seat — data already loaded
+   in `all_crew`.
+2. **The second-pilot candidate list was rebuilt inside the commander
+   loop.** Its CONTENTS never vary with the commander — only the
+   ordering and one exclusion — so this cost `C × S` age queries per
+   rotation to re-sort a list that never changed.
+3. **Every trial re-fetched crew rows and flights.** `_validate_new_duty()`
+   re-fetched crew rows `_validate_pair_internal()` already held, and
+   the same two flights were re-read for every candidate pair.
+4. **Duty history loaded per trial.** `start`/`end` derive from
+   `build_duty(legs)` and the legs are the rotation's own — identical
+   for every candidate — so the same query repeated `C × S` times.
+
+For Air Eagle's real pool (6 commanders, 10 second-pilot-eligible) that
+is ~672 round-trips per uncrewed rotation.
+
+### Result
+
+Measured with the counter below, at Air Eagle's real pool shape, 5
+rotations:
+
+| | round-trips | @50ms | @150ms | @300ms |
+|---|---|---|---|---|
+| before | 4,822 | 4.0 min | 12.1 min | 24.1 min |
+| after | **79** | 4.0 s | 11.8 s | **23.7 s** |
+
+**61× fewer round-trips**, and growth is now linear in pool size rather
+than quadratic: the duty-history query count is exactly `C + S`.
+
+Note the last cell. The ~23s estimate was never wrong — it was measured
+locally and is correct there. The round-trip count was the defect, and
+at worst-case latency the fixed generator now lands almost exactly on
+the original prediction.
+
+### The fix that was NOT needed
+
+A qualification pre-filter — skipping candidates with expired documents
+before spending ~10 round-trips discovering it — was planned and is
+**deliberately not implemented**. The structural fixes alone solved the
+problem, so the pre-filter would now be a correctness risk (moving a
+qualification check outside the gate) bought for no remaining need.
+
+Its benefit was also always **data-dependent**: with 7 of Air Eagle's 10
+pilots currently carrying expired documents it would collapse C=6,S=10
+to C'=2,S'=3, but once documents are renewed it saves nothing. Anyone
+reading a "15 seconds" figure later needs to know it would have been
+measured against a degraded crew state. The structural fixes help
+unconditionally; that is why they came first, and why they were enough.
+
+### `Prefetch` — passing rows in without weakening the gate
+
+`assignment_service.Prefetch` carries crew rows, flight rows and cached
+duty-history rows. Passing rows in DOES weaken the "always current"
+guarantee a direct fetch gave, so four things bound it:
+
+* **Opt-in.** Every lookup falls back to a live fetch, and every
+  existing caller passes nothing — Control Room, Roster and Flt Schedule
+  are byte-for-byte unchanged. Only the generator supplies one.
+* **Lifetime is one `generate_for_window()` call.** Not module-level,
+  not memoised across runs.
+* **A shared snapshot is required for correctness, not merely tolerated
+  for speed.** Any pre-filter and the gate must judge a candidate on the
+  same data, and they would not if one read a snapshot while the other
+  re-fetched.
+* **PROPOSED is not authoritative.** `publish_window()` re-validates
+  every pair against FRESH data before anything becomes PLANNED, so a
+  crew edit landing mid-run cannot reach a published roster.
+
+`validate_pair()` deliberately does NOT take a prefetch — it is the
+fresh-data path.
+
+**The duty-history cache stores the DATAFRAME, not the built records.**
+That distinction is load-bearing: `Duty` is a plain mutable dataclass,
+so handing the same objects to every trial would share mutable state
+through the legality engine. Rows are inert; records and their `Duty`
+objects are rebuilt fresh on every call, exactly as before.
+
+### The guard: `tests/test_generation_round_trips.py`
+
+Counts round-trips with NO DATABASE. The leaf functions that each issue
+one query are replaced with counting fakes and the real orchestration
+runs on top. The fixture makes every candidate fail the qualification
+gate, so the search performs the full `C × S` scan — the case that
+matters — and never reaches a write, which is what lets it run in the
+environments where this defect was invisible.
+
+Three assertions, and the second is the important one:
+
+* ages cost no query (`get_all_crew` is the one crew read per run)
+* **growth: 3×3 vs 6×6 pools, asserting ≤2×.** Measured 15 → 21 (1.4×)
+  with the fix and 129 → 537 (4.16×) without. A single-point budget
+  catches "it got worse"; only a growth assertion catches a reintroduced
+  `C × S` loop, because a small fixture keeps the absolute number low.
+  **That is the defect class that actually broke.**
+* an absolute ceiling against a pinned pool
+
+Mutation-tested: disabling the duty-row cache fails both the growth test
+and the budget test.
+
+**`_read_duty_rows()` is a one-line seam** so the test can count queries
+while the REAL caching still runs. Patching `_fetch_duty_rows` instead
+would have replaced the cache with the test's own copy of it — the exact
+drift this codebase has repeatedly paid for.
+
+### Still deferred: `fail_fast`
+
+Generation discards all alerts and reads only `.status`, so constructing
+thousands of `RuleAlert` objects per candidate is waste — but it is CPU
+waste, not round-trips, and was deliberately kept out of this change so
+the measurement stayed clean. It is now the dominant LOCAL cost (the
+6×6 fixture takes ~47s of pure CPU) and is irrelevant to production
+latency. Worth doing on its own terms, measured on its own terms.
+
+### 2026-08-22 (continued): two defects in the fix itself
+
+**1. A NameError shipped in the ad-hoc pair path.**
+`assign_pair_to_new_flights()` referenced `prefetch`, which it never
+received — a global edit matched two functions with identical
+crew-fetch shapes. Control Room could not assign crew at all and showed
+a raw exception.
+
+Exactly the risk flagged when fix 4 was planned: replacing a fetch with
+a parameter means the function stops being self-sufficient, and one
+caller was not threaded. Reverted to direct fetches rather than adding a
+parameter — that path CREATES flights, so it has nothing to prefetch and
+no caller that benefits.
+
+The audit that should have run at the time now has: an AST check that
+every function using `prefetch` has it in scope, and a bind-check of all
+**71 call sites** of every signature changed in this branch. Both clean.
+
+**2. The round-trip guards had never executed anywhere.** They reached
+`get_engine()`, which raises when `DATABASE_URL` is unset — so they
+failed on the verification machine and only ran locally because this
+machine's `.env` happens to point somewhere. They never actually
+queried (engines are lazy and every query function is patched), but
+depending on the variable at all defeated the point.
+
+**Deliberately NOT switched to `TEST_DATABASE_URL` and the standard
+page fixture.** That would make them SKIP wherever Postgres is absent —
+precisely the environment this defect was invisible in, and the whole
+reason they exist. They now patch `get_engine` with a sentinel that
+RAISES if anything tries to use it, so an unpatched query path fails
+loudly instead of quietly opening a connection. Verified passing with
+both `DATABASE_URL` and `TEST_DATABASE_URL` unset.
+
+**Third occurrence of the same shape** (after the auth harness and the
+Streamlit version drift): a test written to catch what local testing
+cannot see, itself unable to run. The lesson that keeps recurring is
+narrower than "test the tests" — it is that a guard which needs the
+environment it is guarding against is not a guard. Run new DB-free
+tests with the environment variables explicitly unset before believing
+them.
+
+**Also added:** a DB-free smoke test for the ad-hoc pair path, which had
+none — every test of it was DB-gated, which is why an 11-test failure
+appeared only on Postgres. Expired-document crew means validation
+rejects before any write, so the whole read path runs without a
+database. Mutation-tested: it catches the shipped NameError in 1.4
+seconds.
+
+### 2026-08-26: INCIDENT — test runs wrote 2,954 rows into the production audit trail
+
+**What happened.** The round-trip guards patched `audit_service.log_audit`
+but not `assignment_service.log_audit`. Those are DIFFERENT OBJECTS:
+`from services.audit_service import log_audit` binds a COPY into the
+importing module, so patching the source module does nothing to the
+copy. The same is true of `from db.db import get_engine`.
+
+Generation writes a `PAIR_ASSIGNMENT_REJECTED` audit row for every
+rejected candidate pair. With the real `log_audit` still live, each of
+those became a genuine INSERT. On the verification machine, which has no
+`.env`, that surfaced as `RuntimeError: DATABASE_URL not set`. On the
+development machine, whose `.env` points at the production Supabase
+pooler, it silently wrote.
+
+**Damage:** 2,954 `PAIR_ASSIGNMENT_REJECTED` rows, `app_user=occ1`,
+`affected_crew` CPT-01..CPT-06, timestamps 2026-08-26 05:08–11:11. The
+table held 165 rows before that day, so roughly 94% of `audit_log` is
+now test noise. **Nothing was deleted** — audit is append-only by design
+in this project, and removing rows is the operator's call, not a cleanup
+to perform quietly. The rows are exactly identifiable by that
+action_type + date + app_user combination.
+
+**Why `env -u` did not catch it.** `db/db.py` calls `load_dotenv()`,
+which reads `.env` off disk. Clearing the process environment does not
+stop that. The practice recorded on 2026-08-22 — "run new DB-free tests
+with the variables unset" — was therefore insufficient, and the stronger
+form is: **prove isolation by making every `get_engine` binding raise,
+then confirm the tests still pass.** That is the check that finally
+found this, and it is what the guards are now verified against.
+
+**The fix.** `isolate_from_database()` in the test module enumerates
+every service module and replaces `get_engine` and `log_audit` wherever
+the attribute exists, so a new service joins the net automatically
+rather than being missed by name. The engine sentinel raises on ANY
+attribute access, so an unpatched path fails loudly instead of opening a
+connection. Verified with every binding forced to raise: 4 passed in
+2.0s, down from 75s — the difference was real network round-trips.
+
+### The measurement this corrects, and the quadratic that remains
+
+Because those audit writes were escaping uncounted, the figures reported
+on 2026-08-22 were **reads only**. Corrected, with audit writes counted:
+
+| pool | reads | audit writes | total |
+|---|---|---|---|
+| C=3, S=6 | 15 | 15 | 30 |
+| C=6, S=12 | 21 | 66 | 87 |
+| C=6, S=10 (Air Eagle) | 19 | 54 | 73 |
+
+**Reads are linear and fixed.** `audit_write` is exactly C x S — one
+INSERT per rejected candidate pair — so **the quadratic term is not
+fully gone, it moved**. For Air Eagle that is ~73 round-trips per
+uncrewed rotation rather than the ~16 previously claimed; at 150ms and
+5 rotations, roughly 55 seconds rather than ~12. Still far better than
+12 minutes, and worth stating accurately rather than leaving the
+optimistic number standing.
+
+**OPEN QUESTION FOR THE OPERATOR — not a refactor to make
+unilaterally.** Should a speculative candidate trial that was rejected
+leave a permanent audit row at all? `uncovered_seats.reason` already
+records why a seat could not be filled. One generation run currently
+adds hundreds of rows to a table that held 165 in total — which is what
+the incident above demonstrated at scale. Options: leave as-is
+(regulatory completeness), batch the writes per rotation, or stop
+auditing generator-internal rejections while keeping audit on real
+assignment decisions. Touching an audit trail is the operator's call.
+
+Tracked as `test_audit_writes_do_not_grow_quadratically`, marked
+`xfail(strict=True)` — strict, so it FAILS if someone fixes the cause
+without removing the marker, and cannot rot into a permanently ignored
+test.
