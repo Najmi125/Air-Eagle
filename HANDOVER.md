@@ -324,6 +324,64 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`generator-round-trips` merged into `main` (2026-08-26).** Roster
+  generation was unusable in production: **4,822 database round-trips to
+  fill 10 seats**, 7+ minutes against a 23-second estimate. Four stacked
+  multipliers — per-candidate age queries, the second-pilot list rebuilt
+  inside the commander loop, crew/flight rows re-fetched per trial, and
+  duty history reloaded per trial. **651/651 verified against real
+  Postgres 16**, reachability clean, **133 round-trips for 5 rotations
+  measured independently** (from 4,822), and the guards now run with no
+  database at all in 0.54s.
+
+  **No reboot needed.** Verified structurally rather than from memory:
+  the branch adds exactly one file, `tests/test_generation_round_trips.py`,
+  which is a test; every added `import`/`from` line in the whole diff is
+  inside that test file; no page changed. No new service module, no new
+  import edge, so the stale-`sys.modules` rule does not apply. No
+  migration either — this deploy has no ordering requirement of any kind.
+
+  **⚠ THIS BRANCH CAUSED A PRODUCTION INCIDENT — see the dated entry.**
+  Its own tests wrote **2,954 rows into the live `audit_log`**, a table
+  that held 165 before that day. Nothing was deleted; the rows remain,
+  identifiable by `PAIR_ASSIGNMENT_REJECTED` + 2026-08-26 + `app_user=occ1`.
+  **Whether a rejected speculative trial should leave a permanent audit
+  row at all is an OPERATOR decision** about what the regulatory record
+  should contain — it is deliberately NOT being made by whoever next
+  reads this. Left as-is under `test_audit_writes_do_not_grow_quadratically`,
+  `xfail(strict=True)`. Being put to Arif (2026-08-26).
+
+  **`audit_write` is still exactly `C x S`.** Reads are linear and
+  fixed; the quadratic term moved into the audit trail rather than
+  disappearing. Anyone quoting a round-trip figure for this generator
+  should say which of the two they mean.
+
+- **⚠ A PRACTICE THAT WAS RECORDED HERE AND WAS WRONG — `env -u` does
+  NOT isolate a test from the database (2026-08-26).** The advice given
+  on 2026-08-22, to run new DB-free tests with `DATABASE_URL` unset, is
+  worthless as an isolation check: **`db/db.py` calls `load_dotenv()`,
+  which reads `.env` off disk regardless of the process environment.**
+  A test verified that way still wrote thousands of rows to production.
+
+  Two non-obvious causes compound it, and both are easy to repeat:
+
+  - **`from X import y` binds a COPY.** Patching
+    `services.audit_service.log_audit` does nothing to the name
+    `assignment_service` bound at import time. Same for
+    `from db.db import get_engine`. The escaping call was found by
+    tracing it, not by adding patches until the failure went quiet —
+    which is how you get a test that passes for the wrong reason.
+  - **Patch by ENUMERATION, not by name.** Walk every service module and
+    replace the attribute wherever `hasattr` finds it, so a service
+    added later is covered automatically instead of being silently
+    missed.
+
+  **The check that actually works:** make every `get_engine` binding
+  raise on any attribute access, then confirm the tests still pass. If
+  the runtime drops sharply when you do, the earlier run was making real
+  network calls — here it went from 75s to 2.0s, and that 73-second gap
+  was live traffic to production Supabase.
+
 - **`flight-status-transitions` merged into `main` (2026-08-21).**
   `flights.status` could previously only ever become `CANCELLED`, so a
   flight that flew stayed `PLANNED` forever and `DISRUPTED` was
