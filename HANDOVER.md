@@ -7158,3 +7158,76 @@ appeared only on Postgres. Expired-document crew means validation
 rejects before any write, so the whole read path runs without a
 database. Mutation-tested: it catches the shipped NameError in 1.4
 seconds.
+
+### 2026-08-26: INCIDENT — test runs wrote 2,954 rows into the production audit trail
+
+**What happened.** The round-trip guards patched `audit_service.log_audit`
+but not `assignment_service.log_audit`. Those are DIFFERENT OBJECTS:
+`from services.audit_service import log_audit` binds a COPY into the
+importing module, so patching the source module does nothing to the
+copy. The same is true of `from db.db import get_engine`.
+
+Generation writes a `PAIR_ASSIGNMENT_REJECTED` audit row for every
+rejected candidate pair. With the real `log_audit` still live, each of
+those became a genuine INSERT. On the verification machine, which has no
+`.env`, that surfaced as `RuntimeError: DATABASE_URL not set`. On the
+development machine, whose `.env` points at the production Supabase
+pooler, it silently wrote.
+
+**Damage:** 2,954 `PAIR_ASSIGNMENT_REJECTED` rows, `app_user=occ1`,
+`affected_crew` CPT-01..CPT-06, timestamps 2026-08-26 05:08–11:11. The
+table held 165 rows before that day, so roughly 94% of `audit_log` is
+now test noise. **Nothing was deleted** — audit is append-only by design
+in this project, and removing rows is the operator's call, not a cleanup
+to perform quietly. The rows are exactly identifiable by that
+action_type + date + app_user combination.
+
+**Why `env -u` did not catch it.** `db/db.py` calls `load_dotenv()`,
+which reads `.env` off disk. Clearing the process environment does not
+stop that. The practice recorded on 2026-08-22 — "run new DB-free tests
+with the variables unset" — was therefore insufficient, and the stronger
+form is: **prove isolation by making every `get_engine` binding raise,
+then confirm the tests still pass.** That is the check that finally
+found this, and it is what the guards are now verified against.
+
+**The fix.** `isolate_from_database()` in the test module enumerates
+every service module and replaces `get_engine` and `log_audit` wherever
+the attribute exists, so a new service joins the net automatically
+rather than being missed by name. The engine sentinel raises on ANY
+attribute access, so an unpatched path fails loudly instead of opening a
+connection. Verified with every binding forced to raise: 4 passed in
+2.0s, down from 75s — the difference was real network round-trips.
+
+### The measurement this corrects, and the quadratic that remains
+
+Because those audit writes were escaping uncounted, the figures reported
+on 2026-08-22 were **reads only**. Corrected, with audit writes counted:
+
+| pool | reads | audit writes | total |
+|---|---|---|---|
+| C=3, S=6 | 15 | 15 | 30 |
+| C=6, S=12 | 21 | 66 | 87 |
+| C=6, S=10 (Air Eagle) | 19 | 54 | 73 |
+
+**Reads are linear and fixed.** `audit_write` is exactly C x S — one
+INSERT per rejected candidate pair — so **the quadratic term is not
+fully gone, it moved**. For Air Eagle that is ~73 round-trips per
+uncrewed rotation rather than the ~16 previously claimed; at 150ms and
+5 rotations, roughly 55 seconds rather than ~12. Still far better than
+12 minutes, and worth stating accurately rather than leaving the
+optimistic number standing.
+
+**OPEN QUESTION FOR THE OPERATOR — not a refactor to make
+unilaterally.** Should a speculative candidate trial that was rejected
+leave a permanent audit row at all? `uncovered_seats.reason` already
+records why a seat could not be filled. One generation run currently
+adds hundreds of rows to a table that held 165 in total — which is what
+the incident above demonstrated at scale. Options: leave as-is
+(regulatory completeness), batch the writes per rotation, or stop
+auditing generator-internal rejections while keeping audit on real
+assignment decisions. Touching an audit trail is the operator's call.
+
+Tracked as `test_audit_writes_do_not_grow_quadratically`, marked
+`xfail(strict=True)` — strict, so it FAILS if someone fixes the cause
+without removing the marker, and cannot rot into a permanently ignored
+test.
