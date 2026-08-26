@@ -308,17 +308,83 @@ class PairAssignmentResult:
 # records) from the roster+flights tables for one crew member.
 # ------------------------------------------------------------------
 
-def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
-                                 start=None, end=None) -> List[dict]:
-    """
-    Returns a list of dicts, one per duty:
-        {"duty": Duty, "flight_ids": [...], "role_assigned": str,
-         "roster_ids": [...]}
+class Prefetch:
+    """Rows a caller ALREADY holds, so this module does not re-fetch
+    them per call.
 
-    Only ACTIVE (non-cancelled) roster rows are included. Uses actual
-    departure/arrival times where recorded, falling back to planned —
-    "ground truth wins" once a flight has actually operated.
+    OPT-IN AND NON-AUTHORITATIVE. Every lookup falls back to a live
+    fetch when the row is absent, and every existing caller passes
+    nothing — so the default path is byte-for-byte today's behaviour.
+    Only the roster generator supplies one.
+
+    On staleness, since passing rows in DOES weaken the "always current"
+    guarantee the direct fetch gave:
+
+      * Lifetime is one generate_for_window() call. Not module-level,
+        not memoised across runs.
+      * Within a run a SHARED snapshot is required for correctness, not
+        merely tolerated: the qualification pre-filter and this gate
+        must judge a candidate on the same data, and they would not if
+        the filter read a snapshot while the gate re-fetched per trial.
+      * Generation writes PROPOSED rows only. publish_window()
+        re-validates every pair against FRESH data before anything
+        becomes PLANNED, so a crew edit landing mid-run cannot reach a
+        published roster.
     """
+
+    def __init__(self, crew_by_id=None, flights_by_id=None):
+        self.crew_by_id = crew_by_id or {}
+        self.flights_by_id = flights_by_id or {}
+        # (crew_id, start, end) -> DataFrame of duty rows. Inert
+        # data only; Duty objects are rebuilt per call.
+        self.duty_rows = {}
+
+
+def _get_crew_row(crew_id: str, prefetch=None):
+    """The crew row, from the caller's snapshot if it has it."""
+    if prefetch is not None and crew_id in prefetch.crew_by_id:
+        return prefetch.crew_by_id[crew_id]
+    return crew_service.get_crew(crew_id)
+
+
+def _get_flight_row(flight_id: int, prefetch=None):
+    if prefetch is not None and flight_id in prefetch.flights_by_id:
+        return prefetch.flights_by_id[flight_id]
+    return flight_service.get_flight(flight_id)
+
+
+def _read_duty_rows(query: str, engine, params: dict) -> pd.DataFrame:
+    """The single statement that actually goes to the database for duty
+    history. A one-line seam, so a test can count round-trips while the
+    REAL caching in _fetch_duty_rows() still runs — patching that
+    function instead would replace the cache with the test's own copy of
+    it, which is the drift this codebase has repeatedly paid for.
+    """
+    return pd.read_sql(text(query), engine, params=params)
+
+
+def _fetch_duty_rows(engine, crew_id: str, start=None, end=None, prefetch=None) -> pd.DataFrame:
+    """The QUERY behind _load_duty_records_for_crew(), split out so its
+    result can be cached without caching constructed objects.
+
+    That distinction is deliberate and load-bearing. Within one
+    rotation every candidate trial asks for the SAME crew member over
+    the SAME window — start/end derive from build_duty(legs), and the
+    legs are the rotation's own, identical for every candidate — so the
+    query repeats C x S times per rotation and was the last quadratic
+    term in generation (2026-08-22).
+
+    Caching the DATAFRAME rather than the record list is what makes it
+    safe: `Duty` is a plain mutable dataclass, so handing the same
+    objects to every trial would share mutable state through the
+    legality engine. Rows are inert data; the records and their Duty
+    objects are rebuilt fresh on every call, exactly as before.
+    """
+    if prefetch is not None:
+        key = (crew_id, start, end)
+        if key in prefetch.duty_rows:
+            return prefetch.duty_rows[key]
+
     query = """
         SELECT r.roster_id, r.duty_id, r.report_time, r.debrief_time,
                r.role_assigned, r.operating_position, f.flight_id,
@@ -338,7 +404,27 @@ def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
         params["end"] = end
     query += " ORDER BY r.report_time, f.dep_time_planned"
 
-    df = pd.read_sql(text(query), engine, params=params)
+    df = _read_duty_rows(query, engine, params)
+    if prefetch is not None:
+        prefetch.duty_rows[(crew_id, start, end)] = df
+    return df
+
+
+def _load_duty_records_for_crew(engine, crew_id: str, home_base: str,
+                                 start=None, end=None, prefetch=None) -> List[dict]:
+    """
+    Returns a list of dicts, one per duty:
+        {"duty": Duty, "flight_ids": [...], "role_assigned": str,
+         "roster_ids": [...]}
+
+    Only ACTIVE (non-cancelled) roster rows are included. Uses actual
+    departure/arrival times where recorded, falling back to planned —
+    "ground truth wins" once a flight has actually operated.
+
+    The rows may come from a caller's cache (see _fetch_duty_rows), but
+    the Duty objects built from them are always fresh.
+    """
+    df = _fetch_duty_rows(engine, crew_id, start=start, end=end, prefetch=prefetch)
     if df.empty:
         return []
 
@@ -591,7 +677,8 @@ def _check_crew_pairing_age(engine, operating_position: Optional[str], crew_row:
 def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bool, role_assigned: str,
                         meal_provided: bool, snack_provided: bool,
                         flight_ids: Optional[List[int]] = None,
-                        operating_position: Optional[str] = None):
+                        operating_position: Optional[str] = None,
+                        prefetch=None):
     """
     Shared validation core for assign_crew_to_duty() (LM/ENGR, or a
     pilot filling the remaining seat of an already-real pair),
@@ -648,7 +735,7 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
     """
     duty_result = build_duty(legs, domestic=domestic)
 
-    crew_row = crew_service.get_crew(crew_id)
+    crew_row = _get_crew_row(crew_id, prefetch)
     if crew_row is None:
         raise ValueError(f"No crew member with crew_id={crew_id}")
 
@@ -689,7 +776,8 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
     else:
         lookback_start = duty_result.report_time - timedelta(days=LOOKBACK_DAYS)
         existing_records = _load_duty_records_for_crew(
-            engine, crew_id, crew_row["base"], start=lookback_start, end=duty_result.debrief_time)
+            engine, crew_id, crew_row["base"], start=lookback_start,
+            end=duty_result.debrief_time, prefetch=prefetch)
         # Exclude any existing record covering the EXACT SAME flight_ids
         # as the duty being validated here -- that's not real history,
         # it's this same duty already written (publish_window()
@@ -745,7 +833,8 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
 def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                          app_user: Optional[str] = None,
                          roster_status: str = "PLANNED",
-                         operating_position: Optional[str] = None) -> AssignmentResult:
+                         operating_position: Optional[str] = None,
+                         prefetch=None) -> AssignmentResult:
     """
     Assigns crew_id to the duty formed by flight_ids (in chronological
     order — the caller's decision which flights form one duty).
@@ -803,7 +892,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                 f"not assign_crew_to_duty()."
             )
 
-    flights = [flight_service.get_flight(fid) for fid in flight_ids]
+    flights = [_get_flight_row(fid, prefetch) for fid in flight_ids]
     missing = [fid for fid, f in zip(flight_ids, flights) if f is None]
     if missing:
         raise ValueError(f"Flight_id(s) not found: {missing}")
@@ -836,7 +925,7 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
 
     validation_result, new_duty, crew_member, crew_row, duty_result, pairing_info = _validate_new_duty(
         engine, crew_id, legs, domestic, role_assigned, meal_provided, snack_provided,
-        flight_ids=flight_ids, operating_position=operating_position)
+        flight_ids=flight_ids, operating_position=operating_position, prefetch=prefetch)
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
@@ -1191,7 +1280,7 @@ _STATUS_PRECEDENCE = {
 
 
 def _validate_pair_internal(engine, commander_crew_id: str, second_pilot_crew_id: str,
-                             flight_ids: List[int]):
+                             flight_ids: List[int], prefetch=None):
     """
     Shared core for validate_pair() (read-only) and
     assign_pair_to_duty()/assign_pair_to_new_flights() (write path) —
@@ -1209,10 +1298,10 @@ def _validate_pair_internal(engine, commander_crew_id: str, second_pilot_crew_id
     if commander_crew_id == second_pilot_crew_id:
         raise ValueError("Commander and Second Pilot must be different crew members")
 
-    commander_row = crew_service.get_crew(commander_crew_id)
+    commander_row = _get_crew_row(commander_crew_id, prefetch)
     if commander_row is None:
         raise ValueError(f"No crew member with crew_id={commander_crew_id}")
-    second_pilot_row = crew_service.get_crew(second_pilot_crew_id)
+    second_pilot_row = _get_crew_row(second_pilot_crew_id, prefetch)
     if second_pilot_row is None:
         raise ValueError(f"No crew member with crew_id={second_pilot_crew_id}")
 
@@ -1227,7 +1316,7 @@ def _validate_pair_internal(engine, commander_crew_id: str, second_pilot_crew_id
             f"for Second Pilot (must be CPT or FO)"
         )
 
-    flights = [flight_service.get_flight(fid) for fid in flight_ids]
+    flights = [_get_flight_row(fid, prefetch) for fid in flight_ids]
     missing = [fid for fid, f in zip(flight_ids, flights) if f is None]
     if missing:
         raise ValueError(f"Flight_id(s) not found: {missing}")
@@ -1254,10 +1343,10 @@ def _validate_pair_internal(engine, commander_crew_id: str, second_pilot_crew_id
     # to the two real candidates instead of a database lookup.
     commander_result, commander_duty, _, _, commander_duty_result, _ = _validate_new_duty(
         engine, commander_crew_id, legs, domestic, "CPT", meal_provided, snack_provided,
-        flight_ids=flight_ids, operating_position=None)
+        flight_ids=flight_ids, operating_position=None, prefetch=prefetch)
     second_pilot_result, second_pilot_duty, _, _, second_pilot_duty_result, _ = _validate_new_duty(
         engine, second_pilot_crew_id, legs, domestic, second_pilot_row["role"], meal_provided, snack_provided,
-        flight_ids=flight_ids, operating_position=None)
+        flight_ids=flight_ids, operating_position=None, prefetch=prefetch)
 
     reference_date = min(l.dep_time for l in legs).date()
     pair_alerts: List[RuleAlert] = []
@@ -1398,7 +1487,8 @@ def _write_pair_rows(conn, crew_id, role_assigned, operating_position, duty, dut
 
 def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, flight_ids: List[int],
                          app_user: Optional[str] = None,
-                         roster_status: str = "PLANNED") -> PairAssignmentResult:
+                         roster_status: str = "PLANNED",
+                         prefetch=None) -> PairAssignmentResult:
     """
     Assigns BOTH seats of a flight-deck pair to flight_ids (flights
     that already exist — Roster page / roster generator), atomically:
@@ -1412,7 +1502,8 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
     function's outcome. Phase 7's roster generator passes 'PROPOSED'.
     """
     engine = get_engine()
-    core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids)
+    core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids,
+                                  prefetch=prefetch)
     overall_status = core["overall_status"]
 
     commander_summary = summarize_alerts(core["commander_result"], target_duty_id=core["commander_duty"].duty_id)
@@ -1508,10 +1599,10 @@ def assign_pair_to_new_flights(commander_crew_id: str, second_pilot_crew_id: str
     """
     engine = get_engine()
 
-    commander_row = crew_service.get_crew(commander_crew_id)
+    commander_row = _get_crew_row(commander_crew_id, prefetch)
     if commander_row is None:
         raise ValueError(f"No crew member with crew_id={commander_crew_id}")
-    second_pilot_row = crew_service.get_crew(second_pilot_crew_id)
+    second_pilot_row = _get_crew_row(second_pilot_crew_id, prefetch)
     if second_pilot_row is None:
         raise ValueError(f"No crew member with crew_id={second_pilot_crew_id}")
     if commander_crew_id == second_pilot_crew_id:

@@ -6973,3 +6973,140 @@ Merged into `main`, pushed; branch `flight-status-transitions`
 deleted, remote and local. See the "Merge status as of this snapshot"
 paragraph near the top of this file for the two deployment requirements,
 which are independent of each other.
+
+## 2026-08-22: roster generation was unusable in production — 4,822 round-trips to fill 10 seats
+
+The system's core function took **7+ minutes** on the deployed app for 7
+rotations, against a 23-second estimate. Not stuck, not slow queries,
+not the expired documents: **4,822 database round-trips to process 10
+seats**, roughly 480 per seat.
+
+Locally that is 7.2 seconds, because a round-trip to a local database
+costs microseconds. Against Supabase from Streamlit Cloud each carries
+50–300ms of network latency, which is where the minutes came from. **The
+only environment where it hurts is the deployed one.**
+
+### Why 647 passing tests did not catch it
+
+Nothing in the suite measured round-trip COUNT — and count is the only
+environment-independent measure of this defect. A timing assertion
+cannot see it, because locally there is nothing to see. Every test
+passed throughout, on every round, while the core function was unusable.
+
+### Where they came from
+
+Four multipliers, stacked:
+
+1. **`_age_of()` queried per candidate.** A database round-trip to read
+   a birthday, for every candidate, on every seat — data already loaded
+   in `all_crew`.
+2. **The second-pilot candidate list was rebuilt inside the commander
+   loop.** Its CONTENTS never vary with the commander — only the
+   ordering and one exclusion — so this cost `C × S` age queries per
+   rotation to re-sort a list that never changed.
+3. **Every trial re-fetched crew rows and flights.** `_validate_new_duty()`
+   re-fetched crew rows `_validate_pair_internal()` already held, and
+   the same two flights were re-read for every candidate pair.
+4. **Duty history loaded per trial.** `start`/`end` derive from
+   `build_duty(legs)` and the legs are the rotation's own — identical
+   for every candidate — so the same query repeated `C × S` times.
+
+For Air Eagle's real pool (6 commanders, 10 second-pilot-eligible) that
+is ~672 round-trips per uncrewed rotation.
+
+### Result
+
+Measured with the counter below, at Air Eagle's real pool shape, 5
+rotations:
+
+| | round-trips | @50ms | @150ms | @300ms |
+|---|---|---|---|---|
+| before | 4,822 | 4.0 min | 12.1 min | 24.1 min |
+| after | **79** | 4.0 s | 11.8 s | **23.7 s** |
+
+**61× fewer round-trips**, and growth is now linear in pool size rather
+than quadratic: the duty-history query count is exactly `C + S`.
+
+Note the last cell. The ~23s estimate was never wrong — it was measured
+locally and is correct there. The round-trip count was the defect, and
+at worst-case latency the fixed generator now lands almost exactly on
+the original prediction.
+
+### The fix that was NOT needed
+
+A qualification pre-filter — skipping candidates with expired documents
+before spending ~10 round-trips discovering it — was planned and is
+**deliberately not implemented**. The structural fixes alone solved the
+problem, so the pre-filter would now be a correctness risk (moving a
+qualification check outside the gate) bought for no remaining need.
+
+Its benefit was also always **data-dependent**: with 7 of Air Eagle's 10
+pilots currently carrying expired documents it would collapse C=6,S=10
+to C'=2,S'=3, but once documents are renewed it saves nothing. Anyone
+reading a "15 seconds" figure later needs to know it would have been
+measured against a degraded crew state. The structural fixes help
+unconditionally; that is why they came first, and why they were enough.
+
+### `Prefetch` — passing rows in without weakening the gate
+
+`assignment_service.Prefetch` carries crew rows, flight rows and cached
+duty-history rows. Passing rows in DOES weaken the "always current"
+guarantee a direct fetch gave, so four things bound it:
+
+* **Opt-in.** Every lookup falls back to a live fetch, and every
+  existing caller passes nothing — Control Room, Roster and Flt Schedule
+  are byte-for-byte unchanged. Only the generator supplies one.
+* **Lifetime is one `generate_for_window()` call.** Not module-level,
+  not memoised across runs.
+* **A shared snapshot is required for correctness, not merely tolerated
+  for speed.** Any pre-filter and the gate must judge a candidate on the
+  same data, and they would not if one read a snapshot while the other
+  re-fetched.
+* **PROPOSED is not authoritative.** `publish_window()` re-validates
+  every pair against FRESH data before anything becomes PLANNED, so a
+  crew edit landing mid-run cannot reach a published roster.
+
+`validate_pair()` deliberately does NOT take a prefetch — it is the
+fresh-data path.
+
+**The duty-history cache stores the DATAFRAME, not the built records.**
+That distinction is load-bearing: `Duty` is a plain mutable dataclass,
+so handing the same objects to every trial would share mutable state
+through the legality engine. Rows are inert; records and their `Duty`
+objects are rebuilt fresh on every call, exactly as before.
+
+### The guard: `tests/test_generation_round_trips.py`
+
+Counts round-trips with NO DATABASE. The leaf functions that each issue
+one query are replaced with counting fakes and the real orchestration
+runs on top. The fixture makes every candidate fail the qualification
+gate, so the search performs the full `C × S` scan — the case that
+matters — and never reaches a write, which is what lets it run in the
+environments where this defect was invisible.
+
+Three assertions, and the second is the important one:
+
+* ages cost no query (`get_all_crew` is the one crew read per run)
+* **growth: 3×3 vs 6×6 pools, asserting ≤2×.** Measured 15 → 21 (1.4×)
+  with the fix and 129 → 537 (4.16×) without. A single-point budget
+  catches "it got worse"; only a growth assertion catches a reintroduced
+  `C × S` loop, because a small fixture keeps the absolute number low.
+  **That is the defect class that actually broke.**
+* an absolute ceiling against a pinned pool
+
+Mutation-tested: disabling the duty-row cache fails both the growth test
+and the budget test.
+
+**`_read_duty_rows()` is a one-line seam** so the test can count queries
+while the REAL caching still runs. Patching `_fetch_duty_rows` instead
+would have replaced the cache with the test's own copy of it — the exact
+drift this codebase has repeatedly paid for.
+
+### Still deferred: `fail_fast`
+
+Generation discards all alerts and reads only `.status`, so constructing
+thousands of `RuleAlert` objects per candidate is waste — but it is CPU
+waste, not round-trips, and was deliberately kept out of this change so
+the measurement stayed clean. It is now the dominant LOCAL cost (the
+6×6 fixture takes ~47s of pure CPU) and is irrelevant to production
+latency. Worth doing on its own terms, measured on its own terms.

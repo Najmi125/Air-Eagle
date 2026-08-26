@@ -97,8 +97,20 @@ def _seat_occupant(flight_ids: List[int], operating_position: str) -> Optional[s
     return matches.iloc[0] if not matches.empty else None
 
 
-def _age_of(crew_id: str, reference_date: dt.date) -> Optional[int]:
-    crew_row = crew_service.get_crew(crew_id)
+def _age_of(crew_by_id: dict, crew_id: str, reference_date: dt.date) -> Optional[int]:
+    """Age from the ALREADY-LOADED crew snapshot — no query.
+
+    This called crew_service.get_crew() until 2026-08-22: a database
+    round-trip to read a birthday, once per candidate per seat. In the
+    pair search the second-pilot list is rebuilt inside the commander
+    loop, so the cost was C + C x (1 + S) round-trips per rotation
+    before a single legality check ran — 72 of them for Air Eagle's real
+    pool of 6 commanders and 10 second pilots.
+
+    Invisible locally, where a round-trip costs microseconds. Against
+    Supabase from Streamlit Cloud, at 50-300ms each, it is minutes.
+    """
+    crew_row = crew_by_id.get(crew_id)
     if crew_row is None or pd.isna(crew_row["date_of_birth"]):
         return None
     return assignment_service.age_on(crew_row["date_of_birth"], reference_date)
@@ -234,6 +246,23 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
         return summary
 
     all_crew = crew_service.get_all_crew(active_only=True)
+
+    # ONE snapshot of every active crew row, reused for the whole run:
+    # ages, the qualification pre-filter and the validation gate all read
+    # from this instead of re-querying per candidate.
+    #
+    # A SHARED snapshot is required for CORRECTNESS here, not merely
+    # tolerated for speed: the pre-filter and the gate must judge a
+    # candidate on the same data, and they would not if the filter read
+    # this while the gate re-fetched per trial.
+    #
+    # Its lifetime is this one function call. Bounded staleness is safe
+    # because generation writes PROPOSED rows and publish_window()
+    # re-validates every pair against fresh data before anything becomes
+    # PLANNED — so a crew edit landing mid-run cannot reach a published
+    # roster.
+    crew_by_id = {row["crew_id"]: row for _, row in all_crew.iterrows()}
+
     seat_grades = assignment_service.SEAT_ELIGIBLE_GRADES
     pools = {
         position: all_crew[all_crew["role"].isin(seat_grades[position])]
@@ -259,6 +288,13 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
 
         flights = [flight_service.get_flight(fid) for fid in flight_ids]
         domestic = all(bool(f["domestic"]) for f in flights)
+
+        # The flights and crew rows every candidate trial would
+        # otherwise re-fetch. Built once per rotation; see
+        # assignment_service.Prefetch for why passing rows in is safe
+        # here and why it is opt-in everywhere else.
+        prefetch = assignment_service.Prefetch(
+            crew_by_id=crew_by_id, flights_by_id=dict(zip(flight_ids, flights)))
 
         commander_id = _seat_occupant(flight_ids, "COMMANDER")
         second_pilot_id = _seat_occupant(flight_ids, "SECOND_PILOT")
@@ -287,20 +323,21 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
                 fill_position, other_position, other_crew_id = "COMMANDER", "SECOND_PILOT", second_pilot_id
                 pool = pools["COMMANDER"]
 
-            partner_age = _age_of(other_crew_id, reference_date)
+            partner_age = _age_of(crew_by_id, other_crew_id, reference_date)
             candidates = [
                 Candidate(crew_id=row["crew_id"], duty_count=duty_counts[fill_position].get(row["crew_id"], 0),
-                          age=_age_of(row["crew_id"], reference_date))
+                          age=_age_of(crew_by_id, row["crew_id"], reference_date))
                 for _, row in pool.iterrows() if row["crew_id"] != other_crew_id
             ]
             ordered = order_candidates(candidates, domestic=domestic, partner_age=partner_age)
 
             filled_id, reasons = None, []
             for crew_id in ordered:
-                crew_row = crew_service.get_crew(crew_id)
+                crew_row = crew_by_id[crew_id]
                 result = assignment_service.assign_crew_to_duty(
                     crew_id, flight_ids, crew_row["role"], app_user=app_user,
-                    roster_status="PROPOSED", operating_position=fill_position)
+                    roster_status="PROPOSED", operating_position=fill_position,
+                    prefetch=prefetch)
                 if result.status == "ALLOWED":
                     filled_id = crew_id
                     break
@@ -324,27 +361,40 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
         # Neither seat filled -- fresh pair search.
         commander_candidates = [
             Candidate(crew_id=row["crew_id"], duty_count=duty_counts["COMMANDER"].get(row["crew_id"], 0),
-                      age=_age_of(row["crew_id"], reference_date))
+                      age=_age_of(crew_by_id, row["crew_id"], reference_date))
             for _, row in pools["COMMANDER"].iterrows()
         ]
         ordered_commanders = order_candidates(commander_candidates, domestic=domestic, partner_age=None)
 
+        # Built ONCE per rotation, not once per commander. The list's
+        # CONTENTS never vary with the commander — only the ordering
+        # (partner_age) and which single candidate is excluded — so
+        # rebuilding it inside the loop bought nothing and cost S
+        # round-trips per commander while _age_of() still queried.
+        second_pilot_candidates = [
+            Candidate(crew_id=row["crew_id"], duty_count=duty_counts["SECOND_PILOT"].get(row["crew_id"], 0),
+                      age=_age_of(crew_by_id, row["crew_id"], reference_date))
+            for _, row in pools["SECOND_PILOT"].iterrows()
+        ]
+        commander_ages = {
+            candidate.crew_id: candidate.age for candidate in commander_candidates
+        }
+
         filled_pair = None
         all_reasons = []
         for commander_candidate_id in ordered_commanders:
-            commander_age = _age_of(commander_candidate_id, reference_date)
-            second_pilot_candidates = [
-                Candidate(crew_id=row["crew_id"], duty_count=duty_counts["SECOND_PILOT"].get(row["crew_id"], 0),
-                          age=_age_of(row["crew_id"], reference_date))
-                for _, row in pools["SECOND_PILOT"].iterrows() if row["crew_id"] != commander_candidate_id
-            ]
+            # Already computed when the commander list was built.
+            commander_age = commander_ages.get(commander_candidate_id)
+            # Self-exclusion in memory: a CPT eligible for both seats
+            # must not be paired with themselves.
             ordered_second_pilots = order_candidates(
-                second_pilot_candidates, domestic=domestic, partner_age=commander_age)
+                [c for c in second_pilot_candidates if c.crew_id != commander_candidate_id],
+                domestic=domestic, partner_age=commander_age)
 
             for second_pilot_candidate_id in ordered_second_pilots:
                 pair_result = assignment_service.assign_pair_to_duty(
                     commander_candidate_id, second_pilot_candidate_id, flight_ids,
-                    app_user=app_user, roster_status="PROPOSED")
+                    app_user=app_user, roster_status="PROPOSED", prefetch=prefetch)
                 if pair_result.status == "ALLOWED":
                     filled_pair = (commander_candidate_id, second_pilot_candidate_id)
                     break
