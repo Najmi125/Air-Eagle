@@ -334,10 +334,13 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
             filled_id, reasons = None, []
             for crew_id in ordered:
                 crew_row = crew_by_id[crew_id]
+                # audit_trials=False — same reasoning as the pair search
+                # below; this is the one-seat-already-real variant of the
+                # same speculative loop.
                 result = assignment_service.assign_crew_to_duty(
                     crew_id, flight_ids, crew_row["role"], app_user=app_user,
                     roster_status="PROPOSED", operating_position=fill_position,
-                    prefetch=prefetch)
+                    prefetch=prefetch, audit_trials=False)
                 if result.status == "ALLOWED":
                     filled_id = crew_id
                     break
@@ -392,9 +395,20 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
                 domestic=domestic, partner_age=commander_age)
 
             for second_pilot_candidate_id in ordered_second_pilots:
+                # audit_trials=False: an option the search considered and
+                # discarded is not a decision, and the audit trail records
+                # decisions. This loop runs C x S times per uncovered
+                # rotation and previously wrote one row per rejection —
+                # 2,954 of them into production in a morning, 94% of the
+                # whole trail (operator decision, 2026-08-26). What a
+                # regulator actually asks — why this crew was legal, why
+                # that flight went uncovered — is still answerable:
+                # ASSIGNMENT_CREATED is unconditional and
+                # _record_uncovered() below is untouched.
                 pair_result = assignment_service.assign_pair_to_duty(
                     commander_candidate_id, second_pilot_candidate_id, flight_ids,
-                    app_user=app_user, roster_status="PROPOSED", prefetch=prefetch)
+                    app_user=app_user, roster_status="PROPOSED", prefetch=prefetch,
+                    audit_trials=False)
                 if pair_result.status == "ALLOWED":
                     filled_pair = (commander_candidate_id, second_pilot_candidate_id)
                     break

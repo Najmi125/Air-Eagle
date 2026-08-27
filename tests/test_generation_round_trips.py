@@ -158,9 +158,19 @@ def isolate_from_database(monkeypatch, counts=None):
                 else (lambda *a, **k: None))
 
 
-def run_generation(monkeypatch, commanders, second_pilots, rotations=1):
+def run_generation(monkeypatch, commanders, second_pilots, rotations=1,
+                    force_audit_trials=None, uncovered_calls=None):
     """Runs the real generate_for_window() over fake leaves, returning
-    (summary, RoundTrips)."""
+    (summary, RoundTrips).
+
+    force_audit_trials overrides what the generator passes for
+    audit_trials, so the SAME run can be measured with trial auditing on
+    and off. That is what lets uncovered_seats.reason be compared
+    between the two rather than merely asserted to be unaffected.
+
+    uncovered_calls, if given a list, collects the (position, reason)
+    pairs handed to _record_uncovered() — the text that would reach the
+    database, not just the copy in the summary."""
     from services import assignment_service, crew_service, flight_service
     from services import roster_generator_service as rgs
     from services import rotation_template_service as rts
@@ -214,7 +224,20 @@ def run_generation(monkeypatch, commanders, second_pilots, rotations=1):
                         lambda iid: (counts.hit("get_promoted_flight_ids"), [iid * 10, iid * 10 + 1])[1])
     isolate_from_database(monkeypatch, counts)
 
-    monkeypatch.setattr(rgs, "_record_uncovered", lambda *a, **k: None)
+    def record_uncovered(instance_id, rotation_code, reference_date, position, reason, app_user):
+        if uncovered_calls is not None:
+            uncovered_calls.append((position, reason))
+
+    monkeypatch.setattr(rgs, "_record_uncovered", record_uncovered)
+
+    if force_audit_trials is not None:
+        # Wraps the REAL functions, so this overrides only the flag and
+        # nothing else about the call.
+        for name in ("assign_pair_to_duty", "assign_crew_to_duty"):
+            real = getattr(assignment_service, name)
+            monkeypatch.setattr(
+                assignment_service, name,
+                (lambda fn: lambda *a, **k: fn(*a, **{**k, "audit_trials": force_audit_trials}))(real))
 
     summary = rgs.generate_for_window(_ROTATION_DATE, _ROTATION_DATE, app_user="occ1")
     return summary, counts
@@ -246,16 +269,18 @@ def test_round_trips_do_not_grow_quadratically_with_pool_size(monkeypatch):
     _, small = run_generation(monkeypatch, commanders=3, second_pilots=3)
     _, large = run_generation(monkeypatch, commanders=6, second_pilots=6)
 
-    # READ round-trips only. Audit WRITES are excluded here and covered
-    # by their own test below, because they are still O(C x S) and that
-    # is an open product question rather than a regression to gate on.
+    # TOTAL round-trips, reads and writes together. This deliberately
+    # no longer excludes audit writes: they used to be O(C x S) and were
+    # carved out as a tracked open question, and now they are zero, so
+    # counting everything is both simpler and stricter — a returning
+    # write is caught here as well as by the zero-write test below.
     #
-    # Measured 2026-08-22: reads went 15 -> 21 (1.4x) with the fix and
-    # 129 -> 537 (4.16x) without. A 2x ceiling sits cleanly between them.
-    small_reads = small.total - small.by_source.get("audit_write", 0)
-    large_reads = large.total - large.by_source.get("audit_write", 0)
-    assert large_reads <= small_reads * 2, (
-        f"READ round-trips grew super-linearly with pool size — "
+    # Measured 2026-08-26, 3x3 -> 6x6: 15 -> 21 (1.4x) with the fixes,
+    # 30 -> 87 (2.9x) with trial auditing still on, and 129 -> 537
+    # (4.16x) before any of it. A 2x ceiling sits below all three
+    # regressions and above the fixed behaviour.
+    assert large.total <= small.total * 2, (
+        f"round-trips grew super-linearly with pool size — "
         f"small={small!r} large={large!r}"
     )
 
@@ -269,13 +294,13 @@ def test_round_trip_budget_for_a_pinned_pool(monkeypatch):
     If this fails, print the counter — it attributes the round-trips by
     source, which is how the 4,822 was diagnosed in the first place.
 
-    Measured at 15 for this fixture (2026-08-22), of which C + S = 6 are
-    the one duty-history query per crew member per rotation. 25 leaves
-    room for an honest extra read without hiding a regression."""
+    Measured at 15 for this fixture (2026-08-26) — all reads, no writes
+    at all now — of which C + S = 6 are the one duty-history query per
+    crew member per rotation. 25 leaves room for an honest extra read
+    without hiding a regression."""
     _, counts = run_generation(monkeypatch, commanders=3, second_pilots=3)
 
-    reads = counts.total - counts.by_source.get("audit_write", 0)
-    assert reads <= 25, counts
+    assert counts.total <= 25, counts
 
 
 # ------------------------------------------------------------------
@@ -323,31 +348,122 @@ def test_adhoc_pair_path_runs_without_a_stray_name(monkeypatch):
     assert not flight_ids
 
 
-@pytest.mark.xfail(
-    reason="OPEN: one PAIR_ASSIGNMENT_REJECTED audit row is written per "
-           "rejected candidate pair, so audit writes are still O(C x S). "
-           "Whether a speculative candidate trial deserves a permanent "
-           "audit row is an operator decision, not a refactor — see "
-           "HANDOVER.md 2026-08-26.",
-    strict=True,
-)
-def test_audit_writes_do_not_grow_quadratically(monkeypatch):
-    """The remaining quadratic term, deliberately left FAILING so it
-    stays visible.
+def test_generator_trials_write_no_audit_rows(monkeypatch):
+    """The remaining quadratic term, now closed.
 
-    Generation trials every candidate pair, and each rejection writes an
-    audit row — an INSERT, i.e. a round-trip. For Air Eagle's real pool
-    that is 54 writes per uncrewed rotation, and it is what made the
-    production audit_log grow by 2,954 rows in a morning.
+    Generation trials every candidate pair, and each rejection USED TO
+    write an audit row — an INSERT, i.e. a round-trip. For Air Eagle's
+    real pool that was 54 writes per uncrewed rotation, and it is what
+    grew the production audit_log by 2,954 rows in a morning against the
+    165 it had held in total.
 
-    Marked xfail(strict=True) rather than deleted or loosened: strict
-    means it FAILS if someone fixes the underlying issue without
-    removing the marker, so this cannot rot into a permanently ignored
-    test. It is a tracked defect, not an accepted one.
-    """
-    _, small = run_generation(monkeypatch, commanders=3, second_pilots=3)
-    _, large = run_generation(monkeypatch, commanders=6, second_pilots=6)
+    Operator decision (2026-08-26): the audit trail records decisions,
+    not options considered. A regulator asks why a crew was legal and
+    why a flight went uncovered; neither question is about which
+    combinations the algorithm evaluated.
 
-    assert large.by_source["audit_write"] <= small.by_source["audit_write"] * 2, (
-        f"audit writes grew super-linearly — small={small!r} large={large!r}"
+    Asserts ZERO rather than a growth ratio. A ratio would still pass if
+    a single row per rotation crept back in, and the whole point is that
+    a speculative trial writes nothing at all."""
+    small_calls, large_calls = [], []
+    _, small = run_generation(monkeypatch, commanders=3, second_pilots=3,
+                              uncovered_calls=small_calls)
+    _, large = run_generation(monkeypatch, commanders=6, second_pilots=6,
+                              uncovered_calls=large_calls)
+
+    assert small.by_source.get("audit_write", 0) == 0, small
+    assert large.by_source.get("audit_write", 0) == 0, large
+
+    # The seats really did go uncovered — otherwise this passes because
+    # the search never ran, not because it stopped writing.
+    assert small_calls and large_calls
+
+
+def test_uncovered_reason_is_identical_with_and_without_trial_auditing(monkeypatch):
+    """uncovered_seats.reason is now the ONLY record of why a seat could
+    not be filled, so it carries more weight than it did when the
+    rejection rows sat beside it.
+
+    Compares the text produced with trial auditing ON against the text
+    produced with it OFF, across the whole run. Asserting "the reason
+    looks right" would pass while quietly dropping a clause; asserting
+    the two are equal cannot."""
+    audited, silent = [], []
+    run_generation(monkeypatch, commanders=3, second_pilots=3,
+                   force_audit_trials=True, uncovered_calls=audited)
+    run_generation(monkeypatch, commanders=3, second_pilots=3,
+                   force_audit_trials=False, uncovered_calls=silent)
+
+    assert audited == silent, (
+        "the audit flag changed uncovered_seats.reason: "
+        f"audited={audited!r} silent={silent!r}"
+    )
+    # Not vacuous: there is real reason text, and it names the failure.
+    assert audited, "no uncovered seat was recorded — the fixture is not exercising the path"
+    for position, reason in audited:
+        assert position in ("COMMANDER", "SECOND_PILOT"), position
+        assert reason and reason != "No candidates in pool", reason
+
+
+def test_the_generator_still_audits_what_it_actually_decides(monkeypatch):
+    """Suppression is scoped to trials, not to the generator.
+
+    When a pair IS accepted, assign_pair_to_duty() writes roster rows
+    and an ASSIGNMENT_CREATED row, and that must survive — it is the
+    record of a decision the system made. This crew passes validation,
+    so the write path runs.
+
+    Without this, "stop auditing generator rejections" and "stop
+    auditing the generator" look identical to the suite."""
+    from services import assignment_service, crew_service, flight_service
+
+    written = []
+
+    class _Conn:
+        def execute(self, *a, **k):
+            class _R:
+                def scalar(self_inner):
+                    return 1
+            return _R()
+
+    class _Txn:
+        def __enter__(self):
+            return _Conn()
+
+        def __exit__(self, *a):
+            return False
+
+    class _Engine:
+        def begin(self):
+            return _Txn()
+
+    crew = {"CPT-01": pd.Series(_crew_row("CPT-01", "CPT", dob_year=1985)),
+            "FO-01": pd.Series(_crew_row("FO-01", "FO", dob_year=1990))}
+    for row in crew.values():
+        for column in row.index:
+            if "expiry" in column:
+                row[column] = _ROTATION_DATE + dt.timedelta(days=365)
+
+    isolate_from_database(monkeypatch)
+    monkeypatch.setattr(assignment_service, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(assignment_service, "log_audit",
+                        lambda **k: written.append(k["action_type"]))
+    monkeypatch.setattr(crew_service, "get_crew", lambda cid: crew.get(cid))
+    monkeypatch.setattr(flight_service, "get_flight",
+                        lambda fid: pd.Series(_flight_row(fid)))
+    monkeypatch.setattr(assignment_service, "_read_duty_rows",
+                        lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(assignment_service, "_find_paired_pilot", lambda *a, **k: None)
+    monkeypatch.setattr(assignment_service, "get_roster_for_flight",
+                        lambda *a, **k: pd.DataFrame(columns=["crew_id", "operating_position"]))
+
+    result = assignment_service.assign_pair_to_duty(
+        "CPT-01", "FO-01", [10, 11], app_user="occ1",
+        roster_status="PROPOSED", audit_trials=False)
+
+    assert result.status == "ALLOWED", (result.status, result.validation.status)
+    assert "ASSIGNMENT_CREATED" in written, (
+        f"audit_trials=False suppressed the record of an assignment that was "
+        f"actually created — it must only ever suppress discarded trials. "
+        f"Wrote: {written}"
     )

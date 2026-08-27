@@ -7289,3 +7289,103 @@ Tracked as `test_audit_writes_do_not_grow_quadratically`, marked
 `xfail(strict=True)` — strict, so it FAILS if someone fixes the cause
 without removing the marker, and cannot rot into a permanently ignored
 test.
+
+## 2026-08-26: the audit trail records decisions, not options considered
+
+**Operator decision, made by Arif, not by whoever wrote this code.** The
+roster generator no longer writes an audit row for each speculative
+candidate pair its internal search tries and discards. Everything a
+person actually decides is still fully audited: assignments created,
+unassignments, publishes, approvals, manual rejections, crew changes.
+
+The evidence was concrete rather than theoretical. Of 3,157 rows in the
+production `audit_log`, 2,954 were `PAIR_ASSIGNMENT_REJECTED` written by
+a morning of test runs (see the incident entry above). Arif deleted them
+and **no information anyone would ask for was lost**:
+`ROSTER_GENERATION_SEAT_UNCOVERED` (26 rows) already recorded which
+seats went unfilled and why, and survived independently. What remains is
+195 rows that each record something that happened. A regulator asks "why
+was this crew legal" and "why was this flight uncovered" — both still
+answerable. Nobody asks which combinations the algorithm evaluated.
+
+### How the generator is told apart from the pages
+
+`assign_pair_to_duty()` and `assign_crew_to_duty()` are called by both,
+so the distinction is an explicit `audit_trials` parameter rather than
+anything inferred from context. The obvious hazard is that a flag a page
+could set would let a REAL rejection — a decision by a real controller —
+go unrecorded. Four things bound it, and they are checks rather than
+intentions:
+
+* **The default is `True`, and the direction is the point.** Silence is
+  never what a caller gets by saying nothing. A page written next year
+  is fully audited without its author knowing the parameter exists; only
+  an explicit opt-out turns anything off.
+* **It gates ONLY trial outcomes.** `ASSIGNMENT_CREATED` is written
+  unconditionally, outside any branch the flag can reach, so an
+  assignment that IS created cannot go unaudited whatever any caller
+  passes. `tests/test_audit_scope.py` proves this by walking the AST
+  ancestor chain rather than grepping, so it survives a reindent.
+* **Only the generator may pass it, and only as the literal `False`.**
+  Statically enforced over every non-test `.py` file, so it holds for
+  pages that do not exist yet and cannot be satisfied by a
+  copy-pasted `audit_trials=x` that later becomes a variable.
+  `ADHOC_PAIR_REJECTED` and the manual paths are untouched.
+* **Both speculative loops are pinned at two call sites.** If that count
+  drops to one, a loop has started writing a row per discarded option
+  again.
+
+All five guards were mutation-tested: a page passing the flag, the
+generator passing a variable, the default flipped to `False`,
+`ASSIGNMENT_CREATED` moved under the flag, and trial auditing restored
+wholesale — each fails the suite. (The first mutation attempt did NOT
+fail it, and the guard was right: the text edited was a mention of
+`assign_pair_to_duty(` inside the page's module docstring, not a call.
+Worth knowing before concluding a guard is asleep.)
+
+### Re-measured, not inferred
+
+Predicting this from arithmetic is what produced the wrong number last
+time, so the whole table is measured with the counter, both columns
+from the same fixtures:
+
+| fixture | before: reads / writes / **total** | after: reads / writes / **total** |
+|---|---|---|
+| C=3, S=3, 1 rotation | 15 / 15 / **30** | 15 / 0 / **15** |
+| C=6, S=6, 1 rotation | 21 / 66 / **87** | 21 / 0 / **21** |
+| C=6, S=10, 1 rotation | 25 / 90 / **115** | 25 / 0 / **25** |
+| C=6, S=10, 5 rotations | 109 / 450 / **559** | 109 / 0 / **109** |
+
+Writes are **zero**, not merely linear. Reads are untouched — this
+change was never about them. Against the operator's independently
+measured 133 for 5 rotations at the real pool, and 4,822 originally.
+
+Note the write column before: 90 for C=6/S=10, not the 54 previously
+claimed. Commanders are eligible for the second-pilot seat too, so the
+second-pilot pool is 16 and each commander trials 15 partners after
+self-exclusion — 6 x 15. **That is the third time an inferred figure in
+this file has been wrong and the measured one right.**
+
+### The guards
+
+`test_generator_trials_write_no_audit_rows` asserts **zero**, not a
+growth ratio: a ratio would still pass if one row per rotation crept
+back, and the point is that a discarded trial writes nothing at all. The
+growth and budget guards now count reads and writes TOGETHER — the
+carve-out that existed while writes were a tracked open question is
+gone, which makes them both simpler and stricter.
+
+`test_the_generator_still_audits_what_it_actually_decides` runs a pair
+that PASSES validation and asserts `ASSIGNMENT_CREATED` is written even
+with `audit_trials=False`. Without it, "stopped auditing generator
+rejections" and "stopped auditing the generator" look identical to the
+suite.
+
+**`uncovered_seats.reason` is now the only record of why a seat could
+not be filled**, so it carries more weight than when the rejection rows
+sat beside it.
+`test_uncovered_reason_is_identical_with_and_without_trial_auditing`
+runs the same generation twice — flag on, flag off — and asserts the
+text handed to `_record_uncovered()` is equal across both. Asserting
+that the reason "looks right" would pass while quietly dropping a
+clause; asserting the two runs are equal cannot.

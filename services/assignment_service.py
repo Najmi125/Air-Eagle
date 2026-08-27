@@ -834,12 +834,17 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                          app_user: Optional[str] = None,
                          roster_status: str = "PLANNED",
                          operating_position: Optional[str] = None,
-                         prefetch=None) -> AssignmentResult:
+                         prefetch=None,
+                         audit_trials: bool = True) -> AssignmentResult:
     """
     Assigns crew_id to the duty formed by flight_ids (in chronological
     order — the caller's decision which flights form one duty).
     domestic is read from the flights themselves, not asked again
     here — all flights in the duty must agree on it.
+
+    audit_trials: as on assign_pair_to_duty() — see that docstring for
+    what it does and the three things that bound it. Default True; only
+    the roster generator's internal candidate search passes False.
 
     ILLEGAL blocks the save entirely (AssignmentResult.status=
     "REJECTED", nothing written). LEGAL/WARNING saves and returns
@@ -929,15 +934,16 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     alert_summary = summarize_alerts(validation_result, target_duty_id=new_duty.duty_id)
 
     if validation_result.status == AlertStatus.ILLEGAL:
-        log_audit(
-            action_type="ASSIGNMENT_REJECTED",
-            affected_crew=crew_id,
-            affected_flight=flight_ids[0],
-            affected_duty=new_duty.duty_id,
-            legality_result=validation_result.status.value,
-            warning_or_failure_reason=build_audit_reason(alert_summary, frozenset({AlertStatus.ILLEGAL})),
-            app_user=app_user,
-        )
+        if audit_trials:
+            log_audit(
+                action_type="ASSIGNMENT_REJECTED",
+                affected_crew=crew_id,
+                affected_flight=flight_ids[0],
+                affected_duty=new_duty.duty_id,
+                legality_result=validation_result.status.value,
+                warning_or_failure_reason=build_audit_reason(alert_summary, frozenset({AlertStatus.ILLEGAL})),
+                app_user=app_user,
+            )
         return AssignmentResult(
             status="REJECTED",
             legality_status=validation_result.status.value,
@@ -961,16 +967,17 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
         # ILLEGAL in that respect — but this is reported as HELD, not
         # REJECTED, since it isn't a known violation, just an
         # unresolved uncertainty that needs a human decision.
-        log_audit(
-            action_type="ASSIGNMENT_HELD_FOR_REVIEW",
-            affected_crew=crew_id,
-            affected_flight=flight_ids[0],
-            affected_duty=new_duty.duty_id,
-            legality_result=validation_result.status.value,
-            warning_or_failure_reason=build_audit_reason(
-                alert_summary, frozenset({AlertStatus.NEEDS_MANUAL_REVIEW})),
-            app_user=app_user,
-        )
+        if audit_trials:
+            log_audit(
+                action_type="ASSIGNMENT_HELD_FOR_REVIEW",
+                affected_crew=crew_id,
+                affected_flight=flight_ids[0],
+                affected_duty=new_duty.duty_id,
+                legality_result=validation_result.status.value,
+                warning_or_failure_reason=build_audit_reason(
+                    alert_summary, frozenset({AlertStatus.NEEDS_MANUAL_REVIEW})),
+                app_user=app_user,
+            )
         return AssignmentResult(
             status="NEEDS_REVIEW",
             legality_status=validation_result.status.value,
@@ -1488,7 +1495,8 @@ def _write_pair_rows(conn, crew_id, role_assigned, operating_position, duty, dut
 def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, flight_ids: List[int],
                          app_user: Optional[str] = None,
                          roster_status: str = "PLANNED",
-                         prefetch=None) -> PairAssignmentResult:
+                         prefetch=None,
+                         audit_trials: bool = True) -> PairAssignmentResult:
     """
     Assigns BOTH seats of a flight-deck pair to flight_ids (flights
     that already exist — Roster page / roster generator), atomically:
@@ -1500,6 +1508,30 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
     roster_status: same meaning as assign_crew_to_duty()'s own
     parameter — the roster row's own lifecycle state, not this
     function's outcome. Phase 7's roster generator passes 'PROPOSED'.
+    audit_trials: whether a REJECTED / HELD_FOR_REVIEW outcome leaves an
+    audit row. Default True, and the default is the safe direction —
+    silence is never what a caller gets by saying nothing, so a page
+    written next year is fully audited without knowing this parameter
+    exists. ONLY the roster generator passes False, for its internal
+    candidate search: those are options the algorithm considered and
+    discarded, not decisions anybody made, and one run wrote 2,954 rows
+    into a production audit_log that held 165 (2026-08-26).
+
+    Three things bound it, because a flag that a page could set would
+    let a REAL rejection go unaudited:
+
+      * It gates ONLY the trial-outcome rows. ASSIGNMENT_CREATED is
+        written unconditionally, outside any branch this can reach, so
+        no assignment can ever be created without an audit row —
+        whatever any caller passes.
+      * `tests/test_audit_scope.py` fails the suite if any file outside
+        services/roster_generator_service.py passes it at all, and if
+        the generator passes anything but the literal False. Pages
+        cannot acquire it by accident or by copy-paste.
+      * Why a seat went unfilled is recorded independently, by
+        `uncovered_seats.reason` (ROSTER_GENERATION_SEAT_UNCOVERED) —
+        which is now the ONLY record of it, and so is verified
+        byte-identical under both settings.
     """
     engine = get_engine()
     core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids,
@@ -1513,20 +1545,22 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
     if overall_status == AlertStatus.ILLEGAL:
         commander_reason = build_audit_reason(commander_summary, frozenset({AlertStatus.ILLEGAL}))
         second_pilot_reason = build_audit_reason(second_pilot_summary, frozenset({AlertStatus.ILLEGAL}))
-        log_audit(
-            action_type="PAIR_ASSIGNMENT_REJECTED",
-            affected_crew=commander_crew_id, affected_flight=flight_ids[0],
-            legality_result=overall_status.value,
-            warning_or_failure_reason="; ".join(r for r in (commander_reason, second_pilot_reason) if r),
-            app_user=app_user,
-        )
+        if audit_trials:
+            log_audit(
+                action_type="PAIR_ASSIGNMENT_REJECTED",
+                affected_crew=commander_crew_id, affected_flight=flight_ids[0],
+                legality_result=overall_status.value,
+                warning_or_failure_reason="; ".join(r for r in (commander_reason, second_pilot_reason) if r),
+                app_user=app_user,
+            )
     elif overall_status == AlertStatus.NEEDS_MANUAL_REVIEW:
-        log_audit(
-            action_type="PAIR_ASSIGNMENT_HELD_FOR_REVIEW",
-            affected_crew=commander_crew_id, affected_flight=flight_ids[0],
-            legality_result=overall_status.value,
-            app_user=app_user,
-        )
+        if audit_trials:
+            log_audit(
+                action_type="PAIR_ASSIGNMENT_HELD_FOR_REVIEW",
+                affected_crew=commander_crew_id, affected_flight=flight_ids[0],
+                legality_result=overall_status.value,
+                app_user=app_user,
+            )
 
     validation = PairValidationResult(
         status=overall_status.value,
