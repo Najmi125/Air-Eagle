@@ -324,6 +324,37 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`stop-auditing-generator-trials` merged into `main` (2026-08-26).**
+  Operator decision by Arif: the audit trail records decisions, not
+  options considered. The generator's internal candidate search no
+  longer writes a row per pair it tries and discards; every real
+  operational decision stays fully audited, `ADHOC_PAIR_REJECTED`
+  included. **658/658 verified against real Postgres 16**, reachability
+  clean, **measured in both directions independently by the operator**:
+  10 seats all fillable gave 10 audit writes for 10 assignments and zero
+  trial writes; 6 seats uncovered gave 6 audit writes (the uncovered
+  records themselves), zero trial writes, and the reason text intact at
+  full detail —
+  `CPT-01+CPT-02 (REJECTED): commander: CPT-01's MEDICAL expired 2026-07-01, ...`
+
+  That last check had been unobtainable across four rounds and matters
+  more than the count: **`uncovered_seats.reason` is now the ONLY
+  surviving explanation of an unfilled seat.** Treat it as such — it is
+  load-bearing regulatory evidence, not a convenience string.
+
+  **No reboot, no migration**, confirmed structurally: no new service
+  module, and no added `import`/`from` line anywhere outside `tests/`.
+
+  **Before changing anything about `audit_trials`, read
+  `tests/test_audit_scope.py`.** Four static guards, all
+  mutation-tested, and the two that carry the weight are: the default is
+  `True`, so silence never yields silence; and it gates ONLY trial
+  outcomes, so `ASSIGNMENT_CREATED` sits outside any branch the flag can
+  reach. The second is checked by walking the AST ancestor chain rather
+  than grepping, which is what makes it hold under a reindent. Widening
+  who may pass this flag is an operator decision about the regulatory
+  record, not a test to edit.
+
 - **`generator-round-trips` merged into `main` (2026-08-26).** Roster
   generation was unusable in production: **4,822 database round-trips to
   fill 10 seats**, 7+ minutes against a 23-second estimate. Four stacked
