@@ -7420,3 +7420,118 @@ runs the same generation twice — flag on, flag off — and asserts the
 text handed to `_record_uncovered()` is equal across both. Asserting
 that the reason "looks right" would pass while quietly dropping a
 clause; asserting the two runs are equal cannot.
+
+## 2026-08-28: seat versus grade, the third and fourth instances
+
+`operating_position` is the SEAT (COMMANDER / SECOND_PILOT).
+`role_assigned` is the GRADE (CPT / FO). Under the flight-deck pair
+model a CPT may legitimately occupy the Second Pilot seat, so the two
+are not interchangeable — and this is now the same defect **four
+times**: the Control Room status board (fixed 2026-08-21),
+`reports.roster_coverage()` and
+`roster_generator_service._seed_duty_counts()` (both fixed here).
+
+That is why the new guards live in **one file named after the
+distinction**, `tests/test_seat_vs_grade.py`, rather than being
+scattered through three modules' own suites. A reviewer looking for
+"has this been checked" now has one place to look. It is **DB-free on
+purpose**: the equivalent checks in `test_assistant_reports.py` are
+DB-gated and skip wherever Postgres is absent, which is exactly where
+the first two instances survived review.
+
+### `roster_coverage()` reported a crewed flight as half-empty
+
+Seen in production on 2026-08-31:
+
+```
+EPE 787  LHE-KHI   Commander: CPT-03, CPT-04   Second Pilot: UNCOVERED
+```
+
+Two crew under Commander and none under Second Pilot — a state the
+database itself forbids. `uq_roster_flight_operating_position_active`
+(migrations/016) is unique on `(flight_id, operating_position)` for
+non-cancelled rows, so two active COMMANDER rows on one flight cannot
+exist. **The report was describing something impossible**, which is the
+tell: the assignment was correct and only the report was wrong.
+Confirmed against the actual rows — CPT-04 COMMANDER, CPT-03
+SECOND_PILOT on flights 15/16.
+
+Fixed to group by `operating_position`. The headers were renamed
+`CPT`/`FO` -> `Commander`/`Second Pilot`, which is **half the fix, not
+cosmetics**: columns headed by grade invite exactly the grouping that
+was wrong, and a reader cannot otherwise tell a seat report from a
+grade report by looking at it.
+
+### The third state, and the production count
+
+A cockpit row with no `operating_position` belongs to neither seat and
+would have silently vanished from a seat-grouped report — **worse than
+the bug being fixed**, because a coverage report that drops a crew
+member is actively misleading rather than merely wrong.
+
+Such crew are now **named in a note** against their flight, not pushed
+into a seat cell: putting them in one column asserts a seat the data
+does not record, and putting them in both asserts two. They still count
+toward POB — they are aboard regardless of what was recorded — and they
+do NOT mark their seat as covered.
+
+**Production count: ZERO** (checked 2026-08-28, read-only). No cockpit
+row in any status has a NULL `operating_position`, so this is purely
+defensive against pre-016 rows. Not a data finding — recorded because
+"we checked and it was zero" is worth more later than silence.
+
+### `_seed_duty_counts()` — a filter that was a no-op
+
+It filtered `role_assigned.isin(grades)` while its own docstring claimed
+to count "every duty a pilot flies **in that seat**". Since every row
+for a CPT reads `role_assigned='CPT'` whichever seat they sat in, and
+the Commander pool is exactly the CPTs, **the filter did nothing in
+either direction**: a CPT's Second Pilot duties counted toward their
+Commander total and vice versa. It measured total workload.
+
+**THIS CHANGES GENERATED ROSTERS, and it is a decision about what fair
+means rather than a bug fix.** Operator decision (2026-08-28): the
+ordering chooses who is OFFERED a particular seat, and command is the
+position carrying the responsibility, so the opportunity being
+distributed is seat-specific. A CPT who has flown many Second Pilot
+duties now sorts as under-used for Commander, where before they sorted
+as heavily used. **Fatigue is not what this balances** — the FTL gate
+handles that and is untouched.
+
+The pool is still selected by grade (who MAY sit there); only the count
+is by seat. `NULL` positions count toward neither seat, which is what
+"duties in this seat" means.
+
+### Mutation-tested
+
+Four mutations, each failing the suite: `roster_coverage` reverted to
+grade (3 tests), seatless crew silently dropped (1), fairness reverted
+to grade (2), and seat counts no longer deduping sectors into duties
+(1). That last one guards the oldest trap in this codebase —
+migrations/003's "single most repeated bug in this platform's history"
+— because regrouping was an opportunity to reintroduce raw row
+counting.
+
+**The DB-free tests earned themselves immediately**: they caught an
+`UnboundLocalError` in the new seatless path (`date_value` used before
+it was computed) on a branch that only executes when a NULL-position
+row exists. Production has none, and every DB-gated test would have
+skipped here — so that would have shipped and only ever fired against
+pre-016 data.
+
+### One unreproduced failure, recorded rather than buried
+
+A backgrounded full run took **3h00m** and reported
+`test_delete_control_is_enabled_normally_when_the_lookup_succeeds`
+FAILED. Its traceback was lost with the run's output. It did not
+reproduce: that test passes alone (8.6s), passes with its whole file
+(3 passed, 17 skipped, 4.6s), no test file takes even 10s on its own,
+and a foreground full run of the identical tree gives **308 passed,
+361 skipped in 34.4s** — 300x faster with nothing changed.
+
+So the slow run was almost certainly a stalled or descheduled
+background process and the failure collateral to it, but that is an
+inference and not a diagnosis, which is why it is written down. **If
+that test fails on real Postgres, this is where to start** — it would
+mean the run was telling the truth and three green runs since were
+lucky.

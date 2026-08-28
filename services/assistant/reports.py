@@ -71,13 +71,29 @@ UTILIZATION_BASE_HEADERS = (
 # decision — see HANDOVER.md and scripts/import_crew_from_xlsx.py).
 # Cockpit coverage is the only thing this report checks structurally;
 # everyone else aboard is free text (see ROSTER_COVERAGE_HEADERS).
+# These are GRADES, and this report groups by SEAT — the constant is
+# used only to tell a cockpit row from an LM/ENGR one when deciding
+# whether a missing operating_position is worth reporting.
 COCKPIT_COVERAGE_ROLES = ("CPT", "FO")
 
+# Commander / Second Pilot, not CPT / FO. Renamed 2026-08-28 together
+# with the grouping underneath them: these columns are SEATS, and a CPT
+# occupying the Second Pilot seat is normal under the pair model. While
+# they were headed by grade a CPT/CPT pair rendered as two Commanders
+# and an UNCOVERED Second Pilot — a flight that was in fact fully
+# crewed reading as half-empty.
 ROSTER_COVERAGE_HEADERS = (
-    "Date", "Flight", "Route", "CPT", "FO",
+    "Date", "Flight", "Route", "Commander", "Second Pilot",
     "Other occupants — operating", "Other occupants — non-operating",
     "POB", "Remarks",
 )
+
+# Neither covered nor uncovered: a cockpit row that exists but records
+# no seat. Impossible for anything written since migration 016, and
+# there are ZERO such rows in production (checked 2026-08-28) — but a
+# report that silently drops a crew member is worse than one that
+# admits it cannot place them, and pre-016 rows would do exactly that.
+SEAT_NOT_RECORDED = "Seat not recorded"
 
 # OCC's real-world shorthand for a free-text occupant entry that
 # represents more than one person on its own (e.g. "2x AME") —
@@ -278,6 +294,7 @@ def roster_coverage(request: query_parser.ReportRequest) -> Dataset:
 
     rows = []
     any_uncovered = False
+    seatless_notes = []
     for _, flight in flights.iterrows():
         # include_proposed=True (2026-08-04): a seat the roster
         # generator has proposed but OCC hasn't published yet is a
@@ -291,32 +308,67 @@ def roster_coverage(request: query_parser.ReportRequest) -> Dataset:
         roster = assignment_service.get_roster_for_flight(
             flight["flight_id"], include_proposed=True)
 
-        cpt_ids = sorted(roster.loc[roster["role_assigned"] == "CPT", "crew_id"].tolist())
-        fo_ids = sorted(roster.loc[roster["role_assigned"] == "FO", "crew_id"].tolist())
-        cpt_cell = ", ".join(cpt_ids) if cpt_ids else "UNCOVERED"
-        fo_cell = ", ".join(fo_ids) if fo_ids else "UNCOVERED"
-        if not cpt_ids or not fo_ids:
+        dep = flight["dep_time_planned"]
+        date_value = dep.date() if hasattr(dep, "date") else dep
+
+        # Grouped by operating_position (the SEAT), never by
+        # role_assigned (the GRADE). Under the flight-deck pair model a
+        # CPT may legitimately occupy the Second Pilot seat, so a
+        # grade-based split reported a fully-crewed CPT/CPT flight as
+        # two Commanders and an UNCOVERED Second Pilot — which is what
+        # this looked like on 2026-08-31 in production. Third instance
+        # of that conflation; see search_roster()'s own column comment.
+        commander_ids = sorted(
+            roster.loc[roster["operating_position"] == "COMMANDER", "crew_id"].tolist())
+        second_pilot_ids = sorted(
+            roster.loc[roster["operating_position"] == "SECOND_PILOT", "crew_id"].tolist())
+
+        # A cockpit crew member with no seat recorded belongs in neither
+        # column, and must not simply vanish from the report — see
+        # SEAT_NOT_RECORDED.
+        seatless_ids = sorted(roster.loc[
+            roster["role_assigned"].isin(COCKPIT_COVERAGE_ROLES)
+            & roster["operating_position"].isna(), "crew_id"].tolist())
+
+        commander_cell = ", ".join(commander_ids) if commander_ids else "UNCOVERED"
+        second_pilot_cell = ", ".join(second_pilot_ids) if second_pilot_ids else "UNCOVERED"
+        if seatless_ids:
+            # Named in a note against this flight rather than pushed into
+            # a seat cell: putting them in one column would assert a seat
+            # the data does not record, and putting them in both would
+            # assert two. The point is to say "this person is aboard and
+            # I cannot tell you where they are sitting" — which is a
+            # different statement from either seat cell.
+            seatless_notes.append(
+                f"{flight['flight_no']} ({date_value}): {SEAT_NOT_RECORDED} for "
+                f"{', '.join(seatless_ids)}")
+        if not commander_ids or not second_pilot_ids:
             any_uncovered = True
 
         operating = flight.get("other_occupants_operating") or ""
         non_operating = flight.get("other_occupants_non_operating") or ""
-        pob = len(cpt_ids) + len(fo_ids) + _count_occupants(operating) + _count_occupants(non_operating)
-
-        dep = flight["dep_time_planned"]
-        date_value = dep.date() if hasattr(dep, "date") else dep
+        # Seatless cockpit crew are aboard whether or not their seat was
+        # recorded, so they count toward POB — dropping them here would
+        # under-report persons on board, which is the one number on this
+        # report that is not about seats at all.
+        pob = (len(commander_ids) + len(second_pilot_ids) + len(seatless_ids)
+               + _count_occupants(operating) + _count_occupants(non_operating))
 
         rows.append([
             date_value, flight["flight_no"],
             f'{flight["origin"]}-{flight["destination"]}',
-            cpt_cell, fo_cell, operating, non_operating, pob,
+            commander_cell, second_pilot_cell, operating, non_operating, pob,
             flight.get("remarks") or "",
         ])
 
     notes = []
     if rows:
         notes.append(
-            "CPT/FO show UNCOVERED only when that cockpit seat has no "
-            "assigned crew_id — the two occupant columns are OCC-entered "
+            "Commander/Second Pilot are SEATS (operating_position), not "
+            "grades: a CPT may legitimately occupy the Second Pilot seat, "
+            "so both columns can show a CPT. They read UNCOVERED only when "
+            "that seat has no assigned crew_id — the two occupant columns "
+            "are OCC-entered "
             "free text (who else is aboard and what they're doing there) "
             "and never trigger UNCOVERED themselves. POB counts the two "
             "cockpit seats plus every name in both occupant columns, "
@@ -325,6 +377,16 @@ def roster_coverage(request: query_parser.ReportRequest) -> Dataset:
         )
     if any_uncovered:
         notes.append("At least one flight in this range has an uncovered cockpit seat.")
+    if seatless_notes:
+        # Loud, and listed individually. A cockpit row with no seat
+        # cannot be produced by any code path since migration 016, so if
+        # this ever appears it is a data-integrity finding rather than a
+        # display nicety — the crew member IS counted in POB but cannot
+        # be placed in a seat.
+        notes.append(
+            "Cockpit crew aboard whose SEAT is not recorded — counted in POB but "
+            "shown in neither seat column, and not treated as covering a seat: "
+            + "; ".join(seatless_notes))
 
     return Dataset.build(
         name="RosterCoverage", title="Roster Coverage",

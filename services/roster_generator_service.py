@@ -60,16 +60,37 @@ class GenerationSummary:
     already_covered: List[SeatResult] = field(default_factory=list)
 
 
-def _seed_duty_counts(crew_ids: List[str], grades: set, date_from: dt.date, date_to: dt.date) -> dict:
+def _seed_duty_counts(crew_ids: List[str], operating_position: str,
+                       date_from: dt.date, date_to: dt.date) -> dict:
     """One batch query per seat — real, duty-deduped counts, scoped
     to the generation window itself, never raw search_roster() row
     counts (core/duty_summary.py's own warning). include_proposed is
     True here so a seat this same run already filled earlier in the
     walk counts toward fairness immediately, not just already-PLANNED
-    rows from before this run. Counted per crew_id across BOTH grades
-    a seat may draw from (e.g. Second Pilot: CPT or FO) — a fair
-    workload measure across every duty a pilot flies in that seat,
-    regardless of their own grade."""
+    rows from before this run.
+
+    Counted by SEAT (operating_position), not by grade. Corrected
+    2026-08-28 — this filtered on role_assigned, which under the pair
+    model is the pilot's GRADE and not the seat they sat in. Since
+    every row for a CPT reads role_assigned='CPT' whichever seat they
+    occupied, and the Commander pool is exactly the CPTs, the filter
+    was a no-op in both directions: a CPT's Second Pilot duties counted
+    toward their Commander total and vice versa, so this measured total
+    workload while its own docstring claimed seat workload.
+
+    Operator decision, not a silent bug fix (see HANDOVER 2026-08-28):
+    this ordering chooses who is OFFERED a particular seat, and command
+    is the position carrying the responsibility, so the opportunity
+    being distributed is seat-specific. Fatigue is not what this
+    balances — the FTL gate handles that, and it is unaffected. THIS
+    CHANGES GENERATED ROSTERS: a CPT who has flown many Second Pilot
+    duties now sorts as under-used for Commander, where before they
+    sorted as heavily used.
+
+    NULL operating_position rows (LM/ENGR, and any pre-016 cockpit row)
+    belong to no seat and are counted toward neither — which is what
+    "duties in this seat" means, and is why this filters rather than
+    falling back to grade."""
     counts = {cid: 0 for cid in crew_ids}
     if not crew_ids:
         return counts
@@ -77,7 +98,7 @@ def _seed_duty_counts(crew_ids: List[str], grades: set, date_from: dt.date, date
         crew_ids=crew_ids, date_from=date_from, date_to=date_to, include_proposed=True,
     )
     if not rows.empty:
-        rows = rows[rows["role_assigned"].isin(grades)]
+        rows = rows[rows["operating_position"] == operating_position]
     duties = group_roster_rows_into_duties(rows)
     if not duties.empty:
         for crew_id, n in duties.groupby("crew_id").size().items():
@@ -268,8 +289,11 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
         position: all_crew[all_crew["role"].isin(seat_grades[position])]
         for position in SEATS
     }
+    # Seeded per SEAT, not per grade — the pool is still selected by
+    # grade (who MAY sit there), but the fairness count is of duties
+    # actually flown in that seat. See _seed_duty_counts().
     duty_counts = {
-        position: _seed_duty_counts(pools[position]["crew_id"].tolist(), seat_grades[position], date_from, date_to)
+        position: _seed_duty_counts(pools[position]["crew_id"].tolist(), position, date_from, date_to)
         for position in SEATS
     }
 
