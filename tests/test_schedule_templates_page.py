@@ -526,7 +526,21 @@ def test_unused_template_can_be_deleted_from_the_page(page_app):
     assert rts.get_all_rotation_codes() == []
 
 
-def test_delete_is_disabled_with_a_reason_once_the_template_is_used(page_app):
+def test_a_used_template_refuses_deletion_and_offers_the_change_path(page_app):
+    """Against a REAL database, with real instances generated from the
+    template — the DB-free version of this lives further down and fakes
+    the deletability lookup, so only this one proves the refusal comes
+    from migrations/019's own rule rather than from a fake.
+
+    Rewritten 2026-08-31. It previously asserted a single DISABLED
+    "Delete template" button; that button is no longer rendered at all,
+    because in production it could never be clicked for either template
+    and a control that can never work is a dead end rather than an
+    explanation. What is worth pinning is unchanged and is asserted
+    here: the template survives, the reason is still given, and the page
+    names the one action that IS available. Deleting the test would have
+    lost the coverage of a used template correctly refusing deletion,
+    which is the part that actually protects generated rotations."""
     from services import rotation_template_service as rts
 
     _seed_domestic_template("EPE-786-787")
@@ -534,11 +548,25 @@ def test_delete_is_disabled_with_a_reason_once_the_template_is_used(page_app):
 
     at = page_app.run()
 
-    delete_buttons = [b for b in at.button if b.label == "Delete template"]
-    assert len(delete_buttons) == 1
-    assert delete_buttons[0].disabled is True
-    assert any("rotation instance" in c.value for c in at.caption)
+    assert not at.exception, at.exception
+    assert not [b for b in at.button if b.label == "Delete template"], (
+        "a permanently unclickable button is a dead end, not an explanation"
+    )
+    assert any("rotation instance" in c.value for c in at.caption), (
+        "the refusal must still say WHY, naming the instances it protects"
+    )
+    assert any("Change this schedule" in c.value for c in at.caption), (
+        "refusing is not enough — the page must name the action that IS "
+        "available, which for a used template is a new version and nothing else"
+    )
+    assert any("Change this schedule" in m.value for m in at.markdown), (
+        "the change-a-schedule workflow itself must be present in the expander"
+    )
+
+    # The point of the whole rule: the template and its generated
+    # rotations are still there.
     assert rts.get_all_rotation_codes() == ["EPE-786-787"]
+    assert not rts.get_instances(rotation_code="EPE-786-787").empty
 
 
 # ------------------------------------------------------------------

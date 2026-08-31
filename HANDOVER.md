@@ -7699,6 +7699,25 @@ hidden-flight count removed, and the dead Delete button restored.
 
 330 passed, 361 skipped locally; reachability clean.
 
+### The one test that had to be rewritten rather than deleted
+
+`test_delete_is_disabled_with_a_reason_once_the_template_is_used`
+asserted a single DISABLED "Delete template" button, which is exactly
+the behaviour this change replaced — so it failed on real Postgres
+finding zero buttons. It is now
+`test_a_used_template_refuses_deletion_and_offers_the_change_path`.
+
+Deleting it would have been the easy move and would have lost real
+coverage: it is the only test that proves a USED template refuses
+deletion against migrations/019's own rule rather than against a faked
+deletability lookup. What it pins now is what actually matters — the
+template and its generated rotations survive, the refusal still says
+why, and the page names the one action that is available.
+
+**A test pinning behaviour you deliberately changed is stale, not
+wrong.** Rewrite it to the new contract; deleting it silently drops
+whatever else it was covering.
+
 ### ⚠ Reboot required
 
 `services/display_labels.py` is now imported by pages 5, 6 and 7, which
