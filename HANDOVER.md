@@ -324,6 +324,40 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`schedule-change-path-and-display` merged into `main` (2026-08-31).**
+  **⚠ NEEDS A REBOOT FROM MANAGE APP AFTER DEPLOYING — FOURTH
+  OCCURRENCE.** `services/display_labels.py` is now imported by
+  `pages/5_Assistant.py`, `pages/6_Roster_Generation.py` and
+  `pages/7_Schedule_Templates.py`, none of which imported it before.
+  That is the rule's second limb — "a page importing a service module it
+  did not import before" — and it is the one that keeps catching people,
+  because no new file appears in the diff. **No migration.**
+
+  Six live-trial findings. Three were one question: **a template already
+  used is superseded by a new version, and there is no other way**
+  (legs immutable by trigger, template undeletable, existing
+  rotation_code rejected). Answered once so the three UI decisions could
+  follow from it rather than diverging. "Create a new version" was
+  RELOCATED into each template's expander as **Change this schedule**,
+  not removed — removing it would have left both live templates
+  permanently unchangeable. The dead Delete button is gone; the reason
+  stays and points at the change path. Expand and Review merged, with
+  drafts outside the window COUNTED. Timestamps read `25 Aug 2003z`
+  (CSV keeps ISO, deliberately). Day offset explained and kept.
+
+  **691/691 verified against real Postgres 16**, reachability clean,
+  including the used-template refusal against migrations/019's own
+  trigger — the one path the DB-free tests cannot prove, since they stub
+  the deletability lookup and would pass against a database with the
+  trigger dropped.
+
+  **Before touching `format_timestamps()`, read why `datetime` is
+  checked before `date`.** `datetime` subclasses `date`, so the naive
+  order converts every crew expiry column and a medical expiring
+  2026-07-01 renders as "01 Jul" — losing the digit that decides whether
+  a pilot may fly. A silent safety regression inside a formatting
+  change; mutation-tested.
+
 - **`roster-coverage-and-seat-fairness` merged into `main` (2026-08-28).**
   The third and fourth instances of seat-versus-grade:
   `reports.roster_coverage()` reported a fully-crewed CPT/CPT flight as
