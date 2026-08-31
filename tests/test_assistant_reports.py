@@ -80,7 +80,7 @@ def _add_flight(dep, arr, domestic=True, origin="KHI", destination="LHE", **over
 
 
 def _seed_duty(engine, crew_id, flight_id, role_assigned, report_time, debrief_time,
-                fdp_hours, duty_id=None):
+                fdp_hours, duty_id=None, operating_position=None):
     """Insert a roster row directly via SQL, bypassing the assignment
     API's legality gate entirely — same pattern and rationale as
     tests/test_assignment_service.py's own _seed_duty(): these tests
@@ -91,14 +91,14 @@ def _seed_duty(engine, crew_id, flight_id, role_assigned, report_time, debrief_t
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO roster (crew_id, flight_id, duty_id, duty_date,
-                report_time, debrief_time, fdp_hours, role_assigned)
+                report_time, debrief_time, fdp_hours, role_assigned, operating_position)
             VALUES (:crew_id, :flight_id, :duty_id, :duty_date,
-                :report_time, :debrief_time, :fdp_hours, :role_assigned)
+                :report_time, :debrief_time, :fdp_hours, :role_assigned, :operating_position)
         """), {
             "crew_id": crew_id, "flight_id": flight_id, "duty_id": duty_id,
             "duty_date": report_time.date(), "report_time": report_time,
             "debrief_time": debrief_time, "fdp_hours": fdp_hours,
-            "role_assigned": role_assigned,
+            "role_assigned": role_assigned, "operating_position": operating_position,
         })
     return duty_id
 
@@ -289,9 +289,11 @@ def test_roster_coverage_shows_cockpit_crew_and_free_text_occupants(_patch_engin
         remarks="VIP aboard",
     )
     _seed_duty(engine, cpt, flight_id, "CPT",
-               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position="COMMANDER")
     _seed_duty(engine, fo, flight_id, "FO",
-               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position="SECOND_PILOT")
 
     request = _resolved_request(
         "roster_coverage", date_from=dt.date(2026, 7, 1), date_to=dt.date(2026, 7, 31),
@@ -303,8 +305,8 @@ def test_roster_coverage_shows_cockpit_crew_and_free_text_occupants(_patch_engin
     assert row["Date"] == dt.date(2026, 7, 5)
     assert row["Flight"] == "EPE 786"
     assert row["Route"] == "KHI-LHE"
-    assert row["CPT"] == cpt
-    assert row["FO"] == fo
+    assert row["Commander"] == cpt
+    assert row["Second Pilot"] == fo
     assert row["Other occupants — operating"] == "Abdulghani (LM), 2x AME"
     assert row["Other occupants — non-operating"] == "Client rep"
     assert row["Remarks"] == "VIP aboard"
@@ -316,7 +318,7 @@ def test_roster_coverage_shows_cockpit_crew_and_free_text_occupants(_patch_engin
 
 def test_roster_coverage_marks_uncovered_only_for_missing_cockpit_seat(_patch_engine):
     """Occupant columns must never trigger UNCOVERED — only an unfilled
-    CPT or FO seat does."""
+    cockpit SEAT does."""
     engine = _patch_engine
     cpt = _add_crew("CPT")
     flight_id = _add_flight(
@@ -324,17 +326,98 @@ def test_roster_coverage_marks_uncovered_only_for_missing_cockpit_seat(_patch_en
         other_occupants_operating="2x AME",
     )
     _seed_duty(engine, cpt, flight_id, "CPT",
-               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0)
-    # FO deliberately left unassigned.
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position="COMMANDER")
+    # Second Pilot seat deliberately left unassigned.
 
     request = _resolved_request(
         "roster_coverage", date_from=dt.date(2026, 7, 1), date_to=dt.date(2026, 7, 31),
     )
     ds = reports.roster_coverage(request)
     row = dict(zip(ds.headers, ds.rows[0]))
-    assert row["CPT"] == cpt
-    assert row["FO"] == "UNCOVERED"
+    assert row["Commander"] == cpt
+    assert row["Second Pilot"] == "UNCOVERED"
     assert row["POB"] == 3  # 1 cockpit crew (CPT only) + 2x AME
+    assert any("uncovered cockpit seat" in note for note in ds.notes)
+
+
+def test_roster_coverage_reports_a_cpt_cpt_pair_by_seat_not_grade(_patch_engine):
+    """The production defect, reproduced (2026-08-31, flights 15/16):
+    a fully-crewed flight whose Second Pilot happens to be CPT-graded
+    rendered as TWO Commanders and an UNCOVERED Second Pilot, because
+    the split was on role_assigned.
+
+    The database makes the wrong reading impossible on its own terms —
+    uq_roster_flight_operating_position_active (migrations/016) forbids
+    two active COMMANDER rows on one flight — so a report showing two
+    is reporting something that cannot exist. Under the flight-deck
+    pair model a CPT in the Second Pilot seat is ordinary, not an
+    anomaly."""
+    engine = _patch_engine
+    commander = _add_crew("CPT")
+    second_pilot = _add_crew("CPT")
+    flight_id = _add_flight(
+        dt.datetime(2026, 7, 5, 5, 0), dt.datetime(2026, 7, 5, 8, 0),
+        origin="LHE", destination="KHI", flight_no="EPE 787",
+    )
+    _seed_duty(engine, commander, flight_id, "CPT",
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position="COMMANDER")
+    _seed_duty(engine, second_pilot, flight_id, "CPT",
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position="SECOND_PILOT")
+
+    request = _resolved_request(
+        "roster_coverage", date_from=dt.date(2026, 7, 1), date_to=dt.date(2026, 7, 31),
+    )
+    ds = reports.roster_coverage(request)
+    row = dict(zip(ds.headers, ds.rows[0]))
+
+    assert row["Commander"] == commander
+    assert row["Second Pilot"] == second_pilot
+    # The whole point: a fully-crewed flight must not read as half-empty.
+    assert "UNCOVERED" not in (row["Commander"], row["Second Pilot"])
+    assert not any("uncovered cockpit seat" in note for note in ds.notes)
+    assert row["POB"] == 2
+
+
+def test_roster_coverage_names_cockpit_crew_whose_seat_is_not_recorded(_patch_engine):
+    """A cockpit row with no operating_position belongs to no seat, and
+    must not silently disappear — that would under-report who is
+    aboard, which is worse than the bug this replaced.
+
+    Impossible to create through any code path since migration 016, and
+    there are zero such rows in production (checked 2026-08-28), so
+    this is defensive: pre-016 rows would otherwise vanish."""
+    engine = _patch_engine
+    commander = _add_crew("CPT")
+    stranded = _add_crew("FO")
+    flight_id = _add_flight(
+        dt.datetime(2026, 7, 5, 5, 0), dt.datetime(2026, 7, 5, 8, 0),
+        flight_no="EPE 786",
+    )
+    _seed_duty(engine, commander, flight_id, "CPT",
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position="COMMANDER")
+    _seed_duty(engine, stranded, flight_id, "FO",
+               dt.datetime(2026, 7, 5, 4, 15), dt.datetime(2026, 7, 5, 8, 15), fdp_hours=4.0,
+               operating_position=None)
+
+    request = _resolved_request(
+        "roster_coverage", date_from=dt.date(2026, 7, 1), date_to=dt.date(2026, 7, 31),
+    )
+    ds = reports.roster_coverage(request)
+    row = dict(zip(ds.headers, ds.rows[0]))
+
+    # Named, not placed: claiming a seat the data does not record would
+    # be a different kind of wrong.
+    assert stranded not in row["Commander"]
+    assert stranded not in row["Second Pilot"]
+    assert any(reports.SEAT_NOT_RECORDED in note and stranded in note for note in ds.notes)
+    # Aboard, so counted — and the seat they did not fill is still
+    # reported as uncovered rather than quietly covered by them.
+    assert row["POB"] == 2
+    assert row["Second Pilot"] == "UNCOVERED"
     assert any("uncovered cockpit seat" in note for note in ds.notes)
 
 
