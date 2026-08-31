@@ -52,7 +52,7 @@ from services import (assignment_service, auth_service, crew_service,
                       flight_service, roster_generator_service)
 from services.alert_summary import format_alert_lines
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
-from services.display_labels import crew_label, flight_label
+from services.display_labels import crew_label, flight_label, format_timestamps
 from services.time_entry import parse_hhmm
 
 st.set_page_config(page_title="Control Room", page_icon="🛫", layout="wide")
@@ -152,7 +152,7 @@ else:
                     "Commander": seats.get("COMMANDER") or "UNCOVERED",
                     "Second Pilot": seats.get("SECOND_PILOT") or "UNCOVERED",
                 })
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            st.dataframe(format_timestamps(pd.DataFrame(rows)), width="stretch", hide_index=True)
     except Exception as e:
         st.caption(f"Today's flights unavailable ({type(e).__name__}).")
 

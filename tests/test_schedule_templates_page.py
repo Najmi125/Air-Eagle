@@ -526,7 +526,21 @@ def test_unused_template_can_be_deleted_from_the_page(page_app):
     assert rts.get_all_rotation_codes() == []
 
 
-def test_delete_is_disabled_with_a_reason_once_the_template_is_used(page_app):
+def test_a_used_template_refuses_deletion_and_offers_the_change_path(page_app):
+    """Against a REAL database, with real instances generated from the
+    template — the DB-free version of this lives further down and fakes
+    the deletability lookup, so only this one proves the refusal comes
+    from migrations/019's own rule rather than from a fake.
+
+    Rewritten 2026-08-31. It previously asserted a single DISABLED
+    "Delete template" button; that button is no longer rendered at all,
+    because in production it could never be clicked for either template
+    and a control that can never work is a dead end rather than an
+    explanation. What is worth pinning is unchanged and is asserted
+    here: the template survives, the reason is still given, and the page
+    names the one action that IS available. Deleting the test would have
+    lost the coverage of a used template correctly refusing deletion,
+    which is the part that actually protects generated rotations."""
     from services import rotation_template_service as rts
 
     _seed_domestic_template("EPE-786-787")
@@ -534,11 +548,25 @@ def test_delete_is_disabled_with_a_reason_once_the_template_is_used(page_app):
 
     at = page_app.run()
 
-    delete_buttons = [b for b in at.button if b.label == "Delete template"]
-    assert len(delete_buttons) == 1
-    assert delete_buttons[0].disabled is True
-    assert any("rotation instance" in c.value for c in at.caption)
+    assert not at.exception, at.exception
+    assert not [b for b in at.button if b.label == "Delete template"], (
+        "a permanently unclickable button is a dead end, not an explanation"
+    )
+    assert any("rotation instance" in c.value for c in at.caption), (
+        "the refusal must still say WHY, naming the instances it protects"
+    )
+    assert any("Change this schedule" in c.value for c in at.caption), (
+        "refusing is not enough — the page must name the action that IS "
+        "available, which for a used template is a new version and nothing else"
+    )
+    assert any("Change this schedule" in m.value for m in at.markdown), (
+        "the change-a-schedule workflow itself must be present in the expander"
+    )
+
+    # The point of the whole rule: the template and its generated
+    # rotations are still there.
     assert rts.get_all_rotation_codes() == ["EPE-786-787"]
+    assert not rts.get_instances(rotation_code="EPE-786-787").empty
 
 
 # ------------------------------------------------------------------
@@ -616,8 +644,11 @@ def test_page_renders_when_the_deletability_lookup_is_missing_entirely(faked_rts
     at = _render_page()
 
     _assert_page_is_usable(at)
-    delete = [b for b in at.button if b.label == "Delete template"]
-    assert len(delete) == 1 and delete[0].disabled is True
+    # Since 2026-08-31 an unavailable delete renders NO button at all —
+    # a control that cannot be clicked is a dead end, not an
+    # explanation. The explanation is the caption, which is what has to
+    # survive here.
+    assert not [b for b in at.button if b.label == "Delete template"]
     assert any("could not be determined" in c.value for c in at.caption), (
         "a degraded delete control must say so, not look like an ordinary "
         "undeletable template"
@@ -643,9 +674,11 @@ def test_page_renders_against_a_database_without_migration_019(faked_rts, monkey
     assert any("could not be determined" in c.value for c in at.caption)
 
 
-def test_delete_control_is_enabled_normally_when_the_lookup_succeeds(faked_rts, monkeypatch):
+def test_delete_control_is_offered_when_the_template_really_is_deletable(faked_rts, monkeypatch):
     """The degradation must not swallow the healthy path — without this,
-    a permanently broken lookup would look exactly like a working one."""
+    a permanently broken lookup would look exactly like a working one,
+    and hiding the button when undeletable would look exactly like
+    never rendering it."""
     monkeypatch.setattr(faked_rts, "get_template_deletability", lambda tid: {
         "deletable": True, "reason": None, "instance_count": 0, "version_count": 1})
 
@@ -655,3 +688,34 @@ def test_delete_control_is_enabled_normally_when_the_lookup_succeeds(faked_rts, 
     delete = [b for b in at.button if b.label == "Delete template"]
     assert len(delete) == 1 and delete[0].disabled is False
     assert not any("could not be determined" in c.value for c in at.caption)
+
+
+def test_an_undeletable_template_offers_the_change_path_instead_of_a_dead_button(
+        faked_rts, monkeypatch):
+    """The operator's question, answered: why show a control that can
+    never work? In production this button was permanently disabled for
+    BOTH templates, because both have generated rotations.
+
+    The reason must still be visible — "why can't I remove this?" stays
+    answered in place — but the page must also point at the action that
+    IS available, which for a used template is the only one there is:
+    a new version. Templates are immutable once used, so "edit it"
+    would be advice that cannot be followed."""
+    monkeypatch.setattr(faked_rts, "get_template_deletability", lambda tid: {
+        "deletable": False,
+        "reason": "23 rotation instance(s) have been generated from this template.",
+        "instance_count": 23, "version_count": 1})
+
+    at = _render_page()
+
+    _assert_page_is_usable(at)
+    assert not [b for b in at.button if b.label == "Delete template"], (
+        "a permanently unclickable button is a dead end, not an explanation"
+    )
+    assert any("Cannot delete" in c.value for c in at.caption)
+    assert any("Change this schedule" in c.value for c in at.caption), (
+        "the page must name the action that IS available, not just refuse"
+    )
+    assert any("Change this schedule" in m.value for m in at.markdown), (
+        "the change-a-schedule workflow must be present in the expander"
+    )

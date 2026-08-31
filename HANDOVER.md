@@ -324,6 +324,40 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`schedule-change-path-and-display` merged into `main` (2026-08-31).**
+  **⚠ NEEDS A REBOOT FROM MANAGE APP AFTER DEPLOYING — FOURTH
+  OCCURRENCE.** `services/display_labels.py` is now imported by
+  `pages/5_Assistant.py`, `pages/6_Roster_Generation.py` and
+  `pages/7_Schedule_Templates.py`, none of which imported it before.
+  That is the rule's second limb — "a page importing a service module it
+  did not import before" — and it is the one that keeps catching people,
+  because no new file appears in the diff. **No migration.**
+
+  Six live-trial findings. Three were one question: **a template already
+  used is superseded by a new version, and there is no other way**
+  (legs immutable by trigger, template undeletable, existing
+  rotation_code rejected). Answered once so the three UI decisions could
+  follow from it rather than diverging. "Create a new version" was
+  RELOCATED into each template's expander as **Change this schedule**,
+  not removed — removing it would have left both live templates
+  permanently unchangeable. The dead Delete button is gone; the reason
+  stays and points at the change path. Expand and Review merged, with
+  drafts outside the window COUNTED. Timestamps read `25 Aug 2003z`
+  (CSV keeps ISO, deliberately). Day offset explained and kept.
+
+  **691/691 verified against real Postgres 16**, reachability clean,
+  including the used-template refusal against migrations/019's own
+  trigger — the one path the DB-free tests cannot prove, since they stub
+  the deletability lookup and would pass against a database with the
+  trigger dropped.
+
+  **Before touching `format_timestamps()`, read why `datetime` is
+  checked before `date`.** `datetime` subclasses `date`, so the naive
+  order converts every crew expiry column and a medical expiring
+  2026-07-01 renders as "01 Jul" — losing the digit that decides whether
+  a pilot may fly. A silent safety regression inside a formatting
+  change; mutation-tested.
+
 - **`roster-coverage-and-seat-fairness` merged into `main` (2026-08-28).**
   The third and fourth instances of seat-versus-grade:
   `reports.roster_coverage()` reported a fully-crewed CPT/CPT flight as
@@ -7560,3 +7594,168 @@ inference and not a diagnosis, which is why it is written down. **If
 that test fails on real Postgres, this is where to start** — it would
 mean the run was telling the truth and three green runs since were
 lucky.
+
+## 2026-08-31: six trial findings, and the one question three of them were
+
+### The question, answered once: how does a schedule change after it has been used?
+
+**It is superseded by a new version. There is no other way.** Verified
+against the triggers rather than inferred:
+
+* `rotation_template_legs` are immutable — the trigger raises on UPDATE
+  and DELETE. migrations/019 narrowed that to allow deletion only while
+  the template is unused.
+* `rotation_templates` rows are immutable except closing an open
+  `effective_until`, exactly once.
+* `create_new_version()` inserts the new version and closes the old one
+  the day before. Instances already generated keep pointing at the
+  version that produced them — that is the orphan prevention.
+* Deleting works only while a template is unused: no instances, sole
+  version.
+
+In production **both templates are in use** (EPE-786-787: 27 instances,
+EPE-802-804-805: 19). So both are permanently un-editable and
+un-deletable. Findings 3, 5 and 6 are three faces of that one fact, and
+were answered together to avoid three inconsistent answers.
+
+### 5 — "Create a new version" RELOCATED, not removed
+
+The operator asked for it off the page. Removing it would have left **no
+way to change a schedule already in use**: legs immutable, template
+undeletable, and the create form rejects an existing rotation_code
+outright (it already says "use 'Create a new version' below"). EPE 786
+could never have departed twenty minutes later.
+
+Pushed back with that; operator agreed. It now lives in each template's
+own expander as **"Change this schedule"** (`render_change_this_schedule()`).
+The page loses a third competing top-level form — the actual complaint —
+and the workflow is found next to the template it changes rather than by
+remembering a section further down. The old section-level rotation-code
+selectbox is gone: the choice is now which expander you opened.
+
+Widget keys that were fixed strings (`cv_effective_from`) are now keyed
+per rotation code, because the block renders once per template instead
+of once per page.
+
+### 3 — the Delete button is no longer rendered when it cannot work
+
+In production it was permanently disabled for **both** templates. The
+reason caption stays — "why can't I remove this?" must be answered in
+place — but the dead control is gone and the caption now points at the
+action that IS available, immediately above it.
+
+Deliberate asymmetry: a delete whose availability could not be
+DETERMINED (pre-019 database, stale module) still reads as a fault,
+because that is a different statement from "this template is in use".
+
+### 6 — sections merged, and the note the operator drafted was FALSE
+
+"Go back to Create a new template and edit" cannot be followed:
+templates cannot be edited, and an existing rotation_code is rejected.
+It would have walked a controller into an error message. Replaced with
+what is actually true — reject the draft, open the template, use
+**Change this schedule**.
+
+"Expand a window into drafts" and "Review drafts" are now one section.
+They previously had two ideas of "which window am I looking at": you
+picked dates in one and reviewed a list that ignored them entirely.
+
+**Drafts outside the window are COUNTED, not silently dropped.**
+Narrowing a view to hide work looks like tidying and isn't — a draft
+that scrolls out of sight is a draft nobody approves or rejects.
+
+### 2 — "not listing all flights" was FINDABILITY, measured not argued
+
+`tests/test_flt_schedule_selector.py` renders the real page at
+production's real size (103 flights, 5 legs/day, newest-first) and
+asserts the selector offers **every** flight the table holds, in order,
+oldest included. It does. There is no date filter, no default status
+filter and no LIMIT anywhere in that path, and production has **no two
+flights sharing a number, date and route**, so no label collision was
+hiding rows either.
+
+So the fix is a date window to narrow BY CHOICE — and **it defaults to
+every flight**. A window defaulting to "the last week or so" reads as
+helpful and is the same mistake in a new place: recording actuals is
+what you do about a flight that already operated, sometimes weeks late,
+so a controller chasing a three-week-old actual would meet "No flights
+in this date range" and conclude the flight was gone. Anything a
+narrowing does hide is counted in a caption.
+
+Also fixed in passing: the `format_func` did
+`flights_df[flights_df["flight_id"] == fid].iloc[0]` per option — an
+O(n) scan inside an O(n) loop, ~10,600 row scans per render, on a page a
+controller uses daily. `display_labels.flight_labels()` exists for
+exactly this and was not being used.
+
+### 1 — `2003z`, and the two exclusions that matter
+
+`display_labels.utc_stamp()` renders `25 Aug 2003z`; `format_timestamps()`
+converts a whole frame for display. **Seconds are dropped everywhere**
+(operator decision): FDP, rest and the D7.1.2 buffers are all minutes,
+and `:35` implies precision the data does not have.
+
+**PLAIN DATES ARE NOT TOUCHED, and this is the load-bearing part.**
+`25 Aug 2003z` drops the year, which is right for a schedule read inside
+a month-long window and *wrong* for a crew qualification — rendering a
+medical expiring 2026-07-01 as "01 Jul" removes the digit that says
+whether the pilot may fly. Columns are detected by dtype, and the
+`isinstance` order puts `datetime` before `date` precisely because
+datetime subclasses date. `dt.time` IS converted: a bare clock has no
+year to lose.
+
+**THE CSV EXPORT KEEPS ISO, DELIBERATELY** (operator decision), and
+`reporting.dataset_to_csv()` now says so in its own docstring. A CSV is
+a machine-readable regulatory artefact that outlives its session:
+`2026-08-25 20:03:35` sorts as text, parses anywhere, and carries the
+year. Anyone "fixing" the inconsistency with the screen is proposing to
+drop the year from a compliance record.
+
+`flight_label()` gained the time — `EPE 786 · 20 Aug 1900z`. Production
+has no collisions today, but a rotation flying the same number twice in
+one day is ordinary for a cargo operator and would have rendered as one
+duplicated entry, which looks exactly like a missing flight.
+
+### 4 — day offset explained, and kept
+
+**Every leg in production carries `day_offset = 0`** — all five, across
+both templates; Air Eagle's rotations are same-day. Kept anyway: an
+overnight sector is ordinary for a cargo operator, removing the column
+would need a migration, and it costs one field. Help text now says what
+it means, including the part that is easy to get wrong — it shifts the
+DEPARTURE, so a leg departing 2300 and landing 0130 is still offset 0.
+
+### Mutation-tested
+
+Four mutations, each failing the suite: the formatter converting plain
+dates (expiry years lost), `flight_label` losing the time again, the
+hidden-flight count removed, and the dead Delete button restored.
+
+330 passed, 361 skipped locally; reachability clean.
+
+### The one test that had to be rewritten rather than deleted
+
+`test_delete_is_disabled_with_a_reason_once_the_template_is_used`
+asserted a single DISABLED "Delete template" button, which is exactly
+the behaviour this change replaced — so it failed on real Postgres
+finding zero buttons. It is now
+`test_a_used_template_refuses_deletion_and_offers_the_change_path`.
+
+Deleting it would have been the easy move and would have lost real
+coverage: it is the only test that proves a USED template refuses
+deletion against migrations/019's own rule rather than against a faked
+deletability lookup. What it pins now is what actually matters — the
+template and its generated rotations survive, the refusal still says
+why, and the page names the one action that is available.
+
+**A test pinning behaviour you deliberately changed is stale, not
+wrong.** Rewrite it to the new contract; deleting it silently drops
+whatever else it was covering.
+
+### ⚠ Reboot required
+
+`services/display_labels.py` is now imported by pages 5, 6 and 7, which
+did not import it before. That is the second limb of the
+stale-`sys.modules` rule — "a page importing a service module it did not
+import before" — so this needs a **reboot from Manage app after
+deploying**. No migration.

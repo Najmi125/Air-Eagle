@@ -19,6 +19,8 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
+from services.display_labels import format_timestamps
+
 from services import auth_service
 from services import rotation_template_service as rts
 from services.time_entry import format_hhmm as _format_hhmm, parse_hhmm as _parse_hhmm
@@ -85,7 +87,21 @@ def _render_leg_rows(key_prefix: str, defaults: list | None = None) -> list[dict
         destination = cols[2].text_input("Destination", value=d.get("destination", "") or "", key=f"{key_prefix}_dest_{i}")
         dep_time = cols[3].text_input("Dep (UTC HHMM)", value=_format_hhmm(d.get("dep_time")), key=f"{key_prefix}_dep_{i}")
         arr_time = cols[4].text_input("Arr (UTC HHMM)", value=_format_hhmm(d.get("arr_time")), key=f"{key_prefix}_arr_{i}")
-        day_offset = cols[5].number_input("Day offset", min_value=0, value=int(d.get("day_offset", 0)), step=1, key=f"{key_prefix}_offset_{i}")
+        # Unexplained until 2026-08-31, and every leg in production
+        # carries 0 — both of Air Eagle's rotations are same-day. Kept
+        # rather than removed: an overnight sector is an ordinary thing
+        # for a cargo operator, dropping the column would need a
+        # migration, and it costs one field. Explained and visually
+        # demoted instead, which is the actual complaint.
+        day_offset = cols[5].number_input(
+            "Day offset", min_value=0, value=int(d.get("day_offset", 0)), step=1,
+            key=f"{key_prefix}_offset_{i}",
+            help="Days after the rotation's own date that this leg DEPARTS. "
+                 "Leave 0 unless the rotation runs past midnight — a leg "
+                 "departing the following day is 1. It shifts the departure, "
+                 "not the arrival: a leg that departs 2300 and lands 0130 is "
+                 "still offset 0.",
+        )
         domestic_index = 0 if d.get("domestic", True) else 1
         domestic = cols[6].radio("Domestic/Intl", ["Domestic", "International"], index=domestic_index,
                                   key=f"{key_prefix}_domestic_{i}", horizontal=True)
@@ -179,204 +195,35 @@ def _current_version_row(rotation_code: str):
 LEG_DISPLAY_COLUMNS = ["leg_order", "flight_no", "origin", "destination", "dep_time", "arr_time", "day_offset", "domestic"]
 
 
-# ==================================================================
-# 1. View and create templates
-# ==================================================================
-st.header("1. View and create templates")
+def render_change_this_schedule(cv_code, app_user):
+    """The "Create a new version" workflow, rendered inside a template's
+    own expander instead of as a page-level section.
 
-st.subheader("Existing rotation templates")
-rotation_codes = rts.get_all_rotation_codes()
-if not rotation_codes:
-    st.info("No rotation templates yet — create one below.")
-else:
-    for code in rotation_codes:
-        with st.expander(code):
-            versions = rts.get_versions(code)
-            st.dataframe(
-                versions[["version", "effective_from", "effective_until", "description"]],
-                width="stretch", hide_index=True,
-            )
-            current = _current_version_row(code)
-            if current is not None:
-                st.caption(f"Current version: v{int(current['version'])}")
-                legs = rts.get_template_legs(int(current["id"]))
-                st.dataframe(legs[LEG_DISPLAY_COLUMNS], width="stretch", hide_index=True)
-            if st.checkbox("Show all versions' legs", key=f"show_all_legs_{code}"):
-                for _, v in versions.iterrows():
-                    st.markdown(f"**v{int(v['version'])}**")
-                    vlegs = rts.get_template_legs(int(v["id"]))
-                    st.dataframe(vlegs[LEG_DISPLAY_COLUMNS], width="stretch", hide_index=True)
+    RELOCATED, NOT REMOVED (operator decision, 2026-08-31). The request
+    was to take it off the page; the verified consequence of actually
+    removing it is that a schedule already in use could never change
+    again — rotation_template_legs are immutable by trigger, a template
+    with instances cannot be deleted, and the create form rejects an
+    existing rotation_code outright. Both live templates are in that
+    state, so removal would have meant EPE 786 could never depart
+    twenty minutes later.
 
-            # Separated and labelled (2026-08-19). This control sat
-            # immediately below the "Show all versions' legs" checkbox
-            # with nothing between them, so it read as belonging to that
-            # checkbox — a destructive action appearing to be part of a
-            # display toggle. The expander itself is labelled only with
-            # the rotation code, which gives no hint it contains one.
-            st.divider()
-            st.markdown("**Delete this template**")
+    Putting it here answers the operator's actual complaint — three
+    template forms competing for attention on one page — while keeping
+    the only mechanism there is. It also sits next to the thing it
+    changes, so it is found by someone looking at the template they
+    want to change rather than by remembering a section further down.
 
-            # Delete, only for a template that has produced nothing —
-            # undoing a mistaken creation, not a retirement mechanism.
-            # A rotation that has run and should stop is closed with
-            # effective_until; one being replaced is superseded by a new
-            # version. This covers only the remaining case: a template
-            # referenced by nothing at all, where there is no history to
-            # protect. See migrations/019 for why the rule lives in the
-            # database trigger rather than here.
-            #
-            # The control is shown DISABLED with the specific reason
-            # rather than hidden, so "why can't I remove this?" is
-            # answered in place instead of looking like a missing
-            # feature.
-            # Wrapped because this whole block is an AFFORDANCE, not the
-            # page's job. Everything above it — the version table, the
-            # current legs, and further down the expand and review
-            # workflows — is what a controller actually comes here for.
-            # A convenience that decides whether one button is greyed
-            # out must never be able to take that off the air.
-            #
-            # It did, on 2026-08-19: the deployed page raised
-            # AttributeError here and the entire Schedule Templates page
-            # stopped rendering, leaving the operator unable to view,
-            # create, expand or review anything, and unable to clean up
-            # the very templates this feature exists to remove.
-            #
-            # Degrading also removes the hard migration prerequisite
-            # this call had introduced. get_template_deletability()
-            # calls migrations/019's rotation_template_is_deletable(),
-            # so against a pre-019 database the page previously failed
-            # to render at all rather than merely failing to delete.
-            # Now it renders with delete unavailable, which is the
-            # correct behaviour for a database that predates the
-            # feature.
-            #
-            # Deliberately NOT silent: the reason is shown, so a
-            # degraded delete control is visibly degraded rather than
-            # looking like a template that happens to be undeletable.
-            try:
-                if len(versions) == 1:
-                    deletability = rts.get_template_deletability(int(versions.iloc[0]["id"]))
-                else:
-                    deletability = {
-                        "deletable": False,
-                        "reason": (
-                            f"{code} has {len(versions)} versions. Only a sole-version template "
-                            f"can be deleted — removing one version of a chain would leave its "
-                            f"predecessor permanently closed, since effective_until can only be "
-                            f"closed once. Supersede it with a new version instead."
-                        ),
-                    }
-            except Exception as e:
-                deletability = {
-                    "deletable": False,
-                    "reason": (
-                        f"delete availability could not be determined ({type(e).__name__}: {e}). "
-                        f"The rest of this page is unaffected. If this persists, check that "
-                        f"migrations/019 has been applied and reboot the app."
-                    ),
-                }
-            if not deletability["deletable"]:
-                st.caption(f"Cannot delete: {deletability['reason']}")
-            if st.button("Delete template", key=f"delete_{code}",
-                         disabled=not deletability["deletable"]):
-                try:
-                    rts.delete_template(int(versions.iloc[0]["id"]), app_user=app_user)
-                except ValueError as e:
-                    # Already a controller-facing sentence naming the
-                    # actual blocker — same handling as every other
-                    # ValueError on this page. Reachable even though the
-                    # button is disabled when undeletable: the disabled
-                    # state is computed on the previous render, so an
-                    # instance created in between lands here.
-                    st.error(str(e))
-                except Exception as e:
-                    st.error(f"Could not delete {code}: {e}")
-                else:
-                    st.success(f"Template {code} deleted — it had produced no rotations.")
-                    st.rerun()
-
-st.subheader("Create a new template")
-with st.form("create_template_form"):
-    # Generation-keyed like the leg rows, and for the same reason: these
-    # fields were previously unkeyed, which does NOT mean stateless —
-    # Streamlit auto-keys them, so after a save the form still held the
-    # previous template's code, description and weekdays. The reported
-    # corruption was in the legs, but "wherever the controller didn't
-    # overwrite every field" applies just as much here; a description or
-    # a day-of-week silently carried into the next template is the same
-    # defect with a quieter symptom.
-    #
-    # Explicit keys also disambiguate these from the "create new
-    # version" form below, which renders widgets with identical labels
-    # ("Description", "Days of week *"). Label-based lookup cannot tell
-    # them apart once a template exists.
-    ct_prefix = f"ct_{st.session_state.template_form_generation}"
-
-    ct_rotation_code = st.text_input("Rotation code *", key=f"{ct_prefix}_rotation_code")
-    ct_description = st.text_input("Description", key=f"{ct_prefix}_description")
-    ct_weekday_labels = st.multiselect(
-        "Days of week *", [label for label, _ in WEEKDAY_OPTIONS], key=f"{ct_prefix}_days")
-    ct_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in ct_weekday_labels]
-    ct_effective_from = st.date_input(
-        "Effective from *", value=dt.date.today(), key=f"{ct_prefix}_effective_from")
-    ct_open_ended = st.checkbox(
-        "Open-ended (no end date)", value=True, key=f"{ct_prefix}_open_ended")
-    ct_effective_until = None if ct_open_ended else st.date_input(
-        "Effective until", value=dt.date.today(), key=f"{ct_prefix}_effective_until")
-    ct_meal_provided = st.checkbox("Meal provided", value=True, key=f"{ct_prefix}_meal")
-    ct_snack_provided = st.checkbox("Snack provided", value=True, key=f"{ct_prefix}_snack")
-    st.markdown("**Legs**")
-    ct_leg_rows = _render_leg_rows(ct_prefix)
-
-    ct_submitted = st.form_submit_button("Create template")
-
-    if ct_submitted:
-        if not ct_rotation_code.strip():
-            st.error("Rotation code is required.")
-        elif not ct_days_of_week:
-            st.error("At least one day of week is required.")
-        elif ct_rotation_code.strip() in rts.get_all_rotation_codes():
-            st.error(
-                f"A template with rotation_code {ct_rotation_code.strip()!r} already "
-                f"exists — use 'Create a new version' below instead."
-            )
-        else:
-            ct_legs, ct_leg_error = _collect_and_validate_legs(ct_leg_rows)
-            if ct_leg_error:
-                st.error(ct_leg_error)
-            else:
-                try:
-                    rts.create_template(
-                        rotation_code=ct_rotation_code.strip(), days_of_week=ct_days_of_week,
-                        legs=ct_legs, effective_from=ct_effective_from,
-                        meal_provided=ct_meal_provided, snack_provided=ct_snack_provided,
-                        description=ct_description.strip() or None,
-                        effective_until=ct_effective_until,
-                        app_user=app_user,
-                    )
-                except ValueError as e:
-                    st.error(str(e))
-                except Exception as e:
-                    st.error(f"Could not create template: {e}")
-                else:
-                    st.success(f"Template {ct_rotation_code.strip()} v1 created with {len(ct_legs)} leg(s).")
-                    # Retire this form's widget keys so the next
-                    # template starts genuinely blank rather than
-                    # inheriting whatever was just saved.
-                    st.session_state.template_form_generation += 1
-                    st.rerun()
-
-st.subheader("Create a new version")
-if not rotation_codes:
-    st.info("No existing templates to version yet.")
-else:
-    cv_code = st.selectbox("Rotation code", rotation_codes, key="cv_code")
+    cv_code is the expander's own rotation code. This section used to
+    open with a selectbox choosing it; that choice is now made by which
+    expander the controller opened, which is why the selectbox is gone
+    rather than merely hidden.
+    """
     cv_current = _current_version_row(cv_code)
     if cv_current is None:
         st.warning(f"{cv_code} has no open version — cannot create a new version.")
     else:
-        cv_effective_from = st.date_input("New version effective from *", value=dt.date.today(), key="cv_effective_from")
+        cv_effective_from = st.date_input("New version effective from *", value=dt.date.today(), key=f"cv_effective_from_{cv_code}")
         cv_day_before = cv_effective_from - dt.timedelta(days=1)
         # THE least-obvious behaviour on this page: create_new_version()
         # closes the CURRENT version's effective_until to the day before
@@ -495,12 +342,248 @@ else:
                     st.session_state.template_form_generation += 1
                     st.rerun()
 
+
+# ==================================================================
+# 1. View and create templates
+# ==================================================================
+st.header("1. View and create templates")
+
+st.subheader("Existing rotation templates")
+rotation_codes = rts.get_all_rotation_codes()
+if not rotation_codes:
+    st.info("No rotation templates yet — create one below.")
+else:
+    for code in rotation_codes:
+        with st.expander(code):
+            versions = rts.get_versions(code)
+            st.dataframe(
+                versions[["version", "effective_from", "effective_until", "description"]],
+                width="stretch", hide_index=True,
+            )
+            current = _current_version_row(code)
+            if current is not None:
+                st.caption(f"Current version: v{int(current['version'])}")
+                legs = rts.get_template_legs(int(current["id"]))
+                st.dataframe(format_timestamps(legs[LEG_DISPLAY_COLUMNS]), width="stretch", hide_index=True)
+            if st.checkbox("Show all versions' legs", key=f"show_all_legs_{code}"):
+                for _, v in versions.iterrows():
+                    st.markdown(f"**v{int(v['version'])}**")
+                    vlegs = rts.get_template_legs(int(v["id"]))
+                    st.dataframe(format_timestamps(vlegs[LEG_DISPLAY_COLUMNS]), width="stretch", hide_index=True)
+
+            # Separated and labelled (2026-08-19). This control sat
+            # immediately below the "Show all versions' legs" checkbox
+            # with nothing between them, so it read as belonging to that
+            # checkbox — a destructive action appearing to be part of a
+            # display toggle. The expander itself is labelled only with
+            # the rotation code, which gives no hint it contains one.
+            # HOW A SCHEDULE CHANGES, answered once and in one place.
+            # A template whose legs have been used cannot be edited
+            # (rotation_template_legs are immutable by trigger) and
+            # cannot be deleted (migrations/019's own rule). Creating a
+            # new version is the ONLY way, and it is offered here rather
+            # than as a page-level section so it is found next to the
+            # template it changes.
+            st.divider()
+            st.markdown("**Change this schedule**")
+            st.caption(
+                "A template cannot be edited once rotations have been "
+                "generated from it — that is what stops a change from "
+                "rewriting history already flown. Instead, create a new "
+                "version: it takes effect from a date you choose, and the "
+                "current version is closed the day before. Rotations "
+                "already generated keep the version that produced them."
+            )
+            render_change_this_schedule(code, app_user)
+
+            st.divider()
+            st.markdown("**Delete this template**")
+
+            # Delete, only for a template that has produced nothing —
+            # undoing a mistaken creation, not a retirement mechanism.
+            # A rotation that has run and should stop is closed with
+            # effective_until; one being replaced is superseded by a new
+            # version. This covers only the remaining case: a template
+            # referenced by nothing at all, where there is no history to
+            # protect. See migrations/019 for why the rule lives in the
+            # database trigger rather than here.
+            #
+            # The control is shown DISABLED with the specific reason
+            # rather than hidden, so "why can't I remove this?" is
+            # answered in place instead of looking like a missing
+            # feature.
+            # Wrapped because this whole block is an AFFORDANCE, not the
+            # page's job. Everything above it — the version table, the
+            # current legs, and further down the expand and review
+            # workflows — is what a controller actually comes here for.
+            # A convenience that decides whether one button is greyed
+            # out must never be able to take that off the air.
+            #
+            # It did, on 2026-08-19: the deployed page raised
+            # AttributeError here and the entire Schedule Templates page
+            # stopped rendering, leaving the operator unable to view,
+            # create, expand or review anything, and unable to clean up
+            # the very templates this feature exists to remove.
+            #
+            # Degrading also removes the hard migration prerequisite
+            # this call had introduced. get_template_deletability()
+            # calls migrations/019's rotation_template_is_deletable(),
+            # so against a pre-019 database the page previously failed
+            # to render at all rather than merely failing to delete.
+            # Now it renders with delete unavailable, which is the
+            # correct behaviour for a database that predates the
+            # feature.
+            #
+            # Deliberately NOT silent: the reason is shown, so a
+            # degraded delete control is visibly degraded rather than
+            # looking like a template that happens to be undeletable.
+            try:
+                if len(versions) == 1:
+                    deletability = rts.get_template_deletability(int(versions.iloc[0]["id"]))
+                else:
+                    deletability = {
+                        "deletable": False,
+                        "reason": (
+                            f"{code} has {len(versions)} versions. Only a sole-version template "
+                            f"can be deleted — removing one version of a chain would leave its "
+                            f"predecessor permanently closed, since effective_until can only be "
+                            f"closed once. Supersede it with a new version instead."
+                        ),
+                    }
+            except Exception as e:
+                deletability = {
+                    "deletable": False,
+                    "reason": (
+                        f"delete availability could not be determined ({type(e).__name__}: {e}). "
+                        f"The rest of this page is unaffected. If this persists, check that "
+                        f"migrations/019 has been applied and reboot the app."
+                    ),
+                }
+            # A control that can never be clicked is not an
+            # explanation, it is a dead end (operator, 2026-08-31): in
+            # production this button is permanently disabled for BOTH
+            # templates, because both have generated rotations. The
+            # reason is still shown — "why can't I remove this?" must
+            # stay answered in place — but the button itself is no
+            # longer rendered, and the sentence points at the action
+            # that IS available, immediately above.
+            #
+            # Note the asymmetry with the degraded case: if deletability
+            # could not be DETERMINED, that is a fault to surface rather
+            # than a settled answer, so it reads differently.
+            if not deletability["deletable"]:
+                st.caption(f"Cannot delete: {deletability['reason']}")
+                st.caption(
+                    "Nothing to do here — use **Change this schedule** above "
+                    "to alter it, or set an end date on its current version "
+                    "to retire it."
+                )
+            elif st.button("Delete template", key=f"delete_{code}"):
+                try:
+                    rts.delete_template(int(versions.iloc[0]["id"]), app_user=app_user)
+                except ValueError as e:
+                    # Already a controller-facing sentence naming the
+                    # actual blocker — same handling as every other
+                    # ValueError on this page. Reachable even though the
+                    # button is disabled when undeletable: the disabled
+                    # state is computed on the previous render, so an
+                    # instance created in between lands here.
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Could not delete {code}: {e}")
+                else:
+                    st.success(f"Template {code} deleted — it had produced no rotations.")
+                    st.rerun()
+
+st.subheader("Create a new template")
+with st.form("create_template_form"):
+    # Generation-keyed like the leg rows, and for the same reason: these
+    # fields were previously unkeyed, which does NOT mean stateless —
+    # Streamlit auto-keys them, so after a save the form still held the
+    # previous template's code, description and weekdays. The reported
+    # corruption was in the legs, but "wherever the controller didn't
+    # overwrite every field" applies just as much here; a description or
+    # a day-of-week silently carried into the next template is the same
+    # defect with a quieter symptom.
+    #
+    # Explicit keys also disambiguate these from the "create new
+    # version" form below, which renders widgets with identical labels
+    # ("Description", "Days of week *"). Label-based lookup cannot tell
+    # them apart once a template exists.
+    ct_prefix = f"ct_{st.session_state.template_form_generation}"
+
+    ct_rotation_code = st.text_input("Rotation code *", key=f"{ct_prefix}_rotation_code")
+    ct_description = st.text_input("Description", key=f"{ct_prefix}_description")
+    ct_weekday_labels = st.multiselect(
+        "Days of week *", [label for label, _ in WEEKDAY_OPTIONS], key=f"{ct_prefix}_days")
+    ct_days_of_week = [n for label, n in WEEKDAY_OPTIONS if label in ct_weekday_labels]
+    ct_effective_from = st.date_input(
+        "Effective from *", value=dt.date.today(), key=f"{ct_prefix}_effective_from")
+    ct_open_ended = st.checkbox(
+        "Open-ended (no end date)", value=True, key=f"{ct_prefix}_open_ended")
+    ct_effective_until = None if ct_open_ended else st.date_input(
+        "Effective until", value=dt.date.today(), key=f"{ct_prefix}_effective_until")
+    ct_meal_provided = st.checkbox("Meal provided", value=True, key=f"{ct_prefix}_meal")
+    ct_snack_provided = st.checkbox("Snack provided", value=True, key=f"{ct_prefix}_snack")
+    st.markdown("**Legs**")
+    ct_leg_rows = _render_leg_rows(ct_prefix)
+
+    ct_submitted = st.form_submit_button("Create template")
+
+    if ct_submitted:
+        if not ct_rotation_code.strip():
+            st.error("Rotation code is required.")
+        elif not ct_days_of_week:
+            st.error("At least one day of week is required.")
+        elif ct_rotation_code.strip() in rts.get_all_rotation_codes():
+            st.error(
+                f"A template with rotation_code {ct_rotation_code.strip()!r} already "
+                f"exists — use 'Create a new version' below instead."
+            )
+        else:
+            ct_legs, ct_leg_error = _collect_and_validate_legs(ct_leg_rows)
+            if ct_leg_error:
+                st.error(ct_leg_error)
+            else:
+                try:
+                    rts.create_template(
+                        rotation_code=ct_rotation_code.strip(), days_of_week=ct_days_of_week,
+                        legs=ct_legs, effective_from=ct_effective_from,
+                        meal_provided=ct_meal_provided, snack_provided=ct_snack_provided,
+                        description=ct_description.strip() or None,
+                        effective_until=ct_effective_until,
+                        app_user=app_user,
+                    )
+                except ValueError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Could not create template: {e}")
+                else:
+                    st.success(f"Template {ct_rotation_code.strip()} v1 created with {len(ct_legs)} leg(s).")
+                    # Retire this form's widget keys so the next
+                    # template starts genuinely blank rather than
+                    # inheriting whatever was just saved.
+                    st.session_state.template_form_generation += 1
+                    st.rerun()
+
+
+
 st.divider()
 
 # ==================================================================
-# 2. Expand a window into drafts
+# 2. Expand and review drafts
 # ==================================================================
-st.header("2. Expand a window into drafts")
+# MERGED (operator, 2026-08-31). Expanding and reviewing were two
+# sections with two ideas of "which window am I looking at": you picked
+# dates up here, and then reviewed a draft list that ignored them
+# entirely. One place to pick a window and see what it produces.
+st.header("2. Expand and review drafts")
+
+# Hoisted out of the `else` below so the review half can read them even
+# when there are no templates yet — the window is now shared, not the
+# expand section's private state.
+expand_from = dt.date.today()
+expand_to = dt.date.today() + dt.timedelta(days=27)
 
 rotation_codes = rts.get_all_rotation_codes()  # re-fetch: workflow 1 above may have just added one
 if not rotation_codes:
@@ -508,8 +591,8 @@ if not rotation_codes:
 else:
     expand_choice = st.selectbox("Rotation code", ["All rotation codes"] + rotation_codes, key="expand_code")
     exp_col1, exp_col2 = st.columns(2)
-    expand_from = exp_col1.date_input("From", value=dt.date.today(), key="expand_from")
-    expand_to = exp_col2.date_input("To", value=dt.date.today() + dt.timedelta(days=27), key="expand_to")
+    expand_from = exp_col1.date_input("From", value=expand_from, key="expand_from")
+    expand_to = exp_col2.date_input("To", value=expand_to, key="expand_to")
 
     st.caption(
         "Expanding only fills gaps — a date that already has a draft or "
@@ -537,19 +620,44 @@ else:
             st.info("No new instances — every date in this window already has one.")
 
 st.divider()
+st.subheader("Review drafts")
 
-# ==================================================================
-# 3. Review drafts
-# ==================================================================
-st.header("3. Review drafts")
+# The note the operator asked for, with its advice CORRECTED. The draft
+# said "go back to Create a new template and edit" — which cannot be
+# done: rotation_template_legs are immutable by trigger, and the create
+# form rejects an existing rotation_code outright, so that sentence
+# would have walked a controller into an error message. A template
+# changes by being superseded, and nothing else.
+st.info(
+    "Verify these before approving. If a correction is needed, reject the "
+    "draft and open the template above — use **Change this schedule** to "
+    "create a new version. A template cannot be edited once instances "
+    "exist, so there is nothing to go back and change in place."
+)
 
 review_filter_code = st.selectbox("Filter by rotation code", ["All"] + rts.get_all_rotation_codes(), key="review_filter_code")
 drafts = rts.get_instances(status="DRAFT")
 if review_filter_code != "All":
     drafts = drafts[drafts["rotation_code"] == review_filter_code]
 
+# Scoped to the SAME window as the expansion above — that is the point
+# of merging the two. But narrowing a view can hide work, and a draft
+# that scrolls out of sight is a draft nobody approves or rejects, so
+# anything outside the window is COUNTED rather than silently dropped.
+outside_window = 0
+if not drafts.empty:
+    in_window = drafts["rotation_date"].between(expand_from, expand_to)
+    outside_window = int((~in_window).sum())
+    drafts = drafts[in_window]
+
+if outside_window:
+    st.warning(
+        f"{outside_window} further draft(s) fall outside {expand_from} – "
+        f"{expand_to} and are not shown. Widen the window above to review them."
+    )
+
 if drafts.empty:
-    st.info("No drafts to review.")
+    st.info("No drafts to review in this window.")
 else:
     visible_ids = [int(i) for i in drafts["id"].tolist()]
 

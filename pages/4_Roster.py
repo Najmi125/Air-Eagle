@@ -23,7 +23,8 @@ import streamlit as st
 from services import crew_service, flight_service, assignment_service, auth_service
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
 from services.alert_summary import format_alert_lines
-from services.display_labels import crew_label, flight_labels as build_flight_labels
+from services.display_labels import (crew_label, format_timestamps,
+                                      flight_labels as build_flight_labels)
 
 st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
 app_user = auth_service.require_login()
@@ -53,7 +54,7 @@ else:
             })
     if roster_rows:
         import pandas as pd
-        st.dataframe(pd.DataFrame(roster_rows), width="stretch")
+        st.dataframe(format_timestamps(pd.DataFrame(roster_rows)), width="stretch")
     else:
         st.info("No crew assigned yet.")
 

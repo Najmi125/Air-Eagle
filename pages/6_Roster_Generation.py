@@ -34,6 +34,7 @@ import pandas as pd
 import streamlit as st
 
 from services import assignment_service, auth_service, crew_service, roster_generator_service, rotation_template_service
+from services.display_labels import format_timestamps
 from services.roster_generator_service import SEATS
 
 st.set_page_config(page_title="Roster Generation", page_icon="⚙️", layout="wide")
@@ -106,7 +107,9 @@ if open_uncovered.empty:
     st.success("No open uncovered seats in this window.")
 else:
     st.error(f"{len(open_uncovered)} seat(s) currently uncovered — action needed.")
-    st.dataframe(pd.DataFrame([
+    # "Since" is a real timestamp; "Date" is a plain date and is left
+    # alone by format_timestamps, which is what keeps its year.
+    st.dataframe(format_timestamps(pd.DataFrame([
         {
             "Rotation": row["rotation_code"],
             "Date": row["rotation_date"],
@@ -115,7 +118,7 @@ else:
             "Since": row["generated_at"],
         }
         for _, row in open_uncovered.iterrows()
-    ]), width="stretch", hide_index=True)
+    ])), width="stretch", hide_index=True)
 
 # ------------------------------------------------------------------
 # Pre-generate preview — the same APPROVED + window filter
