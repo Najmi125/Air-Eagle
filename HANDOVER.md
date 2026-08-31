@@ -324,6 +324,31 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`roster-coverage-and-seat-fairness` merged into `main` (2026-08-28).**
+  The third and fourth instances of seat-versus-grade:
+  `reports.roster_coverage()` reported a fully-crewed CPT/CPT flight as
+  two Commanders and an UNCOVERED Second Pilot, and
+  `_seed_duty_counts()` measured total workload while its docstring
+  claimed seat workload. **669/669 verified against real Postgres 16**,
+  reachability clean.
+
+  **No reboot, no migration**, confirmed structurally: the only added
+  file is a test, no added `import`/`from` line anywhere outside
+  `tests/`, no page changed.
+
+  **`_seed_duty_counts()` CHANGES GENERATED ROSTERS.** Operator decision
+  about what fair means, not a bug fix — a CPT who has flown many Second
+  Pilot duties now sorts as under-used for Commander. If generated
+  rosters look different from the trial's, this is why. Fatigue is not
+  what it balances; the FTL gate is untouched.
+
+  **`tests/test_seat_vs_grade.py` is the one place to look** before
+  writing anything that derives seat occupancy — named after the
+  distinction rather than scattered through three modules' suites,
+  and DB-free so it runs where the DB-gated checks skip. It caught an
+  `UnboundLocalError` on a branch production data cannot reach, which
+  every DB-gated test would have skipped.
+
 - **`stop-auditing-generator-trials` merged into `main` (2026-08-26).**
   Operator decision by Arif: the audit trail records decisions, not
   options considered. The generator's internal candidate search no
