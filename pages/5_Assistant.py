@@ -30,6 +30,7 @@ import pandas as pd
 import streamlit as st
 
 from services import crew_service, auth_service
+from services.display_labels import format_timestamps
 from services.assistant import query_parser, reports
 from services.reporting import AIR_EAGLE, dataset_to_xlsx, report_filename
 
@@ -186,7 +187,10 @@ st.info("Understood as: " + " · ".join(parts))
 dataset = reports.run_report(result, raw_question)
 
 if dataset.rows:
-    st.dataframe(pd.DataFrame(dataset.rows, columns=dataset.headers), width="stretch")
+    # Screen only. The CSV/XLSX downloads below deliberately keep ISO
+    # timestamps — see reporting.dataset_to_csv().
+    st.dataframe(format_timestamps(pd.DataFrame(dataset.rows, columns=dataset.headers)),
+                 width="stretch")
 else:
     st.info("No matching records.")
 

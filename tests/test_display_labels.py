@@ -68,8 +68,8 @@ def test_crew_labels_maps_every_row():
 
 # ---------------- flights ----------------
 
-def test_flight_label_leads_with_flight_number_and_date():
-    assert flight_label(_flight()) == "EPE 786 · 20 Aug"
+def test_flight_label_leads_with_flight_number_date_and_time():
+    assert flight_label(_flight()) == "EPE 786 · 20 Aug 1900z"
 
 
 def test_flight_label_includes_the_date_because_numbers_repeat_daily():
@@ -80,9 +80,20 @@ def test_flight_label_includes_the_date_because_numbers_repeat_daily():
     assert a != b
 
 
+def test_flight_label_distinguishes_two_departures_on_the_same_day():
+    """A rotation flying the same number twice in a day is ordinary for
+    a cargo operator, and date alone cannot tell those two apart. That
+    collision would render as one duplicated entry in a selector — which
+    looks exactly like a missing flight."""
+    morning = flight_label(_flight(dep=dt.datetime(2026, 8, 20, 6, 0)), include_route=True)
+    evening = flight_label(_flight(dep=dt.datetime(2026, 8, 20, 19, 0)), include_route=True)
+    assert morning != evening
+    assert "0600z" in morning and "1900z" in evening
+
+
 def test_flight_label_falls_back_to_id_for_adhoc_with_no_number():
     """Ad-hoc and charter flights legitimately have no flight_no."""
-    assert flight_label(_flight(flight_no=None)) == "#4242 · 20 Aug"
+    assert flight_label(_flight(flight_no=None)) == "#4242 · 20 Aug 1900z"
 
 
 def test_flight_label_never_renders_none_as_text():
@@ -93,12 +104,12 @@ def test_flight_label_never_renders_none_as_text():
 
 
 def test_flight_label_with_route():
-    assert flight_label(_flight(), include_route=True) == "EPE 786 · 20 Aug · KHI→LHE"
+    assert flight_label(_flight(), include_route=True) == "EPE 786 · 20 Aug 1900z · KHI→LHE"
 
 
 def test_flight_labels_maps_every_row():
     df = pd.DataFrame([_flight(), _flight(99, None, dt.datetime(2026, 8, 21, 6, 0), "LHE", "DWC")])
     assert flight_labels(df, include_route=False) == {
-        4242: "EPE 786 · 20 Aug",
-        99: "#99 · 21 Aug",
+        4242: "EPE 786 · 20 Aug 1900z",
+        99: "#99 · 21 Aug 0600z",
     }

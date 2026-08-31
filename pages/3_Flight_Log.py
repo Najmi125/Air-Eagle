@@ -26,7 +26,7 @@ import streamlit as st
 
 from services import flight_service, assignment_service, auth_service
 from services.alert_summary import format_alert_lines
-from services.display_labels import flight_label
+from services.display_labels import flight_label, flight_labels, format_timestamps
 from services.time_entry import parse_hhmm
 
 st.set_page_config(page_title="Flt Schedule", page_icon="📘", layout="wide")
@@ -42,7 +42,7 @@ status_filter = None if status_choice == "All" else status_choice
 flights_df = flight_service.get_all_flights(status_filter=status_filter)
 
 st.subheader(f"Flights ({len(flights_df)})")
-st.dataframe(flights_df, width="stretch")
+st.dataframe(format_timestamps(flights_df), width="stretch")
 
 
 # ================= UPDATE / CANCEL EXISTING =================
@@ -54,12 +54,56 @@ st.subheader("Record actuals, update status, or cancel a flight")
 if flights_df.empty:
     st.info("No flights yet.")
 else:
-    # Labelled by flight number and date; flight_id stays the
-    # identifier and the selection value.
+    # Reported from the live trial as "not listing all flights". It
+    # was: tests/test_flt_schedule_selector.py measures the selector
+    # against the table at production's real size and they match
+    # exactly, with no filter, no cap and the oldest flight present.
+    # The problem is that 103 options ordered newest-first is not
+    # something you can find a three-week-old flight in.
+    #
+    # So this narrows by DATE rather than removing a filter that never
+    # existed.
+    #
+    # IT DEFAULTS TO EVERYTHING, deliberately. A window defaulting to
+    # "the last week or so" reads as helpful and is the same mistake in
+    # a different place: recording actuals is exactly what you do about
+    # a flight that already operated, sometimes weeks late, and a
+    # controller chasing a missing actual from three weeks ago would
+    # meet "No flights in this date range" — a worse failure than a long
+    # dropdown, because it looks like the flight is gone. The default
+    # hides nothing; narrowing is the controller's choice, and the
+    # count below says what any narrowing leaves out.
+    st.caption("Narrow the list if you want to; it shows every flight by default.")
+    all_dep_dates = flights_df["dep_time_planned"].dt.date
+    sel_col1, sel_col2 = st.columns(2)
+    window_from = sel_col1.date_input(
+        "Flights from", value=all_dep_dates.min(), key="actuals_from")
+    window_to = sel_col2.date_input(
+        "Flights to", value=all_dep_dates.max(), key="actuals_to")
+
+    in_window = all_dep_dates.between(window_from, window_to)
+    selectable = flights_df[in_window]
+    hidden = len(flights_df) - len(selectable)
+    if hidden:
+        st.caption(
+            f"{len(selectable)} of {len(flights_df)} flights shown — "
+            f"{hidden} outside {window_from} – {window_to}."
+        )
+
+    if selectable.empty:
+        st.info("No flights in this date range — widen it to find the flight.")
+        st.stop()
+
+    # Labels built ONCE for the whole frame, not rebuilt per option.
+    # The previous format_func did flights_df[flights_df["flight_id"] ==
+    # fid].iloc[0] for every option — an O(n) scan inside an O(n) loop,
+    # about 10,600 row scans per render at 103 flights, on a page a
+    # controller uses daily. display_labels.flight_labels() exists for
+    # exactly this and was not being used here.
+    labels = flight_labels(selectable, include_route=True)
     selected_id = st.selectbox(
-        "Select flight", flights_df["flight_id"],
-        format_func=lambda fid: flight_label(
-            flights_df[flights_df["flight_id"] == fid].iloc[0], include_route=True),
+        "Select flight", selectable["flight_id"],
+        format_func=lambda fid: labels.get(fid, str(fid)),
     )
     selected = flight_service.get_flight(selected_id)
 

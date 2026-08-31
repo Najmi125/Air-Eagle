@@ -99,6 +99,22 @@ def dataset_to_markdown(dataset: Dataset) -> str:
 
 
 def dataset_to_csv(dataset: Dataset) -> bytes:
+    """Timestamps go out in Python's default ISO-ish form, NOT the
+    `25 Aug 2003z` the screen uses.
+
+    THE DIVERGENCE IS DELIBERATE (operator decision, 2026-08-31) and is
+    not an inconsistency to tidy up. A CSV is a machine-readable
+    regulatory artefact that outlives the session it was exported from:
+    `2026-08-25 20:03:35` sorts correctly as text, parses in every tool
+    without a custom format, and carries the YEAR — which `2003z` does
+    not. The screen format is optimised for a controller reading a
+    column at a glance; this one is optimised for whatever opens the
+    file in two years.
+
+    Anyone tempted to make the export "match the screen" is proposing to
+    drop the year from a compliance record. See
+    display_labels.utc_stamp() for the other side of the same decision.
+    """
     stream = StringIO(newline="")
     writer = csv.writer(stream)
     writer.writerow(dataset.headers)
