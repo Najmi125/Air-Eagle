@@ -8004,3 +8004,66 @@ Commander"; it was "a pilot can crew two rotations without commanding
 either."
 
 335 passed, 364 skipped locally; reachability clean.
+
+### 2026-09-01 (later still): accept IS publication — PLANNED, not PROPOSED
+
+**Operator decision, reversing the call in the first entry above.** That
+entry kept accept writing PROPOSED on the reasoning that the preview
+adds a review stage BEFORE the first write without removing the one
+after it. The question that settles it is what the second stage was FOR.
+
+`publish_window()` re-validates because the old generator wrote PROPOSED
+rows speculatively and arbitrary time passed before anyone looked at
+them. `accept_preview()` validates and writes **in the same call**, per
+rotation, with no gap between the check and the commit — so publish's
+re-check is re-checking work validated moments earlier.
+
+And the review that stage was supposed to enable — rejecting a proposal
+on the Roster page — **did not work: Roster does not show PROPOSED
+rows.** A review stage whose review mechanism is missing is not a stage,
+it is an unlabelled delay. The preview is the better place for that
+review anyway: rejecting there costs nothing because nothing is written,
+where rejecting a PROPOSED row means writing a CANCELLED row to undo a
+write that should not have happened.
+
+So `ACCEPTED_ROSTER_STATUS = "PLANNED"`, the button reads **"Accept and
+publish"**, and the page warns that accepting makes the roster visible
+to crew immediately.
+
+The one thing publishing did still buy is worth naming, because it is
+now gone deliberately: **a controller could accept on Monday and publish
+on Thursday, with a freshness re-check at the moment crew were told.**
+That is a publication-scheduling feature, not a legality one. If it is
+ever wanted, it should come back as a scheduled publication date, not as
+a status a controller has to remember to flip.
+
+#### publish_window() is kept, as cleanup, and the page hides it
+
+Production holds PROPOSED rows from before this change. They are
+invisible on the Roster page and nothing else promotes them, so deleting
+`publish_window()` would strand real roster rows.
+
+**The control renders only when such rows exist in the window.** A
+permanent Publish button would reassert the three-step flow this change
+removed, and a controller would reasonably read it as accepting not
+having finished the job. When the last legacy row is published the
+section disappears for good, and the function can go with it.
+
+#### Tests that could no longer get a PROPOSED row from the generator
+
+Four tests in `test_roster_generator_service.py` and two page tests
+existed by generating PROPOSED rows and then publishing them. Generation
+cannot produce one any more, so they seed it through the real pair API
+(`_seed_proposed_pair()` / `_legacy_proposed_rotation()`) — validated,
+paired, atomic, exactly what the old generator left behind. **Only the
+provenance of the rows changed; `publish_window()` is untouched, and so
+is every property those tests pin** — per-rotation re-validation, pair
+atomicity, the row-vs-duty count, and the PROPOSED visibility contract
+(covered for OCC, hidden from crew), which still governs every
+pre-2026-09-01 row.
+
+Two page tests renamed to what they now check: accept publishes directly
+and offers no further step, and legacy rows can still be published.
+
+335 passed, 365 skipped locally; reachability clean. Everything
+DB-gated here is unverified locally as usual.

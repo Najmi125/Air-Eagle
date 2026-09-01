@@ -22,15 +22,22 @@ and fairness dataframes below it.
 
 REBUILT AGAIN for the preview/accept redesign. Generate no longer
 writes anything, so every test here that needs rows in the database
-clicks Generate AND THEN Accept. The tests that pinned the old
-one-click flow were rewritten rather than deleted: what each was
+clicks Generate AND THEN "Accept and publish". The tests that pinned the
+old one-click flow were rewritten rather than deleted: what each was
 actually covering — the real rejection reason reaching the page, pair
 atomicity at publish, idempotency, the row-vs-duty count — is all still
-covered, now through two clicks instead of one. Two tests are new and
-have no predecessor, because the behaviour they pin did not exist
-before: that Generate writes NOTHING (asserted against search_roster()
-between the clicks, which is the only way to tell this redesign from a
-relabelling), and what a partial accept leaves on screen.
+covered. Three tests are new, because the behaviour they pin did not
+exist before: that Generate writes NOTHING (asserted against
+search_roster() BETWEEN the clicks, which is the only way to tell this
+redesign from a relabelling), what a partial accept leaves on screen,
+and that accept offers no further step.
+
+ACCEPT PUBLISHES (operator decision, 2026-09-01): it writes PLANNED, not
+PROPOSED, so there is no third click for anything this page produces.
+publish_window() survives only for PROPOSED rows written before that
+change, and the page renders its control only when such rows exist — so
+the two tests covering it manufacture those rows through the service
+directly, because the page can no longer create one.
 """
 import os
 import sys
@@ -225,12 +232,12 @@ def test_generate_writes_nothing_and_accept_is_what_writes(page_app):
     # The proposal is on screen even though nothing is stored.
     assert any("Nothing has been written" in i.value for i in at.info)
 
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
     assert not at.exception
 
     after = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     assert len(after) == 4  # 2 legs x 2 seats
-    assert set(after["status"]) == {"PROPOSED"}
+    assert set(after["status"]) == {"PLANNED"}
 
 
 def test_uncovered_is_not_recorded_durably_until_accept(page_app):
@@ -252,7 +259,7 @@ def test_uncovered_is_not_recorded_durably_until_accept(page_app):
 
     assert roster_generator_service.get_open_uncovered_seats(date, date).empty
 
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
     open_now = roster_generator_service.get_open_uncovered_seats(date, date)
     assert set(open_now["operating_position"]) == {"COMMANDER", "SECOND_PILOT"}
 
@@ -281,7 +288,7 @@ def test_proposal_shows_the_pair_and_the_fairness_counts(page_app):
     assert second_pilot_df["Crew"].iloc[0].startswith(fo_id)
     assert int(second_pilot_df["Duties proposed"].iloc[0]) == 1
 
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
     assert any("were written" in s.value for s in at.success)
 
 
@@ -305,7 +312,7 @@ def test_uncovered_no_candidates_reason_reaches_the_proposal(page_app):
     assert any("No candidates in pool" in c.value for c in at.caption)
 
     # And after Accept it is in the durable panel, with both seats.
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
     uncovered_df = at.dataframe[0].value
     assert "No candidates in pool" in uncovered_df["Reason"].iloc[0]
     assert set(uncovered_df["Position"]) == {"COMMANDER", "SECOND_PILOT"}
@@ -338,7 +345,7 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
     at = page_app.run()
     at = _set_window(at, thu, fri)
     at = _click(at, "Generate")
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
 
     assert not at.exception
     uncovered_df = at.dataframe[0].value
@@ -426,7 +433,7 @@ def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
 
     crew_service.update_crew(doomed_id, {"medical_expiry": dt.date(2020, 1, 1)})
 
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
     assert not at.exception
 
     # The refusal is on screen, naming the crew proposed for it and why.
@@ -435,7 +442,7 @@ def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
     assert any("Run Generate again" in i.value for i in at.info)
 
     # No second Accept is offered.
-    assert not [b for b in at.button if b.label == "Accept"]
+    assert not [b for b in at.button if b.label == "Accept and publish"]
 
     # The surviving rotations really did commit; the doomed one did not.
     rows = assignment_service.search_roster(
@@ -457,19 +464,44 @@ def test_generate_twice_is_idempotent(page_app):
     at = page_app.run()
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
     assert any("were written" in s.value for s in at.success)
 
     at = _click(at, "Generate")
     assert not at.exception
     assert any("already fully crewed" in c.value for c in at.caption)
-
-
 # ------------------------------------------------------------------
-# Publish
+# Accept publishes. There is no third step for anything this page
+# produces — the section below only exists for PROPOSED rows written
+# before 2026-09-01, so these two tests manufacture such rows directly
+# rather than through the page, which can no longer create one.
 # ------------------------------------------------------------------
 
-def test_publish_shows_correct_count_and_flips_to_planned(page_app):
+def _legacy_proposed_rotation(date):
+    """A rotation crewed as PROPOSED, the way generation used to leave
+    it. The page cannot produce this any more, so it is written through
+    the service directly — the point of these tests is what happens to
+    rows that already exist in that state."""
+    from services import assignment_service, rotation_template_service as rts
+
+    instance_id = _make_domestic_instance(date)
+    cpt_id = _add_crew("CPT")
+    fo_id = _add_crew("FO")
+    flight_ids = rts.get_promoted_flight_ids(instance_id)
+    result = assignment_service.assign_pair_to_duty(
+        cpt_id, fo_id, flight_ids, roster_status="PROPOSED")
+    assert result.status == "ALLOWED", result.status
+    return cpt_id, fo_id
+
+
+def test_accept_publishes_directly_and_offers_no_further_step(page_app):
+    """The operator's model: preview -> accept -> done.
+
+    Accept writes PLANNED, which is what crew see, so the cleanup section
+    must not render at all. A permanent Publish control would reassert
+    the three-step flow this change removed, and a controller would
+    reasonably read it as accepting not having finished the job.
+    """
     from services import assignment_service
 
     date = _next_weekday(dt.date.today(), 1)
@@ -480,50 +512,73 @@ def test_publish_shows_correct_count_and_flips_to_planned(page_app):
     at = page_app.run()
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
-    at = _click(at, "Accept")
+    at = _click(at, "Accept and publish")
+    assert not at.exception
 
     # search_roster() is sector-level: the domestic rotation has 2 legs
-    # x 2 crew (Commander+Second Pilot) = 4 rows, not 2 duties -- same
-    # row-vs-duty unit publish_window() itself returns (confirmed in
-    # tests/test_roster_generator_service.py's own publish test).
-    assert any("4" in w.value and "unpublished roster row" in w.value for w in at.markdown)
+    # x 2 crew (Commander+Second Pilot) = 4 rows, not 2 duties.
+    roster = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
+    assert len(roster) == 4
+    assert set(roster["status"]) == {"PLANNED"}
 
-    at = _click(at, "Publish")
+    assert not [b for b in at.button if b.label == "Publish these"]
+    assert not any("still" in c.value and "PROPOSED" in c.value for c in at.caption)
+
+
+def test_legacy_proposed_rows_can_still_be_published(page_app):
+    """The rows already in production have a route forward.
+
+    publish_window() is kept for exactly this and nothing else; deleting
+    it would strand real roster rows in a status nothing promotes and the
+    Roster page does not display.
+    """
+    from services import assignment_service
+
+    date = _next_weekday(dt.date.today(), 1)
+    _legacy_proposed_rotation(date)
+
+    at = page_app.run()
+    at = _set_window(at, date, date)
+    assert any("still" in c.value and "PROPOSED" in c.value for c in at.caption)
+
+    at = _click(at, "Publish these")
     assert not at.exception
     assert any("Published 4 roster row" in s.value for s in at.success)
-    assert not any("remain unpublished" in w.value for w in at.warning)
+    assert not any("remain PROPOSED" in w.value for w in at.warning)
 
     roster = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     assert set(roster["status"]) == {"PLANNED"}
 
+    # Section gone once there is nothing left to clean up.
+    assert not [b for b in at.button if b.label == "Publish these"]
+
 
 def test_manual_unassign_before_publish_skips_the_whole_rotation(page_app):
-    """A rotation with only one seat filled (the other manually
-    unassigned after Accept ran) must not publish at all — pair
-    atomicity means BOTH pilots' rows stay as they are, not just the
-    unassigned one; the page must surface how many rows remain
-    unpublished rather than silently reporting a clean publish."""
+    """A legacy rotation with only one seat still active must not publish
+    at all — pair atomicity means BOTH pilots' rows stay as they are, not
+    just the unassigned one; the page must surface how many rows remain
+    PROPOSED rather than silently reporting a clean publish.
+
+    Unchanged in substance from the pre-2026-09-01 version: publish_window()
+    itself is untouched, so the property it guarantees is untouched too.
+    Only the way the PROPOSED rows come into existence has changed, since
+    the page can no longer create them.
+    """
     from services import assignment_service
 
     date = _next_weekday(dt.date.today(), 1)
-    _make_domestic_instance(date)
-    cpt_id = _add_crew("CPT")
-    _add_crew("FO")
-
-    at = page_app.run()
-    at = _set_window(at, date, date)
-    at = _click(at, "Generate")
-    at = _click(at, "Accept")
+    cpt_id, _ = _legacy_proposed_rotation(date)
 
     proposed = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     cpt_duty_id = proposed[proposed["crew_id"] == cpt_id].iloc[0]["duty_id"]
     assignment_service.remove_assignment_from_duty(cpt_id, cpt_duty_id, reason="test reject")
 
-    at = at.run()  # rerun to pick up the cancellation before publishing (Publish is DB-fresh, not session-cached)
-    at = _click(at, "Publish")
+    at = page_app.run()
+    at = _set_window(at, date, date)
+    at = _click(at, "Publish these")
     assert not at.exception
     assert any("Published 0 roster row" in s.value for s in at.success)
-    assert any("remain unpublished" in w.value for w in at.warning)
+    assert any("remain PROPOSED" in w.value for w in at.warning)
 
     after = assignment_service.search_roster(
         date_from=date, date_to=date, include_proposed=True, include_cancelled=True)

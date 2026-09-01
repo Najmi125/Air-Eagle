@@ -52,10 +52,10 @@ st.markdown(
     "Proposes the Commander + Second Pilot pair for already-**approved** "
     "rotations in a date window, using the same legality gate as every "
     "manual assignment. **Generate writes nothing** — it produces a "
-    "proposal you review here. Accept commits it, re-checking every "
-    "rotation against current data first. This page doesn't create or "
-    "approve rotations; that happens on the Schedule Templates page "
-    "(sidebar)."
+    "proposal you review here. **Accept publishes it:** every rotation is "
+    "re-checked against current data and then written as PLANNED, which "
+    "is what crew see. This page doesn't create or approve rotations; "
+    "that happens on the Schedule Templates page (sidebar)."
 )
 
 # The preview lives HERE and nowhere else until it is accepted, which
@@ -249,12 +249,14 @@ if preview is not None:
             else:
                 col.caption("No seats proposed for this position.")
 
-        st.caption(
-            "Accept re-checks every rotation against current data before "
-            "writing it. A rotation that no longer passes is left "
-            "unwritten and reported here; the rest still commit."
+        st.warning(
+            "**Accepting publishes this roster — crew see it immediately.** "
+            "Each rotation is re-checked against current data before it is "
+            "written; one that no longer passes is left unwritten and "
+            "reported here, and the rest still commit. To change something "
+            "afterwards, unassign it on the Roster page."
         )
-        if st.button("Accept", type="primary", disabled=not (proposed or uncovered)):
+        if st.button("Accept and publish", type="primary", disabled=not (proposed or uncovered)):
             with st.spinner("Re-checking and writing..."):
                 roster_generator_service.accept_preview(preview, app_user=app_user)
             st.rerun()
@@ -311,44 +313,43 @@ if preview is not None:
         )
 
 # ------------------------------------------------------------------
-# Publish — deliberately independent of whether Generate ran in THIS
-# session. Computed fresh from the database on every render for the
-# currently selected window, so a controller returning later to
-# publish something accepted earlier (e.g. after reviewing/rejecting
-# proposals on the Roster page) doesn't need to re-run Generate first.
+# Leftover PROPOSED rows — cleanup, not a stage.
+#
+# Accept writes PLANNED, so nothing this page produces is ever PROPOSED.
+# Rows in that status can only predate the 2026-09-01 change, and they
+# are invisible on the Roster page, so they need a route forward or they
+# strand. This section renders ONLY when such rows actually exist:
+# a permanent "Publish" control would otherwise reassert the three-step
+# flow this change removed, and a controller would reasonably conclude
+# that accepting had not finished the job.
 # ------------------------------------------------------------------
-st.divider()
-st.subheader("Publish")
-st.caption(
-    "Publishing promotes accepted assignments to PLANNED for this window "
-    "— that's what makes them visible to crew. Each rotation is "
-    "re-validated fresh right before it flips (crew data or other "
-    "duties may have changed since it was accepted); a rotation that "
-    "fails re-validation, or no longer has both seats filled, is "
-    "skipped and left unpublished rather than blocking the rest of "
-    "the window."
-)
+existing_rows = assignment_service.search_roster(
+    date_from=date_from, date_to=date_to, include_proposed=True)
+proposed_count = int((existing_rows["status"] == "PROPOSED").sum()) if not existing_rows.empty else 0
 
-proposed_rows = assignment_service.search_roster(date_from=date_from, date_to=date_to, include_proposed=True)
-proposed_count = int((proposed_rows["status"] == "PROPOSED").sum()) if not proposed_rows.empty else 0
-st.write(f"**{proposed_count}** accepted-but-unpublished roster row(s) in this window.")
+if proposed_count:
+    st.divider()
+    st.subheader("Unpublished rows from before the accept change")
+    st.caption(
+        f"**{proposed_count}** roster row(s) in this window are still "
+        f"PROPOSED. Generation no longer produces those — accepting a "
+        f"proposal now writes PLANNED directly — so these date from "
+        f"before that change and are not visible to crew or on the Roster "
+        f"page. Publishing promotes them, re-validating each rotation "
+        f"first; one that fails, or no longer has both seats filled, is "
+        f"skipped and left as it is rather than blocking the rest."
+    )
 
-st.info(
-    "To reject an accepted assignment before publishing, unassign it on "
-    "the Roster page — that marks it CANCELLED, so publishing skips it "
-    "and publishes the rest. To reject one BEFORE it is written, don't "
-    "accept the proposal above."
-)
-
-if st.button("Publish", disabled=(proposed_count == 0)):
-    published = roster_generator_service.publish_window(date_from, date_to, app_user=app_user)
-    remaining = assignment_service.search_roster(date_from=date_from, date_to=date_to, include_proposed=True)
-    remaining_count = int((remaining["status"] == "PROPOSED").sum()) if not remaining.empty else 0
-    st.success(f"Published {published} roster row(s).")
-    if remaining_count:
-        st.warning(
-            f"{remaining_count} row(s) remain unpublished — the rotation(s) "
-            f"behind them failed re-validation or weren't fully paired "
-            f"at publish time. Check the panel above, or the Roster page."
-        )
-    st.rerun()
+    if st.button("Publish these"):
+        published = roster_generator_service.publish_window(date_from, date_to, app_user=app_user)
+        remaining = assignment_service.search_roster(
+            date_from=date_from, date_to=date_to, include_proposed=True)
+        remaining_count = int((remaining["status"] == "PROPOSED").sum()) if not remaining.empty else 0
+        st.success(f"Published {published} roster row(s).")
+        if remaining_count:
+            st.warning(
+                f"{remaining_count} row(s) remain PROPOSED — the rotation(s) "
+                f"behind them failed re-validation or weren't fully paired "
+                f"at publish time. Check the Roster page."
+            )
+        st.rerun()

@@ -42,12 +42,33 @@ from core.roster_generation import Candidate, order_candidates
 
 SEATS = ("COMMANDER", "SECOND_PILOT")
 
-# What accept_preview() writes into roster.status. PROPOSED, not
-# PLANNED, DELIBERATELY: the preview adds a review stage BEFORE the
-# first write, it does not remove the one that already exists after it.
-# publish_window() and its fresh re-validation are untouched, and a
-# roster still becomes visible to crew only by being published.
-ACCEPTED_ROSTER_STATUS = "PROPOSED"
+# What accept_preview() writes into roster.status.
+#
+# PLANNED (operator decision, 2026-09-01). ACCEPT IS PUBLICATION: crew
+# see a rotation as soon as it is accepted, and there is no third step.
+#
+# This was PROPOSED for one round, on the reasoning that the preview
+# adds a review stage before the first write without removing the one
+# after it. What that argument missed is what the second stage was FOR.
+# publish_window() re-validates because the old generator wrote PROPOSED
+# rows speculatively and arbitrary time passed before anyone looked at
+# them. accept_preview() validates and writes in the same call, per
+# rotation, with no gap between the check and the commit — so the
+# re-check at publish is re-checking work that was validated moments
+# earlier.
+#
+# And the review that stage was supposed to enable — rejecting a
+# proposal on the Roster page — did not work: Roster does not show
+# PROPOSED rows. A review stage whose review mechanism is missing is not
+# a stage, it is an unlabelled delay. The preview is the better place
+# for that review anyway: rejecting there costs nothing because nothing
+# is written, where rejecting a PROPOSED row means writing a CANCELLED
+# row to undo a write that should not have happened.
+#
+# publish_window() is KEPT, unchanged, for the PROPOSED rows already in
+# production from before this change. It is cleanup, not a stage — see
+# its own docstring.
+ACCEPTED_ROSTER_STATUS = "PLANNED"
 
 
 @dataclass
@@ -776,6 +797,19 @@ def generate_for_window(date_from: dt.date, date_to: dt.date,
 
 def publish_window(date_from: dt.date, date_to: dt.date, app_user: Optional[str] = None) -> int:
     """
+    LEGACY CLEANUP as of 2026-09-01, not a stage in the normal flow.
+
+    accept_preview() writes PLANNED directly (see ACCEPTED_ROSTER_STATUS
+    for why), so nothing this codebase writes today is ever PROPOSED.
+    This function exists for the PROPOSED rows already in production from
+    before that change, and pages/6_Roster_Generation.py only offers the
+    control when such rows actually exist in the selected window. When
+    the last of them is published it becomes dead weight and can go;
+    until then, deleting it would strand real roster rows in a status
+    nothing else promotes and the Roster page does not display.
+
+    Everything below is unchanged and still describes what it does.
+
     The mechanical PROPOSED -> PLANNED flip, gated per-rotation
     (2026-08-12, flight-deck crew package): a rotation only publishes
     if BOTH seats are currently filled (active COMMANDER and
