@@ -324,6 +324,37 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`preview-and-accept-provisional-rows` merged into `main` (2026-09-01).**
+  Generation no longer writes speculatively. `generate_preview()`
+  computes and writes NOTHING; the controller accepts or discards;
+  `accept_preview()` writes **PLANNED** directly, per rotation,
+  re-validating each against fresh data in the same call that commits.
+  PROPOSED is retired as a workflow. **701/701 verified against real
+  Postgres 16**, reachability clean.
+
+  **⚠ NEEDS A REBOOT — FIFTH OCCURRENCE, AND A THIRD LIMB OF THE RULE.**
+  `pages/6_Roster_Generation.py` imports NEW NAMES from
+  `roster_generator_service`, a module it already imported. No new file,
+  no new import edge — just a longer import line. It fails harder than
+  either known limb: `ImportError` at page load against a stale
+  `sys.modules`. **The reliable check is not "did a file get added" but
+  "does any page's import statement differ from what the running process
+  executed" — names included.**
+
+  **⚠ MIGRATION 021 DOES NOT EXIST YET, and must not be applied as part
+  of this deploy.** Dropping PROPOSED from `chk_roster_status` cannot
+  happen while the 24 legacy PROPOSED rows and the `publish_window()`
+  path that promotes them are still live. Sequence: deploy + reboot →
+  resolve the 24 rows (publish or cancel) → THEN write and apply 021.
+  See the dated entry.
+
+  **The cross-rotation legality guard is the whole change**
+  (`tests/test_cross_rotation_legality.py`). With the provisional union
+  disabled, all 36 rotations fill and 30 double-bookings appear; with it
+  on, 14 fill and none do. **A healthy pool would have passed either
+  way** — the defect only bites where a pool is tight against the
+  schedule, which is where operations bite.
+
 - **`schedule-change-path-and-display` merged into `main` (2026-08-31).**
   **⚠ NEEDS A REBOOT FROM MANAGE APP AFTER DEPLOYING — FOURTH
   OCCURRENCE.** `services/display_labels.py` is now imported by
