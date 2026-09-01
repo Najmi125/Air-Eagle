@@ -355,13 +355,30 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
 # ------------------------------------------------------------------
 
 def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
-    """35 written, one refused: what the page shows, and what it does
-    NOT offer.
+    """Several written, one refused: what the page shows, and what it
+    does NOT offer.
 
-    Engineered by expiring the proposed commander's medical between
-    Generate and Accept — a real qualification-gate refusal, produced by
-    the same gate that approved the proposal moments earlier, not a
-    faked result.
+    Engineered by expiring one pilot's medical between Generate and
+    Accept — a real qualification-gate refusal, produced by the same gate
+    that approved the proposal moments earlier, not a faked result.
+
+    THE DOOMED PILOT IS THE ONE CREWED ON THE FEWEST ROTATIONS, and that
+    choice is the whole fixture. An earlier version of this test doomed
+    Tuesday's Commander after checking only that the two days had
+    DIFFERENT Commanders — which they did, while the same pilot was also
+    sitting as Monday's Second Pilot, because the Second Pilot pool
+    includes CPTs and a CPT with no Second Pilot duties sorts as
+    under-used for that seat. Expiring them correctly refused BOTH
+    rotations, nothing was written, and the test read that as "partial
+    accept writes nothing" — a false alarm about a designed behaviour
+    (2026-09-01). Checking Commanders is not enough; what matters is
+    whether the doomed pilot appears ANYWHERE in another rotation.
+
+    The written and refused sets are both asserted non-empty, so a
+    fixture that stops producing a genuine partial failure says so
+    rather than quietly inverting its own claim. The scoping guarantee
+    itself is pinned without a database in
+    tests/test_partial_accept.py — this test is about the SCREEN.
 
     Three things must hold, and each is a decision:
       * the rotations that passed are WRITTEN, and stay written;
@@ -376,28 +393,35 @@ def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
     from services import assignment_service, crew_service
 
     mon = _next_weekday(dt.date.today(), 1)
-    tue = mon + dt.timedelta(days=1)
-    _make_domestic_instance_range(mon, tue)
-    # Two of each seat, so fairness gives the two days different crew and
-    # expiring one commander refuses exactly one rotation.
-    _add_crew("CPT")
-    _add_crew("CPT")
-    _add_crew("FO")
-    _add_crew("FO")
+    fri = mon + dt.timedelta(days=4)
+    _make_domestic_instance_range(mon, fri)
+    for _ in range(3):
+        _add_crew("CPT")
+    for _ in range(3):
+        _add_crew("FO")
 
     at = page_app.run()
-    at = _set_window(at, mon, tue)
+    at = _set_window(at, mon, fri)
     at = _click(at, "Generate")
     assert not at.exception
 
     proposal = at.dataframe[0].value
-    assert len(proposal) == 2, proposal
-    tuesday_row = proposal[proposal["Date"] == tue].iloc[0]
-    doomed_id = tuesday_row["Commander"].split(" ")[0]
-    monday_commander = proposal[proposal["Date"] == mon].iloc[0]["Commander"].split(" ")[0]
-    assert doomed_id != monday_commander, (
-        "fairness put the same commander on both days; this fixture needs "
-        "them different to produce a PARTIAL failure"
+    assert len(proposal) == 5, proposal
+
+    # Which dates each pilot is crewed on, across BOTH seats.
+    appearances = {}
+    for _, row in proposal.iterrows():
+        for column in ("Commander", "Second Pilot"):
+            crew_id = row[column].split(" ")[0]
+            appearances.setdefault(crew_id, set()).add(row["Date"])
+
+    doomed_id = min(appearances, key=lambda cid: len(appearances[cid]))
+    doomed_dates = appearances[doomed_id]
+    surviving_dates = {row["Date"] for _, row in proposal.iterrows()} - doomed_dates
+    assert surviving_dates, (
+        f"{doomed_id} is crewed on every rotation ({sorted(doomed_dates)}), so "
+        f"grounding them refuses the whole window — this fixture needs a "
+        f"pilot who is not on every day to produce a PARTIAL accept"
     )
 
     crew_service.update_crew(doomed_id, {"medical_expiry": dt.date(2020, 1, 1)})
@@ -405,8 +429,7 @@ def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
     at = _click(at, "Accept")
     assert not at.exception
 
-    # One written, one refused -- and the refusal is on screen, naming
-    # the crew that were proposed and why they were refused.
+    # The refusal is on screen, naming the crew proposed for it and why.
     assert any("refused on re-check" in e.value for e in at.error)
     assert any(doomed_id in m.value for m in at.markdown)
     assert any("Run Generate again" in i.value for i in at.info)
@@ -414,10 +437,11 @@ def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
     # No second Accept is offered.
     assert not [b for b in at.button if b.label == "Accept"]
 
-    # Monday really did commit; Tuesday really did not.
+    # The surviving rotations really did commit; the doomed one did not.
     rows = assignment_service.search_roster(
-        date_from=mon, date_to=tue, include_proposed=True, include_cancelled=True)
-    assert set(rows["duty_date"]) == {mon}, sorted(set(rows["duty_date"]))
+        date_from=mon, date_to=fri, include_proposed=True, include_cancelled=True)
+    assert set(rows["duty_date"]) == surviving_dates, sorted(set(rows["duty_date"]))
+    assert doomed_id not in set(rows["crew_id"])
 
 
 # ------------------------------------------------------------------

@@ -7940,3 +7940,67 @@ reproducible as an ARTIFACT.** The round-trip measurement took 1109s
 foreground immediately afterwards with identical output and identical
 counts**. Same 300x-scale discrepancy, same cause, nothing to do with
 the code. Prefer foreground runs when timing matters.
+
+### 2026-09-01 (later): the partial-accept "failure" was the fixture, and the guard is now DB-free
+
+Real Postgres 16: 696 passed, 1 failed.
+`test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason`
+asserted `set(rows["duty_date"]) == {mon}` and got `set()` — **nothing
+committed at all**, while every UI assertion above it passed.
+
+That reads exactly like all-or-nothing transaction scope. **It is not.**
+Two independent confirmations, because the read is genuinely ambiguous:
+
+1. `accept_preview()` opens no transaction. The only `engine.begin()` on
+   the path is inside `assign_pair_to_duty()`, scoped to one rotation's
+   two seats.
+2. Reproduced DB-free: with 2 CPT + 2 FO over two days, the fairness
+   ordering crews **both CPTs on both days** — CPT-01 commands Monday
+   with CPT-02 as Second Pilot, and they swap on Tuesday. The FOs are
+   never used at all.
+
+So `doomed_id` (Tuesday's Commander) was **also Monday's Second Pilot**.
+Grounding them correctly refused BOTH rotations. Nothing was written
+because nothing was legal, and the page reported that correctly.
+
+**The precondition guard checked the wrong thing.** It asserted the two
+Commanders differ — they did — while the doomed pilot occupied a seat on
+the other day anyway. The Second Pilot pool includes CPTs, and under
+seat-scoped fairness (2026-08-28) a CPT with zero Second Pilot duties
+sorts as *under-used for that seat*, so an all-CPT crew is the natural
+output of a small pool. That is the fairness rule working as designed;
+it is only a problem for a fixture that assumed seats imply distinct
+people.
+
+**Fixed by dooming the pilot crewed on the FEWEST rotations** (checked
+across BOTH seats, not just Commander) over a five-day window with 3 CPT
++ 3 FO, and asserting the written and refused sets are both non-empty —
+so a fixture that stops producing a genuine partial failure says so
+instead of inverting its own claim.
+
+#### `tests/test_partial_accept.py` — the guarantee no longer depends on Postgres or on crew selection
+
+A fixture that can raise a false alarm about a designed behaviour is a
+reason to test that behaviour where crew selection cannot reach it. Two
+tests, both DB-free:
+
+* the rotations that pass are written and stay written, asserted against
+  the **statements actually issued** rather than the returned summary;
+* **one transaction per written rotation, not one for the window.**
+
+The second exists because a recording engine cannot roll back, so the
+INSERT assertions alone would pass unchanged against an all-or-nothing
+implementation. Counting transaction boundaries is what separates them.
+
+**Mutation-tested, both caught:** wrapping the loop in a single outer
+`engine.begin()` (transactions 3 != 2), and reporting a refused rotation
+as WRITTEN (both tests fail). The measured run is a genuine partial
+accept — 2 written, 1 refused.
+
+**Correction to the entry above:** it named the fairness precondition as
+the risk in this test and was right that there was one, but wrong about
+which. The risk was not "fairness might give both days the same
+Commander"; it was "a pilot can crew two rotations without commanding
+either."
+
+335 passed, 364 skipped locally; reachability clean.
