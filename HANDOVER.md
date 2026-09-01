@@ -7759,3 +7759,184 @@ did not import it before. That is the second limb of the
 stale-`sys.modules` rule — "a page importing a service module it did not
 import before" — so this needs a **reboot from Manage app after
 deploying**. No migration.
+
+## 2026-09-01: generation proposes, accept writes — and the side effect that was holding legality together
+
+### The defect this branch exists to prevent, not to fix
+
+Generation used to write PROPOSED roster rows as it walked the window.
+Nobody chose that as the cross-rotation legality mechanism, but it was
+one: by the time rotation 2 was validated, rotation 1's rows were
+already in the `roster` table, so `_fetch_duty_rows()` returned them and
+rest, overlap and cumulative limits were all checked across the whole
+window. **The enforcement was a side effect of the writes.**
+
+A preview writes nothing. Remove the writes and that enforcement
+disappears **in silence** — every rotation validates against an empty
+history, every rotation passes on its own, and the SET is illegal.
+Nothing raises. No count looks wrong. The seats just fill, and a
+controller publishes a roster with one pilot in two cockpits.
+
+`assignment_service.ProvisionalDuties` replaces the side effect: each
+pair the run accepts is recorded in memory in the duty-row shape and
+unioned into the gate's own history read, through a one-line seam
+(`_provisional_duty_rows()`) that exists so a test can switch it off.
+
+### The test was built first, and watched fail
+
+`tests/test_cross_rotation_legality.py`. Thirty-six rotations, three in
+the air together each day, **two** commanders. Every rotation is
+individually legal for either of them; taking two at once is not.
+
+- union ON: 14 of 36 filled, 22 uncovered, **zero double-bookings**
+- union OFF: **all 36 filled, 30 double-bookings**
+
+The refusal text is the real gate speaking, not a re-derived rule:
+`Duty overlaps previous duty.; Insufficient rest before duty. Available
+-04:45, required 12:00.` A **negative** available-rest figure can only
+be computed against a duty the engine can actually see.
+
+**The failure is asserted, not described.** A third test runs both
+configurations and asserts the difference. "We watched it fail once" is
+not a property of the suite and does not survive the next refactor.
+
+**Why 36 and not 2, and why a TIGHT pool.** Two rotations prove the
+mechanism. They do not prove it survives the case that matters — and a
+*healthy* pool hides the defect completely. At 6 commanders and 36
+rotations, fairness ordering alone spreads pilots six days apart, so the
+set comes out legal whether the union works or not. The first fixture
+drafted here did exactly that and would have passed with the union
+disabled. The defect only bites where real operations bite: a pool tight
+against the schedule.
+
+**Two count predictions in this file were wrong and were corrected to
+properties.** Coverage under a tight pool depends on the fairness
+ordering — a CPT taken for a Second Pilot seat is a commander lost for
+the next rotation that day — so exact counts were replaced by ranges,
+by the reason text, and by a direct comparison of the two runs.
+
+### Round-trips: measured, not assumed
+
+36 rotations, 6 commanders, 10 second pilots, all crew valid, all
+rotations fill. Counted with the existing `RoundTrips` counter.
+
+| | round-trips |
+|---|---|
+| BEFORE — `generate_for_window()` on main | **652** |
+| AFTER — `generate_preview()` (writes nothing) | **256** |
+| AFTER — `accept_preview()` | **542** |
+| AFTER — generate → accept | **798** |
+
+**+146 (+22%) end to end.** `publish_window()` is unchanged and applies
+identically to both sides, so it cancels out of the comparison.
+
+**Provisional rows themselves cost ZERO round-trips, and invalidate
+nothing.** The union is applied AFTER `Prefetch.duty_rows` is consulted,
+never into it, so the cache holds database answers only — and during a
+preview nothing is written, so a database answer read at rotation 1
+cannot have been invalidated by rotation 35. Caching the union instead
+would have to drop every entry for a crew member on every fill and would
+put the per-candidate duty-history query back, once per rotation: the
+exact 2026-08-22 defect.
+
+The preview is **cheaper** than the old generate (256 vs 652) — no
+writes (324 gone) and no `_check_downstream_impact` reads (72 gone,
+correctly: nothing was written, so nothing downstream broke). The whole
++146 is one extra validation pass, which is what buys the review step.
+
+**One regression was found by measuring and fixed.** Accept first cost
+685, of which **144 were single-row `crew_service.get_crew()` calls** —
+2 pilots x 2 reads x 36 rotations — because accept deliberately passes
+no prefetch. Same shape as the per-candidate birthday lookup removed on
+2026-08-22, and minutes against Supabase. Accept now takes ONE fresh
+bulk snapshot and passes a per-ROTATION `Prefetch` carrying only that.
+Per-rotation matters: duty history must still be read live, because the
+whole point is that rotation N+1 sees rotation N's committed rows.
+
+Taking the snapshot at accept rather than reusing the preview's is what
+keeps "re-validated against fresh data" true — it is as old as the
+Accept click, not the Generate click.
+
+### Partial accept — designed, not discovered
+
+35 written, one refused on re-validation. What the page shows:
+
+- **Written rotations are marked written and stop being offered.** They
+  are real rows now; a screen still presenting them as pending invites a
+  second Accept.
+- **The refused rotation is KEPT, with its proposed crew and the
+  re-validation reason.** Discarding it destroys the only record of what
+  was refused and why — the one thing on the screen needing action.
+- **There is no second Accept, and the service refuses one too**
+  (`accept_preview()` raises on an already-accepted preview). This is
+  not tidiness: the 35 rotations that just committed have CHANGED the
+  legality context the refused rotation was proposed in, so replaying it
+  would be proposing from stale information — **the same defect class
+  this whole branch exists to prevent**. Re-running Generate rebuilds
+  against the rows that are now real.
+
+Per-rotation, not all-or-nothing — the same choice `publish_window()`
+already makes, for the same reason: one pilot's changed circumstances
+must not cost a controller the other thirty-five rotations of work.
+
+### Accept writes PROPOSED, and Publish is untouched
+
+**A call worth flagging.** The preview adds a review stage BEFORE the
+first write; it does not remove the one that already exists after it.
+`publish_window()` and its fresh re-validation are unchanged, and a
+roster still becomes visible to crew only by being published. Nothing in
+production behaviour is lost. It is one constant
+(`ACCEPTED_ROSTER_STATUS`) if that should have been PLANNED instead.
+
+### Two tests were rewritten to the new contract, not deleted
+
+- `test_generation_makes_no_query_per_candidate_for_ages` asserted
+  `get_all_crew == 1`. It is now **2** — one bulk read per stage — and
+  that is the contract, since accept must take its own fresh snapshot.
+  Rewritten as `test_generation_reads_crew_in_bulk_and_never_per_candidate`,
+  which now asserts the real guard **directly**: `get_crew == 0`. The old
+  assertion was a proxy for it.
+- `tests/test_roster_generation_page.py` pinned the one-click flow
+  throughout. Every test needing rows now clicks Generate AND Accept;
+  what each was actually covering is still covered. Two are new, having
+  no predecessor: that Generate writes NOTHING (asserted against
+  `search_roster()` **between** the clicks — the only way to tell this
+  redesign from a relabelling), and what a partial accept leaves behind.
+
+### ⚠ Reboot required — and a THIRD limb of the rule
+
+`pages/6_Roster_Generation.py` now does
+`from services.roster_generator_service import ... OUTCOME_PROPOSED, ...`
+— **new names from a module it already imported.** No new module appears
+anywhere, so neither of the two known limbs fires, and this one fails
+*harder* than either: against a stale `sys.modules` entry it is an
+`ImportError` at page load, not a subtly wrong result.
+
+**Why this rule keeps catching people, recorded because it will happen
+again.** The first three occurrences all ADDED A MODULE, so that is the
+shape everyone now looks for. The second limb — three existing pages
+gaining an import of an existing module (`display_labels`, 2026-08-31) —
+is invisible unless specifically checked for, because **no new file
+appears in the diff**. This third limb is worse still: no new file AND
+no new import line, just a longer one. The reliable check is not "did a
+file get added" but **"does any page's import statement differ from what
+the running process executed"** — which includes the names inside it.
+
+No migration.
+
+### Verified
+
+333 passed, 364 skipped locally; reachability clean. **The DB-gated
+tests are unverified here** — no local Postgres, so
+`test_roster_generation_page.py` (including both new tests) and
+`test_roster_generator_service.py` skip. The partial-accept page test in
+particular depends on fairness giving two different commanders to two
+consecutive days; it asserts that precondition explicitly rather than
+failing obscurely if it does not hold.
+
+**Also confirmed: the 2026-08-28 "slow background run" is real and
+reproducible as an ARTIFACT.** The round-trip measurement took 1109s
+(18m29s) when the tool backgrounded it at 600s, and **5.09s in the
+foreground immediately afterwards with identical output and identical
+counts**. Same 300x-scale discrepancy, same cause, nothing to do with
+the code. Prefer foreground runs when timing matters.

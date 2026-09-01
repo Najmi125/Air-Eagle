@@ -17,8 +17,20 @@ Rebuilt for the flight-deck crew package (2026-08-13): seats are
 Commander/Second Pilot, not CPT/FO. Uncovered is now shown in its own
 always-current "Currently uncovered seats" panel (durable, reads
 uncovered_seats directly), rendered BEFORE the Generate button — so
-its dataframe, when present, is dataframe[0], ahead of the two
-fairness dataframes in the Results section below it.
+its dataframe, when present, is dataframe[0], ahead of the proposal
+and fairness dataframes below it.
+
+REBUILT AGAIN for the preview/accept redesign. Generate no longer
+writes anything, so every test here that needs rows in the database
+clicks Generate AND THEN Accept. The tests that pinned the old
+one-click flow were rewritten rather than deleted: what each was
+actually covering — the real rejection reason reaching the page, pair
+atomicity at publish, idempotency, the row-vs-duty count — is all still
+covered, now through two clicks instead of one. Two tests are new and
+have no predecessor, because the behaviour they pin did not exist
+before: that Generate writes NOTHING (asserted against search_roster()
+between the clicks, which is the only way to tell this redesign from a
+relabelling), and what a partial accept leaves on screen.
 """
 import os
 import sys
@@ -113,6 +125,22 @@ def _make_domestic_instance(date):
     return created[0]
 
 
+def _make_domestic_instance_range(date_from, date_to):
+    """The domestic template expanded across a RANGE, for the tests that
+    need two rotations on different days with different crew — a partial
+    accept has no meaning against a single rotation."""
+    from services import rotation_template_service as rts
+    rts.create_template(
+        rotation_code="EPE-786-787", days_of_week=DOMESTIC_DAYS, legs=DOMESTIC_LEGS,
+        effective_from=dt.date(2020, 1, 1), meal_provided=True, snack_provided=True,
+        description="KHI-LHE-KHI domestic",
+    )
+    created = rts.expand_and_persist("EPE-786-787", date_from, date_to)
+    for instance_id in created:
+        rts.approve_instance(instance_id)
+    return created
+
+
 def _make_international_instances(date_from, date_to):
     from services import rotation_template_service as rts
     rts.create_template(
@@ -150,21 +178,87 @@ def test_page_loads_without_exception(page_app):
 
 def test_no_approved_rotations_shows_templates_page_pointer(page_app):
     at = page_app.run()
-    assert any("Schedule Templates" in i.value for i in at.info)
-    assert not any(b.label == "Generate" for b in at.button)
+    assert any("Schedule Templates page" in i.value for i in at.info)
 
 
 def test_currently_uncovered_panel_shows_success_when_nothing_open(page_app):
     at = page_app.run()
-    assert any("No open uncovered seats" in s.value for s in at.success)
+    assert any("No open uncovered seats in this window" in s.value for s in at.success)
 
 
 # ------------------------------------------------------------------
-# Generate — happy path
+# Generate proposes; Accept writes. The two-step flow is the contract
+# this file was rewritten for (preview/accept redesign) — every test
+# below that needs rows in the database now clicks BOTH buttons, and
+# the first test below exists to prove the first click alone writes
+# nothing.
 # ------------------------------------------------------------------
 
-def test_generate_fills_seats_and_shows_fairness_counts(page_app):
-    date = _next_weekday(dt.date.today(), 1)  # next Monday
+def test_generate_writes_nothing_and_accept_is_what_writes(page_app):
+    """THE new contract, asserted against the database rather than the
+    screen.
+
+    Generation used to write PROPOSED rows as it walked the window. It
+    no longer writes at all — the proposal exists only in the page's
+    session state until Accept. Checking search_roster() between the
+    two clicks is the only way to tell the redesign from a cosmetic
+    relabelling of the old one.
+    """
+    from services import assignment_service
+
+    date = _next_weekday(dt.date.today(), 1)
+    _make_domestic_instance(date)
+    _add_crew("CPT")
+    _add_crew("FO")
+
+    at = page_app.run()
+    at = _set_window(at, date, date)
+    at = _click(at, "Generate")
+    assert not at.exception
+
+    between = assignment_service.search_roster(
+        date_from=date, date_to=date, include_proposed=True, include_cancelled=True)
+    assert between.empty, (
+        f"Generate wrote {len(between)} roster row(s) — the preview is "
+        f"supposed to write nothing at all"
+    )
+    # The proposal is on screen even though nothing is stored.
+    assert any("Nothing has been written" in i.value for i in at.info)
+
+    at = _click(at, "Accept")
+    assert not at.exception
+
+    after = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
+    assert len(after) == 4  # 2 legs x 2 seats
+    assert set(after["status"]) == {"PROPOSED"}
+
+
+def test_uncovered_is_not_recorded_durably_until_accept(page_app):
+    """The mirror of the test above, for the other write path.
+
+    uncovered_seats is the durable record of what is open. A preview a
+    controller walked away from must not have edited it — otherwise
+    merely LOOKING at a window would leave permanent findings behind.
+    """
+    from services import roster_generator_service
+
+    date = _next_weekday(dt.date.today(), 1)
+    _make_domestic_instance(date)
+    _add_crew("FO")  # no CPT at all -- guaranteed uncovered on both seats
+
+    at = page_app.run()
+    at = _set_window(at, date, date)
+    at = _click(at, "Generate")
+
+    assert roster_generator_service.get_open_uncovered_seats(date, date).empty
+
+    at = _click(at, "Accept")
+    open_now = roster_generator_service.get_open_uncovered_seats(date, date)
+    assert set(open_now["operating_position"]) == {"COMMANDER", "SECOND_PILOT"}
+
+
+def test_proposal_shows_the_pair_and_the_fairness_counts(page_app):
+    date = _next_weekday(dt.date.today(), 1)
     _make_domestic_instance(date)
     cpt_id = _add_crew("CPT")
     fo_id = _add_crew("FO")
@@ -174,25 +268,30 @@ def test_generate_fills_seats_and_shows_fairness_counts(page_app):
     at = _click(at, "Generate")
 
     assert not at.exception
-    assert any("Every seat this run attempted was filled or already covered" in s.value for s in at.success)
-
     # No uncovered dataframe renders when nothing's open, so the
-    # fairness tables are dataframe[0] (Commander) and dataframe[1]
-    # (Second Pilot).
-    commander_df = at.dataframe[0].value
-    second_pilot_df = at.dataframe[1].value
+    # proposal table is dataframe[0] and the two fairness tables follow.
+    proposal = at.dataframe[0].value
+    assert proposal["Commander"].iloc[0].startswith(cpt_id)
+    assert proposal["Second Pilot"].iloc[0].startswith(fo_id)
+
+    commander_df = at.dataframe[1].value
+    second_pilot_df = at.dataframe[2].value
     assert commander_df["Crew"].iloc[0].startswith(cpt_id)
-    assert int(commander_df["Duties filled"].iloc[0]) == 1
+    assert int(commander_df["Duties proposed"].iloc[0]) == 1
     assert second_pilot_df["Crew"].iloc[0].startswith(fo_id)
-    assert int(second_pilot_df["Duties filled"].iloc[0]) == 1
+    assert int(second_pilot_df["Duties proposed"].iloc[0]) == 1
+
+    at = _click(at, "Accept")
+    assert any("were written" in s.value for s in at.success)
 
 
 # ------------------------------------------------------------------
-# uncovered — shown first, in its own durable panel, both the
-# structural (no-candidates) and the real rule-derived-reason case.
+# uncovered — the real rule-derived reason, and the structural
+# no-candidates case. Both are now findings ON THE PROPOSAL first and
+# durable records only after Accept.
 # ------------------------------------------------------------------
 
-def test_uncovered_no_candidates_shown_before_fairness(page_app):
+def test_uncovered_no_candidates_reason_reaches_the_proposal(page_app):
     date = _next_weekday(dt.date.today(), 1)
     _make_domestic_instance(date)
     _add_crew("FO")  # no CPT at all -- guaranteed, clean uncovered on both seats
@@ -202,13 +301,11 @@ def test_uncovered_no_candidates_shown_before_fairness(page_app):
     at = _click(at, "Generate")
 
     assert not at.exception
-    error_idx = next(i for i, el in enumerate(at.main) if type(el).__name__ == "Error")
-    fairness_idx = next(
-        i for i, el in enumerate(at.main)
-        if type(el).__name__ == "Markdown" and "fairness check" in getattr(el, "value", "")
-    )
-    assert error_idx < fairness_idx
+    assert any("could not be crewed" in e.value for e in at.error)
+    assert any("No candidates in pool" in c.value for c in at.caption)
 
+    # And after Accept it is in the durable panel, with both seats.
+    at = _click(at, "Accept")
     uncovered_df = at.dataframe[0].value
     assert "No candidates in pool" in uncovered_df["Reason"].iloc[0]
     assert set(uncovered_df["Position"]) == {"COMMANDER", "SECOND_PILOT"}
@@ -222,7 +319,15 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
     candidate is a real, already-established rest-math rejection
     (tests/test_roster_generator_service.py's own grounding case) —
     under the pair model, BOTH seats show uncovered together (pair
-    atomicity), not just Commander."""
+    atomicity), not just Commander.
+
+    UNDER THE PREVIEW DESIGN this rejection is now produced by the
+    PROVISIONAL row for Thursday's duty rather than by a committed one,
+    since the preview writes nothing between the two rotations. That
+    makes this test a real-Postgres companion to
+    tests/test_cross_rotation_legality.py: same mechanism, exercised
+    through the page against the actual database.
+    """
     thu = _next_weekday(dt.date.today(), 4)
     fri = thu + dt.timedelta(days=1)
     _make_international_instances(thu, fri)
@@ -233,6 +338,7 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
     at = page_app.run()
     at = _set_window(at, thu, fri)
     at = _click(at, "Generate")
+    at = _click(at, "Accept")
 
     assert not at.exception
     uncovered_df = at.dataframe[0].value
@@ -241,6 +347,77 @@ def test_uncovered_real_rejection_reason_reaches_page(page_app):
     reason = fri_commander["Reason"].iloc[0]
     assert "REJECTED" in reason or "NEEDS_MANUAL_REVIEW" in reason
     assert "No candidates in pool" not in reason
+
+
+# ------------------------------------------------------------------
+# Partial accept — the interaction this redesign had to decide rather
+# than discover.
+# ------------------------------------------------------------------
+
+def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
+    """35 written, one refused: what the page shows, and what it does
+    NOT offer.
+
+    Engineered by expiring the proposed commander's medical between
+    Generate and Accept — a real qualification-gate refusal, produced by
+    the same gate that approved the proposal moments earlier, not a
+    faked result.
+
+    Three things must hold, and each is a decision:
+      * the rotations that passed are WRITTEN, and stay written;
+      * the refused rotation is still named, still shows the crew that
+        were proposed for it, and shows why it was refused — discarding
+        the proposal would destroy the only record of what happened;
+      * there is NO second Accept. The rotations that just committed
+        changed what is legal for the one that did not, so replaying the
+        proposal would be proposing from stale information — which is
+        the whole defect this redesign exists to prevent.
+    """
+    from services import assignment_service, crew_service
+
+    mon = _next_weekday(dt.date.today(), 1)
+    tue = mon + dt.timedelta(days=1)
+    _make_domestic_instance_range(mon, tue)
+    # Two of each seat, so fairness gives the two days different crew and
+    # expiring one commander refuses exactly one rotation.
+    _add_crew("CPT")
+    _add_crew("CPT")
+    _add_crew("FO")
+    _add_crew("FO")
+
+    at = page_app.run()
+    at = _set_window(at, mon, tue)
+    at = _click(at, "Generate")
+    assert not at.exception
+
+    proposal = at.dataframe[0].value
+    assert len(proposal) == 2, proposal
+    tuesday_row = proposal[proposal["Date"] == tue].iloc[0]
+    doomed_id = tuesday_row["Commander"].split(" ")[0]
+    monday_commander = proposal[proposal["Date"] == mon].iloc[0]["Commander"].split(" ")[0]
+    assert doomed_id != monday_commander, (
+        "fairness put the same commander on both days; this fixture needs "
+        "them different to produce a PARTIAL failure"
+    )
+
+    crew_service.update_crew(doomed_id, {"medical_expiry": dt.date(2020, 1, 1)})
+
+    at = _click(at, "Accept")
+    assert not at.exception
+
+    # One written, one refused -- and the refusal is on screen, naming
+    # the crew that were proposed and why they were refused.
+    assert any("refused on re-check" in e.value for e in at.error)
+    assert any(doomed_id in m.value for m in at.markdown)
+    assert any("Run Generate again" in i.value for i in at.info)
+
+    # No second Accept is offered.
+    assert not [b for b in at.button if b.label == "Accept"]
+
+    # Monday really did commit; Tuesday really did not.
+    rows = assignment_service.search_roster(
+        date_from=mon, date_to=tue, include_proposed=True, include_cancelled=True)
+    assert set(rows["duty_date"]) == {mon}, sorted(set(rows["duty_date"]))
 
 
 # ------------------------------------------------------------------
@@ -256,11 +433,12 @@ def test_generate_twice_is_idempotent(page_app):
     at = page_app.run()
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
-    assert any("Every seat this run attempted was filled or already covered" in s.value for s in at.success)
+    at = _click(at, "Accept")
+    assert any("were written" in s.value for s in at.success)
 
     at = _click(at, "Generate")
     assert not at.exception
-    assert any("2 seat(s) were already covered" in c.value for c in at.caption)
+    assert any("already fully crewed" in c.value for c in at.caption)
 
 
 # ------------------------------------------------------------------
@@ -278,17 +456,18 @@ def test_publish_shows_correct_count_and_flips_to_planned(page_app):
     at = page_app.run()
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
+    at = _click(at, "Accept")
 
     # search_roster() is sector-level: the domestic rotation has 2 legs
     # x 2 crew (Commander+Second Pilot) = 4 rows, not 2 duties -- same
     # row-vs-duty unit publish_window() itself returns (confirmed in
     # tests/test_roster_generator_service.py's own publish test).
-    assert any("4" in w.value and "PROPOSED roster row" in w.value for w in at.markdown)
+    assert any("4" in w.value and "unpublished roster row" in w.value for w in at.markdown)
 
     at = _click(at, "Publish")
     assert not at.exception
     assert any("Published 4 roster row" in s.value for s in at.success)
-    assert not any("remain PROPOSED" in w.value for w in at.warning)
+    assert not any("remain unpublished" in w.value for w in at.warning)
 
     roster = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     assert set(roster["status"]) == {"PLANNED"}
@@ -296,10 +475,10 @@ def test_publish_shows_correct_count_and_flips_to_planned(page_app):
 
 def test_manual_unassign_before_publish_skips_the_whole_rotation(page_app):
     """A rotation with only one seat filled (the other manually
-    unassigned after Generate ran) must not publish at all — pair
+    unassigned after Accept ran) must not publish at all — pair
     atomicity means BOTH pilots' rows stay as they are, not just the
     unassigned one; the page must surface how many rows remain
-    PROPOSED rather than silently reporting a clean publish."""
+    unpublished rather than silently reporting a clean publish."""
     from services import assignment_service
 
     date = _next_weekday(dt.date.today(), 1)
@@ -310,6 +489,7 @@ def test_manual_unassign_before_publish_skips_the_whole_rotation(page_app):
     at = page_app.run()
     at = _set_window(at, date, date)
     at = _click(at, "Generate")
+    at = _click(at, "Accept")
 
     proposed = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     cpt_duty_id = proposed[proposed["crew_id"] == cpt_id].iloc[0]["duty_id"]
@@ -319,7 +499,7 @@ def test_manual_unassign_before_publish_skips_the_whole_rotation(page_app):
     at = _click(at, "Publish")
     assert not at.exception
     assert any("Published 0 roster row" in s.value for s in at.success)
-    assert any("remain PROPOSED" in w.value for w in at.warning)
+    assert any("remain unpublished" in w.value for w in at.warning)
 
     after = assignment_service.search_roster(
         date_from=date, date_to=date, include_proposed=True, include_cancelled=True)
