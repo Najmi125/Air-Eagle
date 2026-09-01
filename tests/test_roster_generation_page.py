@@ -174,6 +174,43 @@ def _click(at, label):
     return at.run()
 
 
+def _rendered_afresh(at):
+    """One more at.run(), for asserting that a control is GONE.
+
+    THE APPTEST TRAP, and it is not obvious. A click handler that ends in
+    st.rerun() produces two script passes inside a single at.run(), and
+    both passes' messages land in the SAME ForwardMsgQueue —
+    LocalScriptRunner builds its queue once and parses the tree from
+    whatever is in it at the end. ForwardMsgQueue.enqueue() replaces
+    messages by delta-path index, so the second pass only overwrites the
+    first as far as it reaches. When the post-rerun render is SHORTER
+    than the pre-rerun one, the TAIL OF THE FIRST PASS SURVIVES into the
+    parsed tree.
+
+    That is exactly this page's shape: the proposal branch is long
+    (info, tables, two fairness columns, warning, button) and the
+    accepted branch is short, so the Accept button — near the end of the
+    long render — outlives the render that replaced it. Same for the
+    legacy publish section, which vanishes entirely once its rows are
+    published. Both produced a real-Postgres failure on 2026-09-01 where
+    every other assertion passed: the click did its work, the new content
+    rendered, and the button that should have gone was still listed.
+
+    Reproduced minimally, outside this app: a script whose pre-click
+    branch renders six elements plus a button and whose post-click branch
+    renders one keeps the stale button after the click, and loses it on
+    the next at.run(). A script whose two branches are the SAME length
+    does not — which is why this never bit until a long branch was
+    replaced by a short one.
+
+    AppTest.run() constructs a new LocalScriptRunner with a new queue, so
+    one more run() is a clean tree. Assertions that a control EXISTS are
+    unaffected and need no help; only "it is gone" does, because that is
+    the only claim a leftover can falsify.
+    """
+    return at.run()
+
+
 # ------------------------------------------------------------------
 # Basics
 # ------------------------------------------------------------------
@@ -441,8 +478,9 @@ def test_a_rotation_refused_at_accept_keeps_its_crew_and_its_reason(page_app):
     assert any(doomed_id in m.value for m in at.markdown)
     assert any("Run Generate again" in i.value for i in at.info)
 
-    # No second Accept is offered.
-    assert not [b for b in at.button if b.label == "Accept and publish"]
+    # No second Accept is offered — asserted against a FRESH RENDER, not
+    # against the tree the click returned. See _rendered_afresh().
+    assert not [b for b in _rendered_afresh(at).button if b.label == "Accept and publish"]
 
     # The surviving rotations really did commit; the doomed one did not.
     rows = assignment_service.search_roster(
@@ -549,8 +587,9 @@ def test_legacy_proposed_rows_can_still_be_published(page_app):
     roster = assignment_service.search_roster(date_from=date, date_to=date, include_proposed=True)
     assert set(roster["status"]) == {"PLANNED"}
 
-    # Section gone once there is nothing left to clean up.
-    assert not [b for b in at.button if b.label == "Publish these"]
+    # Section gone once there is nothing left to clean up — asserted
+    # against a FRESH RENDER. See _rendered_afresh().
+    assert not [b for b in _rendered_afresh(at).button if b.label == "Publish these"]
 
 
 def test_manual_unassign_before_publish_skips_the_whole_rotation(page_app):

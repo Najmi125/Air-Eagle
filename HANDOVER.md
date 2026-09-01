@@ -8067,3 +8067,76 @@ and offers no further step, and legacy rows can still be published.
 
 335 passed, 365 skipped locally; reachability clean. Everything
 DB-gated here is unverified locally as usual.
+
+### 2026-09-01 (last): the button that would not go away was AppTest, not the page
+
+Real Postgres: 698 passed, 2 failed, both the same shape —
+`assert not [b for b in at.button if b.label == ...]` after a click that
+had visibly done its work. The refusal message rendered and named the
+crew, the publish reported four rows, the roster was correctly PLANNED.
+Only "the control is gone" failed.
+
+**The page is correct. The assertion was.**
+
+#### The trap, which is not obvious and will catch the next person
+
+A click handler ending in `st.rerun()` runs the script TWICE inside a
+single `at.run()`. Both passes enqueue into the SAME `ForwardMsgQueue` —
+`LocalScriptRunner` builds its queue once in `__init__` and parses the
+tree from whatever is in it when the run ends.
+`ForwardMsgQueue.enqueue()` replaces messages **by delta-path index**, so
+the second pass overwrites the first only as far as it reaches.
+
+**When the post-rerun render is SHORTER than the pre-rerun render, the
+tail of the first pass survives into the parsed tree.**
+
+That is exactly this page's shape. The proposal branch is long — info,
+proposal table, uncovered expander, two fairness columns, warning,
+button — and the accepted branch is short. The Accept button sits near
+the end of the long render, so nothing in the short render overwrites
+it. Identical story for the legacy publish section, which disappears
+entirely once its rows are published.
+
+**Reproduced minimally, outside this app, before changing anything:**
+
+* two branches of the SAME length — button correctly gone after the click
+* long branch (6 elements + button) replaced by a short one — **stale
+  button still listed**, alongside the new content, and gone on the next
+  `at.run()`
+
+That second case is the failure, in eleven lines and no database. It
+also explains why this never bit before: every earlier click on this
+page replaced a branch with one at least as long.
+
+`AppTest.run()` constructs a NEW `LocalScriptRunner` with a new queue,
+so one more `run()` is a clean tree. `_rendered_afresh()` is that one
+line, with the reasoning attached so nobody "simplifies" it back.
+
+**Assertions that a control EXISTS were never affected** and need no
+help — a leftover can only falsify "it is gone."
+
+#### Was the button merely displayed, or genuinely live?
+
+Merely displayed, and only inside the test harness. On a fresh render
+the control is not in the tree at all, and a Streamlit widget that is
+not rendered cannot be clicked — there is no live path to a second
+accept in the running app.
+
+**Hardened anyway, because the objection was right about what a stale
+click should meet.** The accept call is wrapped so `accept_preview()`'s
+refusal surfaces as its own explanation rather than a traceback. The
+branch should be unreachable — reaching the button requires
+`is_accepted` to have been False when the page rendered, and nothing
+else can flip it — but a safety rule that presents as a raw traceback
+has failed at the only moment it matters.
+
+#### The rule now lives where no page can weaken it
+
+`test_a_spent_preview_refuses_a_second_accept_and_writes_nothing`
+(DB-free) pins the actual guarantee: a second `accept_preview()` raises,
+opens no transaction and writes no row. The absent button is the UI's
+expression of that rule; this is the rule. Asserted with the recorder,
+so "refuses" means nothing was touched — not merely that an exception
+came back after the damage.
+
+336 passed, 365 skipped locally; reachability clean.

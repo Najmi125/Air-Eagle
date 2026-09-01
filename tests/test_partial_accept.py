@@ -259,6 +259,34 @@ def test_a_refused_rotation_costs_only_itself(monkeypatch):
     assert doomed not in {cid for cid, _ in recorder.inserted_roster_rows}
 
 
+def test_a_spent_preview_refuses_a_second_accept_and_writes_nothing(monkeypatch):
+    """The safety rule behind "no second Accept button".
+
+    The page expresses this by not rendering the control once a preview
+    is accepted, and a Streamlit widget that is not rendered cannot be
+    clicked — but that is the UI's expression of the rule, not the rule.
+    The rule is here, and it holds regardless of what any page does with
+    it: a preview whose provisional decisions were made against a
+    database that the accept itself has since changed cannot be replayed.
+
+    Asserted with the recorder, so "refuses" means no transaction was
+    opened and no row was written — not merely that an exception came
+    back after the damage.
+    """
+    recorder = _Recorder()
+    rgs, preview, _, _ = _preview_with_one_pilot_grounded(monkeypatch, recorder)
+
+    rgs.accept_preview(preview, app_user="occ1")
+    after_first = (recorder.transactions, len(recorder.inserted_roster_rows))
+    assert after_first[1] > 0, "the first accept wrote nothing; this proves nothing"
+
+    with pytest.raises(ValueError, match="already been accepted"):
+        rgs.accept_preview(preview, app_user="occ1")
+
+    assert (recorder.transactions, len(recorder.inserted_roster_rows)) == after_first, (
+        "the refused second accept still touched the database")
+
+
 def test_accept_uses_one_transaction_per_rotation_not_one_for_the_window(monkeypatch):
     """The scoping question, asked directly.
 

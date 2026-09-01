@@ -257,9 +257,22 @@ if preview is not None:
             "afterwards, unassign it on the Roster page."
         )
         if st.button("Accept and publish", type="primary", disabled=not (proposed or uncovered)):
-            with st.spinner("Re-checking and writing..."):
-                roster_generator_service.accept_preview(preview, app_user=app_user)
-            st.rerun()
+            try:
+                with st.spinner("Re-checking and writing..."):
+                    roster_generator_service.accept_preview(preview, app_user=app_user)
+            except ValueError as exc:
+                # accept_preview() refuses a preview that has already been
+                # accepted, because its provisional decisions were made
+                # against a database the accept itself has since changed.
+                # This branch should be unreachable — reaching the button
+                # at all requires is_accepted to be False when the page
+                # rendered, and nothing else can flip it — but the refusal
+                # is a SAFETY rule, and a safety rule that surfaces as a
+                # raw traceback has failed at the only moment it matters.
+                # A controller gets the reason instead.
+                st.error(str(exc))
+            else:
+                st.rerun()
 
     else:
         # ----------------------------------------------------------
