@@ -152,11 +152,28 @@ def _seed_seat(engine, crew_id, flight_ids, role_assigned, operating_position, s
     return duty_id
 
 
+def _seed_proposed_pair(instance_id, commander_id, second_pilot_id):
+    """A fully-crewed rotation left in PROPOSED — what generation used to
+    produce before accept started writing PLANNED (2026-09-01).
+
+    Written through the REAL pair API, not SQL, so these rows are exactly
+    what the old generator left behind: validated, paired, atomic. The
+    publish tests below need such rows and can no longer get them from
+    generate_for_window(), which is the only reason this helper exists —
+    publish_window() itself is untouched, and so is everything it
+    guarantees."""
+    flight_ids = rts.get_promoted_flight_ids(instance_id)
+    result = assignment_service.assign_pair_to_duty(
+        commander_id, second_pilot_id, flight_ids, roster_status="PROPOSED")
+    assert result.status == "ALLOWED", result.status
+    return flight_ids
+
+
 # ------------------------------------------------------------------
 # Basic fill + status
 # ------------------------------------------------------------------
 
-def test_generate_for_window_fills_domestic_rotation_as_proposed(_patch_engine):
+def test_generate_for_window_fills_domestic_rotation_as_planned(_patch_engine):
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     _add_crew("CPT")
     _add_crew("FO")
@@ -168,12 +185,16 @@ def test_generate_for_window_fills_domestic_rotation_as_proposed(_patch_engine):
     assert summary.uncovered == []
     assert summary.already_covered == []
 
+    # PLANNED, not PROPOSED (operator decision, 2026-09-01): accept IS
+    # publication, so generate_for_window() -- which is preview+accept in
+    # one call -- leaves a roster crew can see. See
+    # roster_generator_service.ACCEPTED_ROSTER_STATUS.
     roster = assignment_service.search_roster(
         date_from=dt.date(2026, 8, 3), date_to=dt.date(2026, 8, 3), include_proposed=True)
-    assert set(roster["status"]) == {"PROPOSED"}
+    assert set(roster["status"]) == {"PLANNED"}
 
 
-def test_generate_for_window_fills_international_rotation_as_proposed(_patch_engine):
+def test_generate_for_window_fills_international_rotation_as_planned(_patch_engine):
     _make_international_instances(dt.date(2026, 8, 4), dt.date(2026, 8, 4))
     _add_crew("CPT")
     _add_crew("FO")
@@ -489,11 +510,14 @@ def test_get_open_uncovered_seats_reflects_manual_unassign_too(_patch_engine):
 def test_publish_window_flips_only_proposed_rows_in_range(_patch_engine):
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     _make_domestic_instances(dt.date(2026, 9, 1), dt.date(2026, 9, 1), rotation_code="EPE-786-787-SEP")
-    _add_crew("CPT")
-    _add_crew("FO")
+    cpt_id = _add_crew("CPT")
+    fo_id = _add_crew("FO")
 
-    rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
-    rgs.generate_for_window(dt.date(2026, 9, 1), dt.date(2026, 9, 1))
+    aug = rts.get_instances(status="APPROVED")
+    aug_id = int(aug[aug["rotation_date"] == dt.date(2026, 8, 3)].iloc[0]["id"])
+    sep_id = int(aug[aug["rotation_date"] == dt.date(2026, 9, 1)].iloc[0]["id"])
+    _seed_proposed_pair(aug_id, cpt_id, fo_id)
+    _seed_proposed_pair(sep_id, cpt_id, fo_id)
 
     published = rgs.publish_window(dt.date(2026, 8, 1), dt.date(2026, 8, 31))
     # publish_window() returns a raw UPDATE rowcount (sector rows, per
@@ -521,11 +545,10 @@ def test_publish_window_skips_rotation_with_only_one_seat_filled(_patch_engine):
     engine = _patch_engine
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     cpt_id = _add_crew("CPT")
-    _add_crew("FO")
+    fo_id = _add_crew("FO")
 
-    summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
-    commander_row = next(s for s in summary.filled if s.operating_position == "COMMANDER")
-    flight_ids = rts.get_promoted_flight_ids(commander_row.rotation_instance_id)
+    instance_id = int(rts.get_instances(status="APPROVED").iloc[0]["id"])
+    flight_ids = _seed_proposed_pair(instance_id, cpt_id, fo_id)
     roster = assignment_service.get_roster_for_flight(flight_ids[0], include_proposed=True)
     duty_id = roster[roster["crew_id"] == cpt_id].iloc[0]["duty_id"]
     assignment_service.remove_assignment_from_duty(cpt_id, duty_id)
@@ -546,9 +569,10 @@ def test_publish_window_skips_rotation_that_fails_fresh_revalidation(_patch_engi
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     _make_domestic_instances(dt.date(2026, 9, 1), dt.date(2026, 9, 1), rotation_code="EPE-786-787-SEP")
     cpt_id = _add_crew("CPT")
-    _add_crew("FO")
+    fo_id = _add_crew("FO")
 
-    rgs.generate_for_window(dt.date(2026, 8, 1), dt.date(2026, 9, 30))
+    for _, instance in rts.get_instances(status="APPROVED").iterrows():
+        _seed_proposed_pair(int(instance["id"]), cpt_id, fo_id)
     # The Commander's license expires between PROPOSED and publish time.
     crew_service.update_crew(cpt_id, {"license_expiry": dt.date(2020, 1, 1)})
 
@@ -570,9 +594,14 @@ def test_publish_window_skips_rotation_that_fails_fresh_revalidation(_patch_engi
 def test_roster_coverage_shows_proposed_seat_as_covered_but_crew_read_hides_it(_patch_engine):
     _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     cpt_id = _add_crew("CPT")
-    _add_crew("FO")
+    fo_id = _add_crew("FO")
 
-    rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
+    # Seeded PROPOSED deliberately: generation writes PLANNED now, and
+    # what this test pins is the PROPOSED contract itself -- covered for
+    # OCC, hidden from crew -- which still governs every pre-2026-09-01
+    # row and every roster_coverage() read of one.
+    instance_id = int(rts.get_instances(status="APPROVED").iloc[0]["id"])
+    _seed_proposed_pair(instance_id, cpt_id, fo_id)
 
     dataset = assistant_reports.roster_coverage(
         ReportRequest(date_from=dt.date(2026, 8, 3), date_to=dt.date(2026, 8, 3)))

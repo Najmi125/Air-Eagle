@@ -243,16 +243,31 @@ def run_generation(monkeypatch, commanders, second_pilots, rotations=1,
     return summary, counts
 
 
-def test_generation_makes_no_query_per_candidate_for_ages(monkeypatch):
+def test_generation_reads_crew_in_bulk_and_never_per_candidate(monkeypatch):
     """_age_of() issued one round-trip per candidate, per seat, purely
     to read a birthday — data already loaded in the crew snapshot. In
     the pair search the second-pilot list was rebuilt inside the
     commander loop, so this cost C + C x (1 + S) per rotation before any
-    legality check ran."""
+    legality check ran.
+
+    THE SINGLE-ROW READ IS THE ACTUAL GUARD, and it is zero. That is the
+    shape of the defect: crew_service.get_crew() called once per
+    candidate for data a bulk read already holds. It is asserted
+    directly here rather than inferred from the bulk count, which was
+    this test's original proxy.
+
+    The bulk count is now TWO, not one, and that is the contract rather
+    than a regression. generate_for_window() is preview-then-accept, and
+    accept_preview() deliberately takes its OWN fresh snapshot instead
+    of reusing the preview's — that snapshot being as old as the accept
+    and not as old as the generate is precisely what "re-validated
+    against fresh data" means. One bulk read per stage is the floor;
+    what must never come back is a read per candidate.
+    """
     _, counts = run_generation(monkeypatch, commanders=6, second_pilots=4)
 
-    # get_all_crew is the ONE legitimate crew read for the whole run.
-    assert counts.by_source.get("get_all_crew", 0) == 1, counts
+    assert counts.by_source.get("get_crew", 0) == 0, counts
+    assert counts.by_source.get("get_all_crew", 0) == 2, counts
 
 
 def test_round_trips_do_not_grow_quadratically_with_pool_size(monkeypatch):

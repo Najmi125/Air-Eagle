@@ -308,6 +308,114 @@ class PairAssignmentResult:
 # records) from the roster+flights tables for one crew member.
 # ------------------------------------------------------------------
 
+DUTY_ROW_COLUMNS = [
+    "roster_id", "duty_id", "report_time", "debrief_time", "role_assigned",
+    "operating_position", "flight_id", "dep_time", "arr_time", "origin",
+    "destination", "meal_provided", "snack_provided",
+]
+
+
+class ProvisionalDuties:
+    """Duties a caller has DECIDED but not yet written, in the exact row
+    shape _read_duty_rows() returns, so the legality gate sees them as
+    history.
+
+    WHY THIS EXISTS AT ALL. Generation used to write PROPOSED roster
+    rows as it walked the window, which meant cross-rotation legality
+    was enforced by accident: by the time rotation 2 was validated,
+    rotation 1's rows were already in the roster table, so
+    _fetch_duty_rows() picked them up and the rest/cumulative rules saw
+    them. A preview that writes nothing loses that silently — every
+    rotation validates against an empty history, each one passes on its
+    own, and the SET is illegal. Nothing raises; the seats just fill.
+
+    So the union here is not an optimisation and not a convenience. It
+    is the thing that replaces the side effect the writes were
+    providing, and tests/test_cross_rotation_legality.py exists to hold
+    it in place.
+
+    NOT A CACHE, and deliberately kept separate from Prefetch.duty_rows
+    (which is one). Prefetch.duty_rows memoises what the DATABASE said
+    and is invalidated by nothing, because during a preview nothing is
+    written and the answer cannot change. These rows are unioned on
+    AFTER that cache is consulted, so adding a provisional duty costs
+    zero round-trips and invalidates nothing — see add_duty().
+    """
+
+    def __init__(self):
+        # crew_id -> list of row dicts. Kept as dicts rather than one
+        # DataFrame because the hot path is "append one duty, then read
+        # one crew member's rows"; concatenating a frame per append was
+        # measurably the wrong shape.
+        self._rows_by_crew = {}
+
+    def add_duty(self, crew_id: str, duty_id: str, report_time, debrief_time,
+                 role_assigned: str, operating_position, flights: List[dict]) -> None:
+        """Record one provisional duty — every sector of it, one row per
+        flight, matching what the roster table would hold.
+
+        Invalidates NOTHING. Prefetch.duty_rows holds database answers,
+        and a preview issues no writes, so a provisional duty cannot
+        make a cached database answer wrong. That is what keeps the
+        round-trip count flat across this change rather than multiplying
+        it by the number of rotations (measured — see
+        tests/test_generation_round_trips.py).
+
+        roster_id is None: there is no roster row. Anything that needs a
+        real roster_id is a write path and must not be reading these.
+        """
+        rows = self._rows_by_crew.setdefault(crew_id, [])
+        for flight in flights:
+            rows.append({
+                "roster_id": None,
+                "duty_id": duty_id,
+                "report_time": report_time,
+                "debrief_time": debrief_time,
+                "role_assigned": role_assigned,
+                "operating_position": operating_position,
+                "flight_id": flight["flight_id"],
+                "dep_time": flight["dep_time"],
+                "arr_time": flight["arr_time"],
+                "origin": flight["origin"],
+                "destination": flight["destination"],
+                "meal_provided": flight["meal_provided"],
+                "snack_provided": flight["snack_provided"],
+            })
+
+    def duty_ids_for(self, crew_id: str) -> set:
+        return {row["duty_id"] for row in self._rows_by_crew.get(crew_id, [])}
+
+    def rows_for(self, crew_id: str, start=None, end=None) -> pd.DataFrame:
+        """This crew member's provisional rows in [start, end], filtered
+        on report_time — the same predicate _fetch_duty_rows() applies in
+        SQL, so a provisional duty is in or out of the lookback window on
+        identical terms to a committed one."""
+        rows = self._rows_by_crew.get(crew_id)
+        if not rows:
+            return pd.DataFrame(columns=DUTY_ROW_COLUMNS)
+        if start is not None:
+            rows = [r for r in rows if r["report_time"] >= start]
+        if end is not None:
+            rows = [r for r in rows if r["report_time"] <= end]
+        return pd.DataFrame(rows, columns=DUTY_ROW_COLUMNS)
+
+
+def _provisional_duty_rows(prefetch, crew_id: str, start=None, end=None) -> pd.DataFrame:
+    """The seam the cross-rotation legality test disables.
+
+    A one-line indirection for the same reason _read_duty_rows() is one:
+    a test can neutralise the provisional union here and watch the suite
+    go red, without also replacing the caching and filtering around it
+    with its own reimplementation. Watching this fail is the only thing
+    that distinguishes "cross-rotation legality is enforced by the
+    provisional union" from "cross-rotation legality happens to still be
+    enforced by leftover committed rows".
+    """
+    if prefetch is None or prefetch.provisional is None:
+        return pd.DataFrame(columns=DUTY_ROW_COLUMNS)
+    return prefetch.provisional.rows_for(crew_id, start=start, end=end)
+
+
 class Prefetch:
     """Rows a caller ALREADY holds, so this module does not re-fetch
     them per call.
@@ -326,18 +434,28 @@ class Prefetch:
         merely tolerated: the qualification pre-filter and this gate
         must judge a candidate on the same data, and they would not if
         the filter read a snapshot while the gate re-fetched per trial.
-      * Generation writes PROPOSED rows only. publish_window()
-        re-validates every pair against FRESH data before anything
-        becomes PLANNED, so a crew edit landing mid-run cannot reach a
-        published roster.
+      * Generation writes nothing at all now — generate_preview()
+        decides, accept_preview() writes, and accept re-validates every
+        rotation against FRESH data before committing it. A crew edit
+        landing mid-preview therefore cannot reach the roster table at
+        all, which is a stronger guarantee than the PROPOSED-rows
+        design this replaced.
+
+    `provisional` is the other half of that change: with no writes
+    during a run, the duties a run has already decided exist nowhere the
+    gate would find them, so they are carried here instead. See
+    ProvisionalDuties.
     """
 
-    def __init__(self, crew_by_id=None, flights_by_id=None):
+    def __init__(self, crew_by_id=None, flights_by_id=None, provisional=None):
         self.crew_by_id = crew_by_id or {}
         self.flights_by_id = flights_by_id or {}
         # (crew_id, start, end) -> DataFrame of duty rows. Inert
-        # data only; Duty objects are rebuilt per call.
+        # data only; Duty objects are rebuilt per call. DATABASE ANSWERS
+        # ONLY — provisional duties are unioned on after this is read,
+        # never stored in it, so this stays valid for a whole preview.
         self.duty_rows = {}
+        self.provisional = provisional
 
 
 def _get_crew_row(crew_id: str, prefetch=None):
@@ -379,7 +497,34 @@ def _fetch_duty_rows(engine, crew_id: str, start=None, end=None, prefetch=None) 
     objects to every trial would share mutable state through the
     legality engine. Rows are inert data; the records and their Duty
     objects are rebuilt fresh on every call, exactly as before.
+
+    PROVISIONAL ROWS ARE UNIONED ON AFTER THE CACHE, not into it. The
+    cached frame is what the DATABASE said, which during a preview never
+    changes because a preview writes nothing; the provisional rows are
+    what this run has decided since. Keeping them apart is what lets the
+    cache survive a provisional duty being added — the alternative,
+    caching the union, would have to drop every entry for that crew
+    member on every fill and would put the per-candidate duty-history
+    query back, once per rotation, which is the exact 2026-08-22 defect.
     """
+    db_rows = _cached_db_duty_rows(engine, crew_id, start=start, end=end, prefetch=prefetch)
+    extra = _provisional_duty_rows(prefetch, crew_id, start=start, end=end)
+    if extra.empty:
+        return db_rows
+    if db_rows.empty:
+        combined = extra
+    else:
+        combined = pd.concat([db_rows, extra], ignore_index=True)
+    # Same ordering the query itself applies (report_time, then departure
+    # within the duty) — _load_duty_records_for_crew() builds a duty's
+    # sectors in row order, so an unsorted concat would hand the
+    # legality engine a duty whose sectors run backwards.
+    return combined.sort_values(["report_time", "dep_time"], kind="stable").reset_index(drop=True)
+
+
+def _cached_db_duty_rows(engine, crew_id: str, start=None, end=None, prefetch=None) -> pd.DataFrame:
+    """The committed half of _fetch_duty_rows() — the query and its
+    per-run memo, with no knowledge of provisional duties."""
     if prefetch is not None:
         key = (crew_id, start, end)
         if key in prefetch.duty_rows:
@@ -835,7 +980,8 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                          roster_status: str = "PLANNED",
                          operating_position: Optional[str] = None,
                          prefetch=None,
-                         audit_trials: bool = True) -> AssignmentResult:
+                         audit_trials: bool = True,
+                         dry_run: bool = False) -> AssignmentResult:
     """
     Assigns crew_id to the duty formed by flight_ids (in chronological
     order — the caller's decision which flights form one duty).
@@ -845,6 +991,14 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     audit_trials: as on assign_pair_to_duty() — see that docstring for
     what it does and the three things that bound it. Default True; only
     the roster generator's internal candidate search passes False.
+
+    dry_run: run the whole validation and write nothing, returning the
+    result the write would have produced (including new_duty's duty_id,
+    so a caller can record the duty provisionally). Only
+    generate_preview() passes it. It short-circuits the INSERT and
+    nothing else — the qualification gate, the FTL gate, the partner
+    lookup and the age-pairing check all still run, on the same inputs,
+    in the same order.
 
     ILLEGAL blocks the save entirely (AssignmentResult.status=
     "REJECTED", nothing written). LEGAL/WARNING saves and returns
@@ -991,7 +1145,29 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
             computed_fdp_hours=duty_result.fdp_hours,
         )
 
-    # Only LEGAL or WARNING reach here — passed the immediate gate,
+    # Only LEGAL or WARNING reach here — passed the immediate gate.
+    if dry_run:
+        # The preview's answer, taken from the SAME call the write path
+        # takes and at the same point in it. Everything above this line
+        # ran; only the INSERT below is skipped. That is the whole
+        # reason dry_run is a flag on this function rather than a
+        # separate validate-only twin: a twin would be free to drift,
+        # and "the preview said ALLOWED but accept rejected it" would
+        # then have two possible causes instead of one.
+        return AssignmentResult(
+            status="ALLOWED",
+            legality_status=validation_result.status.value,
+            alerts=validation_result.alerts,
+            alert_summary=alert_summary,
+            duty_id=new_duty.duty_id,
+            computed_report_time=duty_result.report_time,
+            computed_debrief_time=duty_result.debrief_time,
+            computed_fdp_hours=duty_result.fdp_hours,
+            pairing_pending=pairing_info.pending,
+            paired_crew_id=pairing_info.paired_crew_id,
+            pairing_constraint=pairing_info.constraint_message,
+        )
+
     # write to roster (one row per sector) and its audit record
     # together, in one transaction (Step 6, 2026-08-02): previously
     # these were 2 separate, independently-committed transactions, so
@@ -1496,7 +1672,8 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
                          app_user: Optional[str] = None,
                          roster_status: str = "PLANNED",
                          prefetch=None,
-                         audit_trials: bool = True) -> PairAssignmentResult:
+                         audit_trials: bool = True,
+                         dry_run: bool = False) -> PairAssignmentResult:
     """
     Assigns BOTH seats of a flight-deck pair to flight_ids (flights
     that already exist — Roster page / roster generator), atomically:
@@ -1508,6 +1685,11 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
     roster_status: same meaning as assign_crew_to_duty()'s own
     parameter — the roster row's own lifecycle state, not this
     function's outcome. Phase 7's roster generator passes 'PROPOSED'.
+    dry_run: as on assign_crew_to_duty() — full validation, no write,
+    duty_ids returned so generate_preview() can record the pair
+    provisionally. Both seats or neither, in the dry-run case too:
+    there is no state in which the preview holds a commander without
+    the second pilot it was validated against.
     audit_trials: whether a REJECTED / HELD_FOR_REVIEW outcome leaves an
     audit row. Default True, and the default is the safe direction —
     silence is never what a caller gets by saying nothing, so a page
@@ -1588,7 +1770,21 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
             second_pilot_duty_id=core["second_pilot_duty"].duty_id,
         )
 
-    # LEGAL or WARNING — both seats, all sectors, one transaction.
+    # LEGAL or WARNING.
+    if dry_run:
+        # See assign_crew_to_duty()'s dry_run note. Downstream-conflict
+        # detection is skipped too: it asks "what did writing this duty
+        # break later", and nothing was written. The preview's own
+        # cross-rotation question is answered by the provisional union
+        # feeding the gate above, not here.
+        return PairAssignmentResult(
+            status="ALLOWED",
+            validation=validation,
+            commander_duty_id=core["commander_duty"].duty_id,
+            second_pilot_duty_id=core["second_pilot_duty"].duty_id,
+        )
+
+    # Both seats, all sectors, one transaction.
     with engine.begin() as conn:
         commander_roster_ids = _write_pair_rows(
             conn, commander_crew_id, "CPT", "COMMANDER",
