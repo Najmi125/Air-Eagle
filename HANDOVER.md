@@ -8171,3 +8171,92 @@ so "refuses" means nothing was touched — not merely that an exception
 came back after the damage.
 
 336 passed, 365 skipped locally; reachability clean.
+
+## 2026-09-02: why a seat could not be crewed — readable first, complete underneath
+
+Reported from live use. One rotation's reason was every attempted pair
+concatenated into a paragraph:
+
+```
+CPT-05+FO-01 (REJECTED): commander: CPT-05's MEDICAL expired 2026-08-31...;
+second pilot: FO-01's SIM expired...; CPT-05+FO-03 (REJECTED): commander:
+CPT-05's MEDICAL expired 2026-08-31...; CPT-05+FO-04 (REJECTED): ...
+```
+
+The content was right; the presentation buried it. **The same commander
+rejection repeats in every line**, because the search tries that
+commander against every second pilot in turn and records each failure
+whole. It now reads:
+
+```
+No eligible Commander — CPT-05's MEDICAL expired 2026-08-31, not valid
+for duty date 2026-09-07. Tried 3 combination(s). Detail: <every trial>
+```
+
+### The seat asymmetry is the whole insight
+
+When the **Commander** is unavailable, every pair fails for that reason
+whoever the Second Pilot is — so the Second Pilot reasons are **noise**,
+and naming them points a controller at the wrong renewal. When a
+Commander was available and only Second Pilots failed, the opposite
+holds and the list of who and why **is** the answer.
+
+The commander test is deliberately *every trial that named a commander
+was blocked by that commander*, not *some trial mentioned a commander
+problem*. A pool where one commander is grounded and another is merely
+busy must NOT report "no eligible Commander" — that would send someone
+to renew a medical when the real blocker was rest. Pinned by
+`test_a_partly_blocked_commander_pool_does_not_read_as_no_commander`,
+and mutation-tested by weakening `all(...)` to `any(...)`.
+
+Same shape as the alert-volume problem and the same treatment: bucket by
+root cause, lead with the blocking one, collapse repeats, and keep
+status derived from the full set rather than from the summary.
+
+### Summarised from STRUCTURE, never parsed back out of the string
+
+The facts are all in hand at the moment each trial fails.
+`_pair_reject_trial()` / `_reject_trial()` now return a `RejectedTrial`
+carrying the commander reason, the second pilot reason, the pair reason
+AND the full sentence; `_pair_reject_reason()` / `_reject_reason()` are
+thin wrappers returning `.text`, byte-identical to what they always
+produced.
+
+Joining those sentences and re-splitting them later would have made the
+display depend on the exact punctuation of prose written for humans.
+That is the drift this codebase has repeatedly paid for.
+
+### The record loses nothing — the summary is PREPENDED
+
+`uncovered_seats.reason` is the only surviving explanation of an
+unfilled seat and is regulatory evidence (2026-08-26 decision). So this
+does **not** substitute a summary for the detail: every trial line
+survives character for character after `Detail:`, asserted by
+`test_every_trial_survives_verbatim_in_the_stored_reason`. The stored
+column strictly gains a derived headline.
+
+A small win found on the way: the summary read `CPT-05: CPT-05's MEDICAL
+expired...` because `build_audit_reason()` already opens with the crew
+member's own id. Naming a pilot twice in a sentence written to reduce
+repetition would be a poor joke; the prefix is now added only to reasons
+that do not already identify who they are about.
+
+### ⚠ Reboot required — and a FOURTH LIMB of the rule
+
+**No import changed anywhere**, so both known checks pass this branch
+clean. But `pages/6_Roster_Generation.py` reads `rotation.outcome_summary`,
+a NEW ATTRIBUTE on a `PreviewRotation` built by
+`roster_generator_service`. Against a stale `sys.modules` the page gets
+the OLD dataclass, which has no such field, and every uncovered rotation
+raises `AttributeError` — the 2026-08-19 outage exactly.
+
+**The rule now has four limbs, and the honest statement of it is not
+about imports at all:** a reboot is needed whenever a page depends on
+anything the running process's copy of a service module does not have —
+a new module, a new import edge, a new NAME in an existing import, or a
+new ATTRIBUTE on an object that module builds.
+
+The page reads it through `getattr(..., None)` with a fallback to the
+old unsummarised sentence, truncated. That does not remove the reboot
+requirement; it decides what a missed reboot costs — the old wall of
+text instead of the page.

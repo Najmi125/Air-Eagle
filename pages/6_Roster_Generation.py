@@ -219,9 +219,37 @@ if preview is not None:
                 f"records these as uncovered seats so they show in the panel "
                 f"above and don't get forgotten."
             )
-            with st.expander("Why each one could not be crewed"):
-                for rotation in uncovered:
-                    st.markdown(f"**{rotation.rotation_code} · {rotation.rotation_date}**")
+            # One expander PER ROTATION, labelled with the root cause,
+            # rather than one expander containing every rotation's full
+            # trial log (2026-09-02). The summary is therefore visible
+            # without opening anything, and the detail is one click
+            # away rather than first.
+            #
+            # Not nested inside an outer expander: Streamlit forbids
+            # that, and the label is where the summary has to live for
+            # it to be readable without interaction.
+            st.markdown("**Why each one could not be crewed**")
+            for rotation in uncovered:
+                # getattr, not attribute access: outcome_summary is NEW
+                # on PreviewRotation, and this is a limb of the
+                # stale-sys.modules rule with no name yet — a page
+                # reading a new ATTRIBUTE on an object built by a
+                # service module. No import changes, so neither known
+                # check sees it; against a stale module every rotation
+                # here would raise AttributeError and take the page down,
+                # which is the 2026-08-19 outage exactly.
+                #
+                # A reboot is still required (recorded in HANDOVER). This
+                # only decides what a missed reboot costs: the old
+                # unsummarised sentence, truncated, instead of the page.
+                headline = getattr(rotation, "outcome_summary", None)
+                if not headline:
+                    fallback = rotation.outcome_reason or "no detail"
+                    headline = fallback[:120] + ("…" if len(fallback) > 120 else "")
+                with st.expander(
+                        f"{rotation.rotation_code} · {rotation.rotation_date} — {headline}"):
+                    # The full record, every combination tried. This is
+                    # the same text stored in uncovered_seats.reason.
                     st.caption(rotation.outcome_reason or "no detail")
 
         if already:
