@@ -324,6 +324,40 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`uncovered-reason-summary` merged into `main` (2026-09-02).**
+  "Why each one could not be crewed" was every attempted pair
+  concatenated into a paragraph, the same commander rejection repeating
+  in every line. It now leads with the root cause — `No eligible
+  Commander — CPT-01's MEDICAL expired 2026-08-31, not valid for duty
+  date 2026-09-08. Tried 3 combination(s). Detail: ...` — with every
+  trial kept verbatim after `Detail:`. **713/713 verified against real
+  Postgres 16**, reachability clean.
+
+  **⚠ NEEDS A REBOOT — AND THE RULE IS NOT ABOUT IMPORTS.** This branch
+  changes **no import anywhere**, so both previously-known checks pass
+  it clean, and it would still have taken the page down against a stale
+  `sys.modules`: `pages/6_Roster_Generation.py` reads
+  `rotation.outcome_summary`, a NEW ATTRIBUTE on a `PreviewRotation`
+  built by `roster_generator_service`. The old dataclass has no such
+  field.
+
+  **The version worth keeping: reboot whenever a page depends on
+  anything the running process's copy of a service module does not
+  have** — a new module, a new import edge, a new NAME in an existing
+  import, or a new ATTRIBUTE on an object that module builds. That
+  subsumes all four occurrences. No migration.
+
+  **Two things not to "simplify" here.** The commander test is `all(...)`,
+  not `any(...)`: reporting "no eligible Commander" when one is merely
+  busy would send a controller to renew a medical when the blocker was
+  rest. And the summary is built from STRUCTURED trial fields, never by
+  re-parsing the joined sentence — the display must not depend on the
+  punctuation of prose written for humans. Both mutation-tested.
+
+  **`uncovered_seats.reason` still holds every trial character for
+  character.** The summary is PREPENDED, never substituted; that column
+  remains the only surviving explanation of an unfilled seat.
+
 - **`preview-and-accept-provisional-rows` merged into `main` (2026-09-01).**
   Generation no longer writes speculatively. `generate_preview()`
   computes and writes NOTHING; the controller accepts or discards;
