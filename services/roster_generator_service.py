@@ -105,6 +105,9 @@ class PreviewRotation:
     seats: dict = field(default_factory=dict)   # position -> PreviewSeat
     outcome: str = OUTCOME_PROPOSED
     outcome_reason: Optional[str] = None
+    # The one-sentence root cause, when there is one. outcome_reason
+    # keeps the full record; this is what a controller reads first.
+    outcome_summary: Optional[str] = None
 
     @property
     def is_writable(self) -> bool:
@@ -238,15 +241,184 @@ def _age_of(crew_by_id: dict, crew_id: str, reference_date: dt.date) -> Optional
     return assignment_service.age_on(crew_row["date_of_birth"], reference_date)
 
 
+# ------------------------------------------------------------------
+# Why a seat could not be filled
+# ------------------------------------------------------------------
+# Reported from live use (2026-09-02): the reason for one rotation was
+# every attempted pair concatenated into a single paragraph —
+#
+#   CPT-05+FO-01 (REJECTED): commander: CPT-05's MEDICAL expired ...;
+#   second pilot: FO-01's SIM expired ...; CPT-05+FO-03 (REJECTED):
+#   commander: CPT-05's MEDICAL expired ...; CPT-05+FO-04 ...
+#
+# The content was right and the presentation buried it. The same
+# commander rejection repeats in EVERY line, because the search tries
+# that commander against every second pilot in turn, and each failure
+# is recorded whole.
+#
+# THE SEAT ASYMMETRY IS THE WHOLE INSIGHT. When the Commander is
+# unavailable, every pair fails for that reason whoever the Second
+# Pilot is — so the Second Pilot reasons are noise, and the useful
+# sentence is "no eligible Commander, because ...". When a Commander
+# was available and only Second Pilots failed, the opposite holds and
+# the list of who and why IS the answer.
+#
+# Same shape as the alert-volume problem, and the same treatment:
+# bucket by root cause, lead with the blocking one, collapse repeats —
+# while the status stays derived from the full set, never from the
+# summary (see services/alert_summary.py).
+#
+# SUMMARISED FROM STRUCTURE, NEVER PARSED BACK OUT OF THE STRING. The
+# facts are all in hand at the moment each trial fails; joining them
+# and then re-splitting would make the display depend on the exact
+# punctuation of a sentence written for humans.
+
+_MAX_NAMED_CREW = 4
+
+
+@dataclass
+class RejectedTrial:
+    """One candidate combination the search tried and discarded.
+
+    `text` is the full human sentence that has always been recorded —
+    kept verbatim so the durable record loses nothing — while the
+    separate fields are what the summary is computed from.
+    """
+    commander_id: Optional[str] = None
+    second_pilot_id: Optional[str] = None
+    commander_reason: Optional[str] = None
+    second_pilot_reason: Optional[str] = None
+    pair_reason: Optional[str] = None
+    text: str = ""
+
+
+def _named_reasons(pairs) -> str:
+    """`CPT-05: MEDICAL expired ...; CPT-06: insufficient rest`, each
+    crew member once, in first-seen order, capped so one unreadable
+    paragraph is not replaced by a shorter unreadable paragraph."""
+    seen = {}
+    for crew_id, reason in pairs:
+        if crew_id and reason and crew_id not in seen:
+            seen[crew_id] = reason
+    # build_audit_reason() already opens with the crew member's own id
+    # ("CPT-05's MEDICAL expired ..."), so prefixing unconditionally
+    # produced "CPT-05: CPT-05's MEDICAL expired ...". Naming a pilot
+    # twice in a sentence written to reduce repetition would be a poor
+    # joke, and the prefix is kept only for reasons that do not already
+    # identify who they are about.
+    named = [reason if reason.startswith(crew_id) else f"{crew_id}: {reason}"
+             for crew_id, reason in list(seen.items())[:_MAX_NAMED_CREW]]
+    remainder = len(seen) - len(named)
+    if remainder > 0:
+        named.append(f"and {remainder} other crew member(s)")
+    return "; ".join(named)
+
+
+def summarize_rejected_trials(trials: List["RejectedTrial"],
+                               seat: Optional[str] = None) -> str:
+    """One sentence naming the ROOT CAUSE, from the structured trials.
+
+    seat names the single seat being filled when only one was open
+    (the other is already crewed); None means a fresh pair search.
+
+    The commander test is deliberately "every trial that named a
+    commander was blocked BY that commander" rather than "some trial
+    mentioned a commander problem". A pool where one commander is
+    grounded and another is merely busy must not report as "no eligible
+    Commander" — that would send a controller to renew a medical when
+    the real blocker was rest.
+    """
+    if not trials:
+        return "No candidates in pool"
+
+    if seat is not None:
+        label = seat.replace("_", " ").title()
+        blocked = _named_reasons(
+            (t.commander_id or t.second_pilot_id, t.commander_reason or t.second_pilot_reason)
+            for t in trials)
+        return f"No eligible {label} — {blocked}" if blocked else f"No eligible {label}"
+
+    commander_trials = [t for t in trials if t.commander_id]
+    commanders_all_blocked = bool(commander_trials) and all(
+        t.commander_reason for t in commander_trials)
+
+    if commanders_all_blocked:
+        # Every commander candidate is itself unavailable, so no choice
+        # of second pilot could have helped and naming them would point
+        # at the wrong problem.
+        return "No eligible Commander — " + _named_reasons(
+            (t.commander_id, t.commander_reason) for t in trials)
+
+    # At least one commander was usable, so the second pilots are where
+    # it actually failed — and only the trials with a usable commander
+    # say anything about them.
+    viable = [t for t in trials if not t.commander_reason]
+    second_pilot_blocked = _named_reasons(
+        (t.second_pilot_id, t.second_pilot_reason) for t in viable)
+    if second_pilot_blocked:
+        return "No eligible Second Pilot — " + second_pilot_blocked
+
+    pair_reasons = [t.pair_reason for t in viable if t.pair_reason]
+    if pair_reasons:
+        # Neither pilot is individually blocked; the combination is —
+        # the age-pairing rule being the live example.
+        return "No legal pairing — " + "; ".join(dict.fromkeys(pair_reasons))
+
+    return "No legal pairing found"
+
+
+def build_uncovered_reason(trials: List["RejectedTrial"],
+                            seat: Optional[str] = None) -> str:
+    """What is STORED in uncovered_seats.reason: the summary first, then
+    every trial verbatim.
+
+    PREPENDED, NOT SUBSTITUTED. That column is now the only surviving
+    explanation of an unfilled seat and is regulatory evidence, so the
+    per-trial detail that was always there is still there, character for
+    character — this only puts a derived headline in front of it, so the
+    first thing a reader meets is the blocking cause rather than the
+    thirtieth repetition of it. tests/test_uncovered_reason.py asserts
+    every original line survives.
+    """
+    if not trials:
+        return "No candidates in pool"
+    summary = summarize_rejected_trials(trials, seat=seat)
+    # The summary usually ends in a full stop already, because it ends
+    # in a reason sentence build_audit_reason() punctuated ("... not
+    # valid for duty date 2026-09-08."). Appending another gave
+    # "2026-09-08.. Tried 3 combination(s)." — so the terminator is
+    # added only when the summary has not supplied one, rather than
+    # stripped afterwards, which would eat a legitimate ellipsis.
+    if not summary.endswith((".", "!", "?")):
+        summary += "."
+    return (f"{summary} Tried {len(trials)} combination(s). Detail: "
+            + "; ".join(t.text for t in trials))
+
+
 def _reject_reason(crew_id: str, result) -> str:
+    return _reject_trial(crew_id, result).text
+
+
+def _reject_trial(crew_id: str, result) -> RejectedTrial:
+    """The single-seat trial, structured. `text` is byte-identical to
+    what _reject_reason() has always produced."""
     reason_text = None
     if result.alert_summary is not None:
         reason_text = build_audit_reason(
             result.alert_summary, frozenset({AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW}))
-    return f"{crew_id} ({result.status}): {reason_text or 'no detail'}"
+    return RejectedTrial(
+        second_pilot_id=crew_id, second_pilot_reason=reason_text,
+        text=f"{crew_id} ({result.status}): {reason_text or 'no detail'}")
 
 
 def _pair_reject_reason(commander_id: str, second_pilot_id: str, pair_result) -> str:
+    return _pair_reject_trial(commander_id, second_pilot_id, pair_result).text
+
+
+def _pair_reject_trial(commander_id: str, second_pilot_id: str, pair_result) -> RejectedTrial:
+    """The pair trial, structured. `text` is byte-identical to what
+    _pair_reject_reason() has always produced — the summary is built
+    from the fields beside it, never by parsing this back apart."""
     parts = []
     commander_reason = build_audit_reason(
         pair_result.validation.commander_alert_summary, frozenset({AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW})
@@ -260,8 +432,14 @@ def _pair_reject_reason(commander_id: str, second_pilot_id: str, pair_result) ->
         parts.append(f"second pilot: {second_pilot_reason}")
     if pair_result.validation.pair_alerts:
         parts.append("; ".join(a.message for a in pair_result.validation.pair_alerts))
+    pair_reason = ("; ".join(a.message for a in pair_result.validation.pair_alerts)
+                   if pair_result.validation.pair_alerts else None)
     detail = "; ".join(parts) if parts else "no detail"
-    return f"{commander_id}+{second_pilot_id} ({pair_result.status}): {detail}"
+    return RejectedTrial(
+        commander_id=commander_id, second_pilot_id=second_pilot_id,
+        commander_reason=commander_reason, second_pilot_reason=second_pilot_reason,
+        pair_reason=pair_reason,
+        text=f"{commander_id}+{second_pilot_id} ({pair_result.status}): {detail}")
 
 
 def _record_uncovered(instance_id: int, rotation_code: str, reference_date: dt.date,
@@ -482,7 +660,7 @@ def generate_preview(date_from: dt.date, date_to: dt.date,
             ]
             ordered = order_candidates(candidates, domestic=domestic, partner_age=partner_age)
 
-            filled_id, filled_result, reasons = None, None, []
+            filled_id, filled_result, reasons = None, None, []  # reasons: RejectedTrial
             for crew_id in ordered:
                 crew_row = crew_by_id[crew_id]
                 # dry_run=True: the whole gate runs, nothing is written.
@@ -496,7 +674,7 @@ def generate_preview(date_from: dt.date, date_to: dt.date,
                 if result.status == "ALLOWED":
                     filled_id, filled_result = crew_id, result
                     break
-                reasons.append(_reject_reason(crew_id, result))
+                reasons.append(_reject_trial(crew_id, result))
 
             if filled_id is not None:
                 duty_counts[fill_position][filled_id] = duty_counts[fill_position].get(filled_id, 0) + 1
@@ -515,10 +693,12 @@ def generate_preview(date_from: dt.date, date_to: dt.date,
                 )
                 rotation.outcome = OUTCOME_PROPOSED
             else:
-                reason = "; ".join(reasons) if reasons else "No candidates in pool"
+                reason = build_uncovered_reason(reasons, seat=fill_position)
                 rotation.seats[fill_position].reason = reason
                 rotation.outcome = OUTCOME_UNCOVERED
                 rotation.outcome_reason = reason
+                rotation.outcome_summary = summarize_rejected_trials(
+                    reasons, seat=fill_position)
             continue
 
         # Neither seat filled -- fresh pair search.
@@ -569,8 +749,8 @@ def generate_preview(date_from: dt.date, date_to: dt.date,
                     filled_pair = (commander_candidate_id, second_pilot_candidate_id)
                     pair_result_kept = pair_result
                     break
-                all_reasons.append(
-                    _pair_reject_reason(commander_candidate_id, second_pilot_candidate_id, pair_result))
+                all_reasons.append(_pair_reject_trial(
+                    commander_candidate_id, second_pilot_candidate_id, pair_result))
             if filled_pair is not None:
                 break
 
@@ -609,11 +789,12 @@ def generate_preview(date_from: dt.date, date_to: dt.date,
                 debrief_time=validation.second_pilot_computed_debrief_time)
             rotation.outcome = OUTCOME_PROPOSED
         else:
-            reason = "; ".join(all_reasons) if all_reasons else "No candidates in pool"
+            reason = build_uncovered_reason(all_reasons)
             for position in SEATS:
                 rotation.seats[position].reason = reason
             rotation.outcome = OUTCOME_UNCOVERED
             rotation.outcome_reason = reason
+            rotation.outcome_summary = summarize_rejected_trials(all_reasons)
 
     return preview
 
