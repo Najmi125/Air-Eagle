@@ -382,8 +382,16 @@ def build_uncovered_reason(trials: List["RejectedTrial"],
     """
     if not trials:
         return "No candidates in pool"
-    return (f"{summarize_rejected_trials(trials, seat=seat)}. "
-            f"Tried {len(trials)} combination(s). Detail: "
+    summary = summarize_rejected_trials(trials, seat=seat)
+    # The summary usually ends in a full stop already, because it ends
+    # in a reason sentence build_audit_reason() punctuated ("... not
+    # valid for duty date 2026-09-08."). Appending another gave
+    # "2026-09-08.. Tried 3 combination(s)." — so the terminator is
+    # added only when the summary has not supplied one, rather than
+    # stripped afterwards, which would eat a legitimate ellipsis.
+    if not summary.endswith((".", "!", "?")):
+        summary += "."
+    return (f"{summary} Tried {len(trials)} combination(s). Detail: "
             + "; ".join(t.text for t in trials))
 
 

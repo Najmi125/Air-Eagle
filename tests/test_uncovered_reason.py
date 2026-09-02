@@ -182,6 +182,27 @@ def test_the_stored_reason_leads_with_the_summary_and_counts_the_trials():
     assert stored.index("Detail:") < stored.index("CPT-05+FO-01")
 
 
+def test_the_summary_is_not_double_punctuated():
+    """Reported 2026-09-02: `...duty date 2026-09-08.. Tried 3
+    combination(s).` — build_audit_reason() punctuates its own sentence,
+    and the joiner added a second full stop.
+
+    Both directions are pinned, because the fix is "add a terminator
+    only when one is missing" rather than "strip one afterwards", and
+    the two differ on a summary that legitimately ends some other way."""
+    ends_with_stop = [RejectedTrial(
+        commander_id="CPT-05", commander_reason="CPT-05's MEDICAL expired 2026-08-31.",
+        text="CPT-05+FO-01 (REJECTED): commander: expired")]
+    stored = build_uncovered_reason(ends_with_stop)
+    assert ".." not in stored, stored
+    assert "2026-08-31. Tried 1 combination(s)." in stored
+
+    no_stop = [RejectedTrial(
+        commander_id="CPT-05", commander_reason="CPT-05's MEDICAL expired 2026-08-31",
+        text="CPT-05+FO-01 (REJECTED): commander: expired")]
+    assert "2026-08-31. Tried 1 combination(s)." in build_uncovered_reason(no_stop)
+
+
 def test_the_summary_is_derived_and_not_the_status():
     """Belt and braces on the alert-volume lesson: collapsing is a
     display concern. The count of trials in the record must reflect

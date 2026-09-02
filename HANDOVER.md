@@ -8241,6 +8241,14 @@ member's own id. Naming a pilot twice in a sentence written to reduce
 repetition would be a poor joke; the prefix is now added only to reasons
 that do not already identify who they are about.
 
+A second one found in verification: the joined reason read
+`...duty date 2026-09-08.. Tried 3 combination(s).` — `build_audit_reason()`
+punctuates its own sentence and the joiner added another. The terminator
+is now added only when the summary has not supplied one, rather than
+stripped afterwards, which would eat a legitimate ellipsis. Both
+directions pinned, and mutation-tested by making the append
+unconditional.
+
 ### ⚠ Reboot required — and a FOURTH LIMB of the rule
 
 **No import changed anywhere**, so both known checks pass this branch
