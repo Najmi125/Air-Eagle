@@ -268,13 +268,18 @@ def _render(assign_pair=True):
     return at
 
 
-def _fill_flight(at, operating="", non_operating=""):
+def _fill_flight(at, operating="", non_operating="", flight_no="EPE 786"):
     """Exact-prefix matching, NOT substring: the non-operating label
     contains the operating one ("...non-operating (aboard" contains
     "operating (aboard"), so a substring match fills both fields with
     the same value."""
     for t in at.text_input:
-        if t.label.startswith("Origin"):
+        # Flight No. became required in the UI on 2026-09-04; the
+        # column stays nullable (see the form's own comment). Pass
+        # flight_no="" to exercise the refusal.
+        if t.label.startswith("Flight No"):
+            t.input(flight_no)
+        elif t.label.startswith("Origin"):
             t.input("KHI")
         elif t.label.startswith("Destination"):
             t.input("LHE")
@@ -412,7 +417,11 @@ def _by_label(elements, label):
 
 
 def _fill_flight_form(at, origin="KHI", destination="LHE",
-                      dep="0500", arr="0700", flight_no=None):
+                      dep="0500", arr="0700", flight_no="EPE 786"):
+    """flight_no defaults to a real number since 2026-09-04, when the
+    field became required in the UI. It defaulted to None and was left
+    BLANK, which every one of these DB-gated tests would now fail on.
+    Pass "" to exercise the refusal."""
     for t in at.text_input:
         if t.label.startswith("Flight No") and flight_no is not None:
             t.input(flight_no)
