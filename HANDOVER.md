@@ -324,6 +324,38 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`rescue-swap-alerts-and-flight-no` merged into `main` (2026-09-05).**
+  Three things rescued from the cancelled
+  `flt-schedule-readonly-actuals-to-control-room` branch, all
+  independent of the move that was cancelled. **764/764 verified against
+  real Postgres 16**, reachability clean. **No reboot, no migration** —
+  from the check, not from memory.
+
+  **A CONTROLLER HAD NEVER SEEN A SWAP ALERT.** Live defect on `main`,
+  not something the cancelled branch introduced: Control Room's ALLOWED
+  branch wrote its success line, pair alerts and swap alerts — "this
+  assignment breaks the legality of N already-scheduled future
+  duty(ies)", including "no legal candidates found" — then called
+  `st.rerun()`, which abandons the run. Queued now.
+
+  **Scoped to the two paths that actually rerun.** REJECTED and
+  NEEDS_REVIEW never call `st.rerun()`, so their messages were always
+  visible and were left alone — fixing them would have been a change
+  with no defect behind it. `tests/test_control_room_notices.py` pins
+  BOTH directions, so a later tidy-up that adds a rerun to a visible
+  branch fails too.
+
+  **Flight No. required in the UI, nullable in the schema**, and not a
+  contradiction: rotation expansion already refused a numberless leg
+  and the import script creates crew, so this form was the only path
+  that ever produced a NULL. `flight_label()`'s `#123` fallback stays
+  for the case the schema still allows.
+
+  Two notes rescued with it: `cargo_dg` recorded and checked against
+  nothing while `dg_expiry` is checked on every duty regardless
+  (recorded, NOT fixed — operator question), and the positional-access
+  rule extended to `at.dataframe[`.
+
 - **`crew-change-revalidation` merged into `main` (2026-09-05).**
   Correcting a legality-relevant crew field now re-checks every future
   PLANNED duty that crew member holds and flags whichever no longer
