@@ -66,6 +66,34 @@ st.title("Control Room")
 # ==================================================================
 st.header("1. Operational status")
 
+# Messages that must OUTLIVE the st.rerun() that ends a successful
+# save. st.rerun() ABANDONS the current run, so anything written before
+# it never reaches the browser (HANDOVER 2026-09-03).
+#
+# TWO SITES ON THIS PAGE WERE DISCARDING, and one of them matters a
+# great deal: the ALLOWED branch of the crew-assignment handler wrote
+# its success line, its pair alerts, AND its SWAP ALERTS -- "this
+# assignment breaks the legality of N already-scheduled future
+# duty(ies)", including "no legal candidates found" -- and then called
+# st.rerun(). A controller crewing a flight has never seen any of it.
+#
+# Scoped precisely: the REJECTED and NEEDS_REVIEW branches do NOT
+# rerun, so their messages have always been visible and are left alone.
+# Only the two paths that end in st.rerun() needed queueing.
+_CR_NOTICES = "control_room_notices"
+
+for _notice in st.session_state.pop(_CR_NOTICES, []):
+    {"error": st.error, "warning": st.warning, "info": st.info}.get(
+        _notice["level"], st.success)(_notice["headline"])
+    for _line in _notice["lines"]:
+        st.write(_line)
+
+
+def queue_cr_notice(level, headline, lines=()):
+    """Hold a message for the run AFTER the imminent st.rerun()."""
+    st.session_state.setdefault(_CR_NOTICES, []).append(
+        {"level": level, "headline": headline, "lines": list(lines)})
+
 # Gated on db_status, not merely wrapped. try/except catches a FAILING
 # query but not a HANGING one, and against an unreachable database
 # these sit in connection retries until they time out — which took the
@@ -179,7 +207,25 @@ with st.form("control_room_form"):
         # one didn't, and a charter may well carry one. Optional,
         # because an ad-hoc flight legitimately may not have a number
         # yet; flight_service treats it as nullable for that reason.
-        flight_no = st.text_input("Flight No (optional — ad-hoc flights may not have one yet)")
+        # REQUIRED IN THE UI, NULLABLE IN THE SCHEMA, and the two are
+        # not in conflict (operator decision, 2026-09-04). Air Eagle's
+        # ad-hoc flights always carry an EPE number, so this form
+        # should not invite a blank — but migrations/002 keeps
+        # flight_no nullable, because 103 existing flights were created
+        # under the old assumption and a NOT NULL migration would make
+        # the column lie about what the programmatic paths permit.
+        #
+        # display_labels.flight_label()'s `#123 · 04 Sep 1900z` fallback
+        # therefore STAYS. It protects nothing in production today —
+        # every one of those 103 flights has a number — and it protects
+        # the case the schema still allows.
+        #
+        # Checked: rotation expansion already REFUSES a leg without a
+        # number (rotation_template_service raises, saying numberless
+        # flights go through Control Room), and the import script
+        # creates crew, not flights. So this form was the only path
+        # that ever produced a NULL.
+        flight_no = st.text_input("Flight No. *")
         origin = st.text_input("Origin *")
         destination = st.text_input("Destination *")
         aircraft = st.text_input("Aircraft", value=flight_service.AIRCRAFT_DEFAULT or "")
@@ -283,7 +329,9 @@ if submitted:
     dep_time, dep_error = parse_hhmm(dep_time_raw)
     arr_time, arr_error = parse_hhmm(arr_time_raw)
 
-    if not origin or not destination:
+    if not flight_no or not flight_no.strip():
+        st.error("Flight No. is required.")
+    elif not origin or not destination:
         st.error("Origin and destination are required.")
     elif dep_error or arr_error:
         st.error(dep_error or arr_error)
@@ -325,10 +373,10 @@ if submitted:
             # There is no crew here, so there is no legality gate to run
             # and nothing to be atomic with.
             new_id = flight_service.add_flight(flights_data[0], app_user=app_user)
-            st.success(
+            queue_cr_notice("success", (
                 f"Flight {new_id} saved with no crew assigned (crew TBC). "
                 f"Both cockpit seats will show as UNCOVERED until assigned in Roster."
-            )
+            ))
             st.rerun()
         else:
             try:
@@ -365,27 +413,30 @@ if submitted:
                     for alert in result.validation.pair_alerts:
                         st.write(f"Pair — {alert.message}")
                 else:
-                    st.success(
+                    queue_cr_notice("success", (
                         f"ALLOWED — flight {flight_ids[0]} saved, {commander_id} assigned "
                         f"as Commander, {second_pilot_id} assigned as Second Pilot"
-                    )
-                    for alert in result.validation.pair_alerts:
-                        st.info(f"Pair — {alert.message}")
+                    ), [f"Pair — {alert.message}"
+                        for alert in result.validation.pair_alerts])
 
                     for label, conflicts in (
                         ("Commander", result.commander_downstream_conflicts),
                         ("Second Pilot", result.second_pilot_downstream_conflicts),
                     ):
                         if conflicts:
-                            st.error(
+                            # THE message this fix exists for. A swap
+                            # alert says the assignment just made breaks
+                            # duties already on the roster, and it was
+                            # being written into a run that st.rerun()
+                            # then threw away.
+                            queue_cr_notice("error", (
                                 f"⚠️ Swap alert — this assignment breaks the legality of "
                                 f"{len(conflicts)} already-scheduled future duty(ies) for the {label}:"
-                            )
-                            for conflict in conflicts:
-                                st.write(
-                                    f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
-                                    f"reports {conflict.report_time}): "
-                                    + (f"legal candidates: {', '.join(conflict.candidates)}"
-                                       if conflict.candidates else "**no legal candidates found**")
-                                )
+                            ), [
+                                f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
+                                f"reports {conflict.report_time}): "
+                                + (f"legal candidates: {', '.join(conflict.candidates)}"
+                                   if conflict.candidates else "**no legal candidates found**")
+                                for conflict in conflicts
+                            ])
                     st.rerun()

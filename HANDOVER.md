@@ -8839,3 +8839,120 @@ revalidating); `deactivate_crew` no longer calling the door;
   at page load.
 
 No migration.
+
+## 2026-09-05: rescued from a cancelled branch — swap alerts, a required field, and two notes
+
+The Flt Schedule column removal and the "move actuals to Control Room"
+work were **cancelled** by the operator (2026-09-05), not deferred: Flt
+Schedule keeps "Record actuals, update status, or cancel a flight"
+exactly as it is. `flt-schedule-readonly-actuals-to-control-room` is
+therefore abandoned unmerged.
+
+Three things on it were independent of the move and were rescued here
+rather than lost with it.
+
+### A controller has never seen a swap alert
+
+**A live defect on `main`, not something the cancelled branch
+introduced.** Control Room's crew-assignment handler, ALLOWED branch,
+wrote its success line, its pair alerts, and its SWAP ALERTS —
+
+> ⚠️ Swap alert — this assignment breaks the legality of N
+> already-scheduled future duty(ies) for the Commander:
+> - Duty ... : **no legal candidates found**
+
+— and then called `st.rerun()`, which abandons the run and discards
+everything written in it. The same on the flight-only save path. So the
+one message that tells a controller their new assignment has just
+broken duties already on the roster has never reached a browser.
+
+**Scoped precisely rather than blanket-queued**, because not every
+branch was broken: REJECTED and NEEDS_REVIEW do NOT call `st.rerun()`,
+so their messages have always been visible. Only the two paths that end
+in a rerun needed queueing, and
+`tests/test_control_room_notices.py` pins BOTH directions — so a later
+tidy-up that adds an `st.rerun()` to the visible branches, or that
+routes a queued message back to a direct write, fails.
+
+That test file also documents why it must assert on the run AFTER the
+rerun: an AppTest assertion that a message merely EXISTS can pass while
+the browser shows nothing, because a rerun runs the script twice inside
+one `at.run()` and the discarded first pass survives wherever the
+second render is shorter.
+
+**Pages audited for this defect so far:** Flt Schedule (2026-09-03),
+Roster Generation, Control Room (here), Crew Data and Roster (both in
+the crew-revalidation branch, same day). **Schedule Templates remains
+un-audited** — the last one.
+
+### Flight No. required in the UI, nullable in the schema
+
+Not a contradiction, and recorded so it does not read as one:
+
+* the **form** now demands it (`Flight No. *`), because Air Eagle's
+  ad-hoc flights always carry an EPE number;
+* the **column** stays nullable — 103 existing flights were created
+  under the old assumption, and a NOT NULL migration would make the
+  column lie about what the programmatic paths permit;
+* `flight_label()`'s `#123 · 04 Sep 1900z` fallback **stays**, because
+  it protects the case the schema still allows.
+
+Checked rather than assumed: rotation expansion already REFUSES a leg
+without a number (`rotation_template_service` raises, saying numberless
+flights go through Control Room), and the import script creates crew,
+not flights. **This form was the only path that ever produced a NULL.**
+
+### `cargo_dg` is recorded and checked against nothing (NOT fixed)
+
+Worth writing down because it is easy to assume otherwise:
+`flights.cargo_dg` flags a flight as carrying dangerous goods, and the
+legality gate never reads it. Meanwhile `dg_expiry` sits in
+`QUALIFICATION_EXPIRY_FIELDS`, so **a DG certificate is checked on
+EVERY duty for EVERY crew member regardless of whether the flight
+carries dangerous goods at all.**
+
+That is not a missing check — it is a check applied where it does not
+belong, and it fails toward refusal, so it is an availability cost
+rather than a safety hole. `_check_crew_qualifications()` takes a crew
+row and a date and could not consult `cargo_dg` even in principle.
+**Whether every Air Eagle flight is potentially DG-carrying is an
+operator question**, with Arif as of 2026-09-04. Recorded, not fixed,
+at the operator's instruction.
+
+(The LM/AME side of the same gap is recorded separately from
+2026-08-02.)
+
+### The positional-access rule, extended to `at.dataframe[`
+
+From the same cancelled branch, and general: `st.dataframe()` carries
+no `label=` to match on, so the only honest guard is COUNT rather than
+position.
+
+> A test may not index `at.dataframe[N]` unless the page renders
+> exactly one dataframe by construction. Where more than one could
+> exist, or where the count itself might change, assert the count
+> first. The grep for the WIDGET version of this rule
+> (`at.text_input[`, `at.button[`, `at.selectbox[`, `at.date_input[`,
+> `at.time_input[`) now reads `at.dataframe[` too.
+
+Not swept across the rest of the suite — recorded as the occasion that
+found the gap, not as a claim the gap is closed everywhere.
+
+### No reboot, and the check was RUN
+
+Stated from the check, not from memory:
+
+```
+added imports in pages/          : (none)
+new service attribute reads      : (none)
+migrations                       : (none)
+```
+
+The only new name is `queue_cr_notice()`, defined in the page itself —
+a page's own module-level function is re-created on every script run,
+so no limb applies. **No reboot. No migration.**
+
+Worth noting because the two branches merged on the same day differ:
+`crew-change-revalidation` DID need one, on two limbs. The rule is easy
+to remember and hard to apply, so the grep decides, not the memory of
+what the last branch needed.
