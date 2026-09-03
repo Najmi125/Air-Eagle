@@ -8302,3 +8302,109 @@ The page reads it through `getattr(..., None)` with a fallback to the
 old unsummarised sentence, truncated. That does not remove the reboot
 requirement; it decides what a missed reboot costs — the old wall of
 text instead of the page.
+
+## 2026-09-03: a delay that made a duty impossible produced no warning
+
+Reported from live use. Flight 53 (EPE 786, KHI-LHE) planned 1900-2045z
+was recorded 2200-2345z while its second sector, flight 54, still read
+2200-2345z. Sector 1 landed at the moment sector 2 departed. Status went
+to OPERATED and nothing was reported.
+
+**It detected nothing** — not "detected and failed to surface". Traced:
+
+* `update_flight_actual_times_and_revalidate()` ->
+  `_recompute_one_duty_after_delay()`, which **never called
+  `build_duty()`**. It computed `debrief = sectors[-1].arrival_utc +
+  buffer` directly.
+* the validator's `_check_overlaps()` compares `duty.start_utc` /
+  `duty.end_utc` **between duties**. Nothing checked sectors **within**
+  one.
+* `build_duty()`'s continuity check ran only at assignment time and at
+  rotation expansion — on PLANNED times, where this duty is perfectly
+  coherent. That is exactly why planning-time checking never caught it.
+
+### The worse defect underneath: actuals used for arithmetic, never for ordering
+
+`duty.sectors` are appended in query order — `ORDER BY r.report_time,
+f.dep_time_planned` — and never re-sorted once actuals arrive. So
+`sectors[-1]` is the last sector by PLANNED departure.
+
+**A delay on a NON-FINAL sector therefore ended the duty earlier on
+paper than the crew actually finished, and the recorded FDP understated
+it.** Measured on the real classes:
+
+```
+sectors[-1].arrival_utc   : 2026-09-02 23:45   <- flight 54, untouched
+max arrival across sectors: 2026-09-03 01:00   <- when the crew finished
+debrief computed          : 2026-09-03 00:00
+```
+
+Now `max(s.arrival_utc for s in duty.sectors)`. **THIS CHANGES FDP
+VALUES ON EXISTING DELAYED DUTIES**, upward, and only where a sector
+overtook another — a duty whose sectors are still in order is
+bit-identical, which is pinned. Upward is the safe direction: the old
+number was too low, and a plausible number that is too low is worse
+than a missing one, because nothing about it invites a second look.
+
+In the reported case the two arrivals TIE, so FDP stayed 5.75h — not
+stale, recomputed to the same number. Every figure on screen looked
+right while the duty was impossible.
+
+### One rule, two callers, opposite behaviour
+
+`sector_continuity_problems()` extracted from `build_duty()` into
+`core/duty_builder.py` as a pure predicate returning sentences.
+
+* **Planning must refuse** — `build_duty()` turns any problem into
+  `ValueError`, unchanged.
+* **Recording must not** — what happened, happened. A controller
+  entering an actual mid-duty is doing their job, and blocking it would
+  leave the record less accurate, not more.
+
+A second copy of those two comparisons living in the recording path is
+precisely how the two would drift into disagreeing about what
+"continuous" means.
+
+**NEEDS_MANUAL_REVIEW, not ILLEGAL and not WARNING** (operator
+decision). No ANO-012 limit has been exceeded, so it is not a violation;
+it is a duty whose recorded times cannot be assessed, which is what that
+status means. It also flags every roster row sharing the duty_id as
+NEEDS_REVIEW through machinery that already existed, so the duty carries
+a durable marker rather than a sentence that prints once.
+
+### Found while fixing it: every delay warning was being thrown away
+
+`pages/3_Flight_Log.py` wrote its warnings and then called `st.rerun()`,
+which **abandons the current run** — so nothing written before it ever
+reached the browser. The swap alerts have been invisible since the day
+they were written, and the new continuity warning would have joined
+them. Notices are now queued in `session_state` and rendered at the top
+of the next run.
+
+**This is the FOURTH distinct `session_state` case, and they are not
+interchangeable:** Schedule Templates needs generation-keyed widget
+keys, Crew Data must have none, Roster Generation holds computed work
+deliberately not persisted, and this one carries a message across
+exactly one rerun and drops it. Do not consolidate them.
+
+A suspected fifth defect was NOT one: `result.status in ("ILLEGAL",
+...)` compares an enum to strings, but `AlertStatus(str, Enum)` makes it
+work. Checked rather than assumed, and recorded so nobody "fixes" it.
+
+### The guards, and why the first version of them was theatre
+
+`tests/test_sector_coherence.py`, DB-free. **The first six tests
+exercised the pure rule and a REIMPLEMENTATION of the debrief
+arithmetic — and deleting the continuity check from the service, or
+putting `sectors[-1]` back, left every one of them green.** Same shape
+as the `_read_duty_rows` seam lesson: a test that reimplements the thing
+it tests measures its own copy.
+
+Three further tests drive the real `_recompute_one_duty_after_delay()`
+over fake leaves, patching `_read_duty_rows` so the real
+record-building runs. All four mutations now fail: the check removed,
+`sectors[-1]` restored, the alert downgraded to WARNING, and the rule
+itself defanged.
+
+No new module, no new page import, no new attribute read by a page — so
+**no reboot**, and no migration.
