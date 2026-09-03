@@ -213,6 +213,62 @@ def flight_label(row: Any, include_route: bool = False) -> str:
     return " · ".join(parts)
 
 
+# Titles that appear INSIDE the stored name field. Air Eagle's crew
+# records were imported from a spreadsheet where at least one name
+# reads "CAPT MUHAMMAD ASAD ALI" (checked in production 2026-09-03), so
+# taking the first word as a given name yields "C Ali" — a pilot
+# initialled from a rank. Names are also stored uppercase and two carry
+# trailing whitespace.
+NAME_TITLES = frozenset({
+    "CAPT", "CAPTAIN", "CPT", "FO", "F/O", "FIRST", "OFFICER",
+    "MR", "MRS", "MS", "DR",
+})
+
+
+def crew_seat_name(row: Any) -> str:
+    """`CPT M Waqar` — grade, given-name initial, surname.
+
+    For the Roster table, where two crew share a row and the full
+    `AE-95 (CPT-01) — MUHAMMAD WAQAR` of crew_label() does not fit. A
+    controller reads the seat and wants to know who is in it.
+
+    THE RULE WAS CHOSEN AGAINST THE REAL NAMES, not in the abstract
+    (2026-09-03). First-name-only renders six of Air Eagle's ten pilots
+    as "Muhammad", which identifies nobody; initial-plus-surname
+    separates all ten. It also means CPT-03 reads `CPT S Mahmood` rather
+    than the "Fahim" a controller might say aloud — the trade accepted
+    deliberately, because a rule that works on one name is not a rule.
+
+    Titles stored inside the name are stripped (see NAME_TITLES), so
+    "CAPT MUHAMMAD ASAD ALI" gives `CPT M Ali` and not `CPT C Ali`.
+    Storage is uppercase, so the surname is title-cased; a single-word
+    name is returned whole rather than initialled into nothing.
+
+    The GRADE is used, not the operating position: this answers "who is
+    this person" — the seat is already the column they are sitting in.
+    """
+    grade = _clean(row["role"]) if "role" in row else None
+    name = _clean(row["name"]) if "name" in row else None
+    crew_id = _clean(row["crew_id"]) if "crew_id" in row else None
+
+    if not name:
+        # Never render "None": a crew record with no name still has an
+        # id, and an id is more use than a blank cell.
+        return " ".join(part for part in (grade, crew_id) if part) or "—"
+
+    parts = [word for word in name.split()
+             if word.upper().strip(".") not in NAME_TITLES]
+    if not parts:
+        parts = name.split()
+
+    if len(parts) == 1:
+        who = parts[0].title()
+    else:
+        who = f"{parts[0][0].upper()} {parts[-1].title()}"
+
+    return f"{grade} {who}" if grade else who
+
+
 def crew_labels(crew_df: pd.DataFrame, with_name: bool = True) -> dict:
     """{crew_id: label} for a whole DataFrame — what a selectbox's
     format_func wants, built once instead of per option."""

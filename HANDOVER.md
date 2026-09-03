@@ -324,6 +324,41 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`roster-table-by-flight` merged into `main` (2026-09-03).** The
+  Roster page's "Current assignments" is now one row per flight —
+  Flight, Route, Commander, Second Pilot — with the serial column,
+  `role`, `duty_id` and `flight_id` gone and crew shown as
+  `CPT M Waqar`. **735/735 verified against real Postgres 16**,
+  reachability clean.
+
+  **⚠ NEEDS A REBOOT — limb three.** `pages/4_Roster.py` imports
+  `crew_seat_name` and `flight_label` from `services/display_labels.py`,
+  a module it already imported: a new NAME in an existing import, which
+  is an `ImportError` at page load against a stale `sys.modules`. **No
+  migration.**
+
+  I wrote "no reboot" in this branch's own entry and caught it only by
+  running the check mechanically before pushing — two days after
+  documenting that limb. **The rule is easy to remember and hard to
+  apply, because the diff looks unremarkable. Run the grep, do not
+  recall the conclusion.**
+
+  **`operating_position` NULL means OPPOSITE things depending on grade,
+  and the two must stay apart in code.** On a CPT or FO it is an
+  anomaly — a real assignment the data failed to place — and is
+  surfaced. On an LM or ENGR it is normal, and such a flight does not
+  appear at all. Conflating them fills the column with cargo flights
+  until it is ignored, which is how the anomaly then gets swallowed.
+  Both directions mutation-tested. `COCKPIT_GRADES` is derived from
+  `SEAT_ELIGIBLE_GRADES`, never retyped, because that set decides which
+  meaning applies.
+
+  **`nan or ""` does not fall back — nan is TRUTHY.** An all-NULL seat
+  column comes back float64 and crashed the unassign selectbox. Found
+  by a DB-free fixture constructing a state production does not have,
+  which is the argument for fixtures that build impossible states and
+  not only realistic ones.
+
 - **`sector-coherence-on-actuals` merged into `main` (2026-09-03).** A
   delay that made a duty physically impossible produced no warning —
   flight 53 recorded 2200-2345z while its second sector still read
@@ -8496,3 +8531,112 @@ check is owed to `pages/1_Control_Room.py`, `pages/4_Roster.py`,
 `pages/6_Roster_Generation.py` and `pages/7_Schedule_Templates.py`,
 which have not been audited for this. **NOT DONE — an honest open item
 rather than a claim of completeness.**
+
+## 2026-09-03: the Roster table reads as seats, not as rows
+
+"Current assignments" showed one row per crew member per sector, with
+`crew_id`, `role`, `duty_id`, `flight_id` and a serial column — internal
+identifiers on a screen nobody debugs from. It is now one row per
+flight: **Flight, Route, Commander, Second Pilot**.
+
+### Commander / Second Pilot, not PIC / SIC — a choice, not the schema leaking
+
+PIC and SIC are the operator's own words, and migrations/016 records
+them as equivalent to COMMANDER / SECOND_PILOT. The display could
+legitimately diverge from the data model here.
+
+It does not, because `roster_coverage`'s headers were standardised on
+Commander / Second Pilot on 2026-08-28, and **one concept with two names
+across two screens is worse than either name**. Operator decision
+(2026-09-03). Recorded so this reads as settled rather than as nobody
+having noticed the operator says PIC.
+
+### `crew_seat_name()` — the rule was chosen against the real names
+
+`CPT M Waqar`: grade, given-name initial, surname. Added to
+`display_labels` beside `crew_label()`/`flight_label()` rather than
+started as a new module.
+
+The rule was picked by running candidates over all ten of Air Eagle's
+actual crew records, not reasoned about in the abstract:
+
+* **first-name-only renders SIX OF TEN pilots as "Muhammad"** and
+  identifies nobody. The operator's own illustration ("CPT Fahim") was
+  a rule that worked on one name.
+* **initial-plus-surname separates all ten**, and gives `CPT S Mahmood`
+  for the pilot a controller may say aloud as "Fahim". Trade accepted
+  deliberately.
+* **one stored name begins with a rank** — `CAPT MUHAMMAD ASAD ALI` —
+  so the naive rule initials a pilot from their title: `CPT C Ali`.
+  `NAME_TITLES` strips it. Two names also carry trailing whitespace and
+  all are stored uppercase.
+
+### The same NULL means opposite things depending on grade
+
+`operating_position` is NULL in two unrelated situations, and the
+distinction is kept explicit in code rather than handled by analogy
+(operator decision):
+
+* **on a CPT or FO it is an ANOMALY.** Someone holds a flight-deck seat
+  the data failed to record; dropping them hides a real assignment.
+  Surfaced in a "Seat not recorded" column, and the seat they did not
+  fill still reads UNCOVERED rather than being treated as covered by
+  them. Same treatment as `roster_coverage`.
+* **on an LM or ENGR it is NORMAL.** They are outside the flight-deck
+  model by design — Air Eagle does not even hold them as crew records.
+  A flight carrying only them has no flight-deck assignment, so there
+  is nothing to omit, and it does not appear at all. Same reason a
+  wholly uncrewed flight stays out; Roster Generation's uncovered panel
+  owns those.
+
+**Conflating them fails in both directions**: treat LM like the anomaly
+and the table fills with cargo flights until the column is ignored;
+treat the anomaly like LM and a real assignment vanishes. Both
+mutation-tested.
+
+`COCKPIT_GRADES` is derived from `SEAT_ELIGIBLE_GRADES` rather than
+retyped, so a grade added there cannot quietly become "not cockpit"
+here — which is exactly what decides which of the two meanings applies.
+
+### A latent crash found by the fixture
+
+`a["operating_position"] or ""` was not safe. When EVERY roster row on
+a flight has a NULL seat — an LM/ENGR-only flight — pandas types the
+column float64, and **`nan or ""` evaluates to `nan`, because nan is
+truthy**. The unassign selectbox then concatenated a float to a string
+and the page raised `TypeError`.
+
+Latent rather than live, since Air Eagle holds no LM/ENGR crew records
+today — and it surfaced only because a DB-free fixture created what
+production has not. Now an explicit `pd.isna` check.
+
+### Mutation-tested
+
+Four mutations, each failing the test written for it: LM/ENGR treated as
+an anomaly, the cockpit anomaly silently dropped, flights with no
+flight-deck assignment included, and honorific stripping removed.
+
+370 passed, 365 skipped locally; reachability clean. No migration.
+
+### ⚠ Reboot required — and I wrote "no reboot" first
+
+`pages/4_Roster.py` imports `crew_seat_name` and `flight_label` from
+`services/display_labels.py`, a module it already imported. That is
+**limb three** — a new NAME in an existing import — which needs a
+reboot, and against a stale `sys.modules` it is an `ImportError` at
+page load.
+
+I documented that limb on 2026-09-01, wrote "no new page import, so no
+reboot" here, and only caught it by running the check mechanically
+before pushing rather than trusting the sentence I had just written.
+
+Which is the point worth keeping: **the rule is not hard to remember,
+it is hard to APPLY, because the diff looks unremarkable.** Run the
+check, do not recall the conclusion:
+
+```bash
+git diff main...HEAD -- 'pages/*.py' | grep -E '^\+\s*(import |from )'
+```
+
+and then read any new attribute access on a service-built object,
+which grep cannot show you.
