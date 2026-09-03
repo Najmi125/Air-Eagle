@@ -2317,6 +2317,43 @@ def cancel_flight_and_roster(flight_id: int, reason: Optional[str] = None,
     )
 
 
+def _mark_duty_needs_review(engine, duty_id: str, *, only_planned: bool) -> int:
+    """The ONE place a roster row is moved into NEEDS_REVIEW.
+
+    Returns the number of rows flagged.
+
+    NEVER CLEARS. This function only ever moves rows INTO
+    NEEDS_REVIEW; nothing here or anywhere else moves them out
+    automatically. A field corrected back in the safe direction — a
+    later expiry, a base put right — does not silently un-flag a duty,
+    because the flag records that a human has not yet looked, not that
+    the data is currently bad. clear_duty_review_flag() is the only
+    exit, and it requires a person and a reason.
+
+    only_planned distinguishes the two callers, and the distinction is
+    deliberate rather than incidental:
+
+      * False — _recompute_one_duty_after_delay(). A delay applies to
+        a flight that has already operated, so every non-cancelled row
+        of that duty is in scope.
+      * True — revalidate_crew_duties(). A crew record corrected today
+        cannot make yesterday's duty un-happen, so only future PLANNED
+        rows are touched.
+
+    Passing the scope explicitly is what keeps that difference visible
+    at both call sites. A single shared WHERE clause would have had to
+    pick one, and whichever it picked would have been silently wrong
+    for the other.
+    """
+    scope = "status = 'PLANNED'" if only_planned else "status != 'CANCELLED'"
+    with engine.begin() as conn:
+        result = conn.execute(text(
+            f"UPDATE roster SET status = 'NEEDS_REVIEW' "
+            f"WHERE duty_id = :duty_id AND {scope}"
+        ), {"duty_id": duty_id})
+    return result.rowcount or 0
+
+
 def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
                                      app_user: Optional[str] = None):
     """
@@ -2434,11 +2471,13 @@ def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
 
     now_needs_review = validation_result.status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)
     if now_needs_review:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE roster SET status = 'NEEDS_REVIEW'
-                WHERE duty_id = :duty_id AND status != 'CANCELLED'
-            """), {"duty_id": duty_id})
+        # only_planned=False: a DELAY applies to a flight that has
+        # already operated, so every non-cancelled row of the duty is
+        # in scope. The crew-change path passes True, because a duty
+        # already flown cannot be un-flown by correcting a crew record.
+        # The difference is real, so it is named at both call sites
+        # rather than buried in one shared WHERE clause.
+        _mark_duty_needs_review(engine, duty_id, only_planned=False)
 
     log_audit(
         action_type="DUTY_FLAGGED_FOR_REVIEW_AFTER_DELAY" if now_needs_review else "DUTY_RECOMPUTED_AFTER_DELAY",
@@ -2534,6 +2573,350 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
                 "alert_summary": alert_summary,
             })
     return results
+
+
+# ==================================================================
+# Crew-change revalidation (2026-09-05)
+# ==================================================================
+# Reported from live use: an OCC member set CPT-03's SIM expiry to a
+# past date and saved it. CPT-03 stayed on already-written PLANNED
+# rosters and nothing was flagged. Future assignments were correctly
+# refused, but a pilot whose document lapses today stayed on next
+# week's published roster silently -- the only remedy being for
+# somebody to notice.
+#
+# The GENERAL shape, not the reported slice: an OCC member enters a
+# crew field wrong and corrects it days later, and it is not only
+# expiry dates. A wrong base corrected a week later is the same
+# operator scenario as a wrong expiry, so both go through one door.
+# Nobody should have to know which field is "cheap" to trust that
+# correcting it revalidates the roster.
+
+# Which crew fields legality actually depends on, and what each costs
+# to re-check. The tiers are about COST, not about whether the field
+# matters -- every one of these re-checks every affected duty.
+#
+# Derived from what the engine actually consumes, checked rather than
+# assumed: CrewMember carries only crew_id/name/home_base, so `base`
+# feeds rest; `role` feeds FTL_EXEMPT_ROLES and seat eligibility;
+# date_of_birth feeds the age-pairing rule; the expiries and is_active
+# feed _check_crew_qualifications().
+LEGALITY_FIELDS_TIER1 = frozenset(QUALIFICATION_EXPIRY_FIELDS) | {"is_active"}
+LEGALITY_FIELDS_TIER2 = frozenset({"date_of_birth"})
+LEGALITY_FIELDS_TIER3 = frozenset({"base", "role"})
+LEGALITY_RELEVANT_FIELDS = (
+    LEGALITY_FIELDS_TIER1 | LEGALITY_FIELDS_TIER2 | LEGALITY_FIELDS_TIER3
+)
+# Everything else on the crew record -- operator_staff_id, name,
+# nationality, phone, email, license_no, remarks -- changes nothing a
+# legality rule reads, so correcting a phone number does not walk the
+# roster.
+
+
+def _read_reval_rows(engine, query: str, params: dict) -> List[dict]:
+    """One-line seam, same purpose as _read_duty_rows(): lets a test
+    control this query without reimplementing the scoping rules above
+    it."""
+    with engine.connect() as conn:
+        return [dict(row) for row in conn.execute(text(query), params).mappings()]
+
+
+def _future_planned_duties(engine, crew_id: str, now=None) -> List[dict]:
+    """Every duty this crew member holds that is BOTH still in the
+    future and still merely PLANNED.
+
+    Its own query rather than a column added to _cached_db_duty_rows().
+    That loader is the cached hot path the 2026-08-22 round-trip work
+    took from 4,822 to 133, and it answers a different question --
+    "this crew member's duty history, for legality" -- which is why it
+    filters status != 'CANCELLED' and does not carry status at all.
+    "Which duties are future and PLANNED" is a scoping question, not a
+    legality one, and conflating the two is how that loader accretes.
+
+    THE FOUR EXCLUSIONS, all deliberate:
+
+      * OPERATED -- a duty already flown does not retroactively
+        un-happen because a crew record was corrected afterwards.
+      * NEEDS_REVIEW -- already flagged. Re-flagging says nothing new,
+        and re-examining risks the auto-clear this must never do.
+      * DISRUPTED -- carries its own manual label and its own reason;
+        a crew edit must not quietly overwrite that state.
+      * PROPOSED -- legacy rows only. Accept has written PLANNED
+        directly since 2026-09-01, so these are pre-change leftovers
+        rather than commitments anyone is flying.
+
+    "Future" is measured on report_time, not duty_date: a duty that
+    reported this morning has already started, and is not future even
+    though its calendar date is today.
+    """
+    # NAIVE UTC, deliberately: roster.report_time is a bare TIMESTAMP
+    # and this whole engine is "naive, UTC by convention" (see
+    # FlightLeg). Handing Postgres an aware datetime here would compare
+    # timestamp against timestamptz, which casts through the session
+    # timezone and can move the future/past boundary by hours.
+    # utcnow() would be the short spelling and is deprecated in 3.12.
+    now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    return _read_reval_rows(engine, """
+        SELECT r.duty_id,
+               MIN(r.report_time)  AS report_time,
+               MAX(r.debrief_time) AS debrief_time,
+               MIN(r.role_assigned) AS role_assigned,
+               MIN(r.operating_position) AS operating_position,
+               ARRAY_AGG(DISTINCT r.flight_id) AS flight_ids
+        FROM roster r
+        WHERE r.crew_id = :crew_id
+          AND r.status = 'PLANNED'
+          AND r.report_time > :now
+        GROUP BY r.duty_id
+        ORDER BY MIN(r.report_time)
+    """, {"crew_id": crew_id, "now": now})
+
+
+def _tier_for(changed_fields) -> int:
+    """The HIGHEST tier among the changed fields, because the higher
+    check subsumes the lower one -- tier 3 runs the whole gate, which
+    includes the qualification check tier 1 runs alone.
+
+    Returns 0 when nothing legality-relevant changed, which is what
+    stops a corrected phone number walking the roster.
+    """
+    changed = set(changed_fields or ())
+    if changed & LEGALITY_FIELDS_TIER3:
+        return 3
+    if changed & LEGALITY_FIELDS_TIER2:
+        return 2
+    if changed & LEGALITY_FIELDS_TIER1:
+        return 1
+    return 0
+
+
+def _reasons_duty_fails(engine, crew_row, duty: dict, *, tier: int,
+                         schedule_result=None) -> List[str]:
+    """Why this one duty no longer passes, as sentences -- or [] if it
+    still does.
+
+    NO NEW LEGALITY LOGIC. Tier 1 asks _check_crew_qualifications(),
+    tier 2 asks validate_pair(), tier 3 reads the validator's own
+    schedule result. Each is the function the assignment gate already
+    uses; this only re-asks them about a duty that already exists.
+    """
+    reasons: List[str] = []
+    blocking = (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)
+
+    # Tier 1 applies at EVERY tier -- the higher tiers subsume it
+    # rather than replace it, and a lapsed document is a reason a duty
+    # fails whatever else changed.
+    debrief = duty.get("debrief_time")
+    qual_date = debrief.date() if hasattr(debrief, "date") else debrief
+    for alert in _check_crew_qualifications(crew_row, qual_date):
+        if alert.status in blocking:
+            reasons.append(alert.message)
+
+    if tier >= 2 and duty.get("operating_position") in ("COMMANDER", "SECOND_PILOT"):
+        flight_ids = list(duty.get("flight_ids") or [])
+        partner = _find_paired_pilot(
+            engine, flight_ids, duty["operating_position"], crew_row["crew_id"])
+        if partner is not None:
+            if duty["operating_position"] == "COMMANDER":
+                commander_id, second_pilot_id = crew_row["crew_id"], partner["crew_id"]
+            else:
+                commander_id, second_pilot_id = partner["crew_id"], crew_row["crew_id"]
+            try:
+                pair = validate_pair(commander_id, second_pilot_id, flight_ids)
+            except ValueError as exc:
+                reasons.append(f"pair could not be re-validated: {exc}")
+            else:
+                if pair.status in (AlertStatus.ILLEGAL.value,
+                                   AlertStatus.NEEDS_MANUAL_REVIEW.value):
+                    for alert in pair.pair_alerts:
+                        reasons.append(alert.message)
+
+    if tier >= 3 and schedule_result is not None:
+        summary = summarize_alerts(schedule_result, target_duty_id=duty["duty_id"])
+        for alert in summary.target_duty_alerts:
+            if alert.status in blocking:
+                reasons.append(alert.message)
+
+    # Deduplicated, order preserved: tier 1 runs at every tier and the
+    # pair check re-runs each pilot's own qualification gate, so the
+    # same lapsed medical can arrive twice.
+    return list(dict.fromkeys(reasons))
+
+
+def revalidate_crew_duties(crew_id: str, changed_fields,
+                            app_user: Optional[str] = None) -> dict:
+    """Re-check every future PLANNED duty this crew member holds, using
+    CURRENT data, and flag whichever no longer pass.
+
+    THE ONE DOOR. crew_service.update_crew() and
+    crew_service.deactivate_crew() both call this, so no second writer
+    can change a legality-relevant crew field without the roster being
+    re-asked.
+
+    deactivate_crew() matters as much as update_crew() and is easy to
+    miss: is_active is not in UPDATABLE_FIELDS at all, so a fix wired
+    only into update_crew() would have left the single most
+    consequential crew change -- removing a pilot from service while
+    they still hold future duties -- bypassing revalidation entirely.
+
+    Returns {"tier", "checked", "flagged", "schedule_level"}, where
+    flagged is a list of {duty_id, report_time, reasons}. Callers
+    report it; nothing here writes to the screen.
+
+    EVERY affected duty is flagged, with no cap. If a correction
+    affects thirty duties then thirty duties are genuinely affected,
+    and quietly showing five would be the reassuring-but-false record
+    this project keeps stamping out.
+
+    NEVER CLEARS -- see _mark_duty_needs_review(). A correction in the
+    safe direction leaves existing flags standing, because the flag
+    records that nobody has looked yet, not that the data is currently
+    bad. clear_duty_review_flag() is the only exit.
+    """
+    tier = _tier_for(changed_fields)
+    result = {"tier": tier, "checked": 0, "flagged": [], "schedule_level": []}
+    if tier == 0:
+        return result
+
+    engine = get_engine()
+    crew_row = crew_service.get_crew(crew_id)
+    if crew_row is None:
+        return result
+
+    duties = _future_planned_duties(engine, crew_id)
+    result["checked"] = len(duties)
+    if not duties:
+        return result
+
+    schedule_result = None
+    if tier >= 3 and crew_row["role"] not in FTL_EXEMPT_ROLES:
+        # Loaded ONCE for the whole sweep, not per duty. The crew
+        # member's history does not change between duties inside a
+        # single revalidation, and reloading it per duty is the
+        # per-candidate re-fetch that cost the generator 4,822
+        # round-trips on 2026-08-22.
+        history = _load_duty_records_for_crew(engine, crew_id, crew_row["base"])
+        all_duties = sorted((r["duty"] for r in history), key=lambda d: d.start_utc)
+        if all_duties:
+            schedule_result = validator.validate_schedule(
+                _crew_member(crew_row), all_duties)
+
+    for duty in duties:
+        reasons = _reasons_duty_fails(
+            engine, crew_row, duty, tier=tier, schedule_result=schedule_result)
+        if not reasons:
+            continue
+
+        flagged_rows = _mark_duty_needs_review(engine, duty["duty_id"], only_planned=True)
+        if not flagged_rows:
+            # Raced with something else: the duty stopped being PLANNED
+            # between the scoping query and this write. Reporting it as
+            # flagged would be a lie.
+            continue
+
+        result["flagged"].append({
+            "duty_id": duty["duty_id"],
+            "report_time": duty["report_time"],
+            "reasons": reasons,
+        })
+        log_audit(
+            action_type="DUTY_FLAGGED_FOR_REVIEW_AFTER_CREW_CHANGE",
+            affected_crew=crew_id,
+            affected_duty=duty["duty_id"],
+            legality_result="NEEDS_MANUAL_REVIEW",
+            changed_state=f"crew fields changed: {sorted(set(changed_fields))}",
+            warning_or_failure_reason="; ".join(reasons),
+            app_user=app_user,
+        )
+
+    if schedule_result is not None:
+        # Whole-schedule patterns (D23.1 mandatory days off, D23.2
+        # seventh day) belong to no single duty, so they flag no single
+        # duty -- attributing one to an arbitrary duty would invent a
+        # precision the rule does not have. They are REPORTED instead,
+        # loudly, because silently dropping a legality failure the
+        # change caused is the worse of the two errors.
+        summary = summarize_alerts(schedule_result, target_duty_id=None)
+        result["schedule_level"] = [
+            a.message for a in summary.schedule_level_alerts
+            if a.status in (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)
+        ]
+
+    return result
+
+
+def clear_duty_review_flag(duty_id: str, reason: str,
+                            app_user: Optional[str] = None) -> int:
+    """Move a duty out of NEEDS_REVIEW, back to PLANNED. Returns the
+    number of rows changed.
+
+    THE ONLY EXIT, and deliberately a human one. Nothing in this system
+    clears a review flag automatically: a crew field corrected back in
+    the safe direction leaves the flag standing, because the flag does
+    not record "the data is bad" -- it records "nobody has looked at
+    this duty since the data changed". Only a person retires that, and
+    they have to say so.
+
+    ADDED WITH the revalidation that made it necessary. Until
+    2026-09-05 nothing anywhere could clear this status: the only
+    writer was _recompute_one_duty_after_delay(), and no service, page
+    or migration ever reversed it. Combined with flagging every
+    affected duty, one corrected field could have permanently flagged
+    thirty duties with no way back short of unassigning and reassigning
+    every one -- which is how a safety flag becomes a thing people
+    route around instead of read.
+
+    A reason is REQUIRED, for the same purpose the flag has: the audit
+    row must say who decided this duty was fine, and why.
+    """
+    if not reason or not reason.strip():
+        raise ValueError("A reason is required to clear a review flag.")
+
+    engine = get_engine()
+    with engine.begin() as conn:
+        updated = conn.execute(text("""
+            UPDATE roster SET status = 'PLANNED'
+            WHERE duty_id = :duty_id AND status = 'NEEDS_REVIEW'
+        """), {"duty_id": duty_id})
+    changed = updated.rowcount or 0
+
+    if changed:
+        log_audit(
+            action_type="DUTY_REVIEW_FLAG_CLEARED",
+            affected_duty=duty_id,
+            changed_state="NEEDS_REVIEW->PLANNED",
+            warning_or_failure_reason=reason.strip(),
+            app_user=app_user,
+        )
+    return changed
+
+
+def duties_needing_review(date_from=None, date_to=None) -> pd.DataFrame:
+    """Every roster row currently sitting in NEEDS_REVIEW, so a human
+    can find what they are being asked to look at.
+
+    Without this the flag is invisible: it lives in roster.status, and
+    no page listed it before 2026-09-05 -- which is the other half of
+    why flagging duties was safe to add only once clearing them was
+    possible.
+    """
+    engine = get_engine()
+    query = """
+        SELECT r.duty_id, r.crew_id, r.duty_date, r.report_time, r.debrief_time,
+               r.role_assigned, r.operating_position, r.flight_id,
+               f.flight_no, f.origin, f.destination
+        FROM roster r JOIN flights f ON r.flight_id = f.flight_id
+        WHERE r.status = 'NEEDS_REVIEW'
+    """
+    params = {}
+    if date_from is not None:
+        query += " AND r.duty_date >= :date_from"
+        params["date_from"] = date_from
+    if date_to is not None:
+        query += " AND r.duty_date <= :date_to"
+        params["date_to"] = date_to
+    query += " ORDER BY r.report_time, r.duty_id"
+    return pd.read_sql(text(query), engine, params=params)
 
 
 def get_roster_for_crew(crew_id: str, include_cancelled: bool = False,

@@ -324,6 +324,50 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`crew-change-revalidation` merged into `main` (2026-09-05).**
+  Correcting a legality-relevant crew field now re-checks every future
+  PLANNED duty that crew member holds and flags whichever no longer
+  pass. Reported from live use: an OCC member set CPT-03's SIM expiry
+  to a past date and CPT-03 stayed on already-written PLANNED rosters
+  with nothing flagged. **758/758 verified against real Postgres 16**,
+  reachability clean, with the operator's exact scenario reproduced end
+  to end (`PLANNED` -> `NEEDS_REVIEW`, renewing forward leaves the flag
+  standing, `deactivate_crew()` routing through the same door).
+
+  **⚠ NEEDS A REBOOT — TWO LIMBS. No migration.**
+  `pages/2_Crew_Data.py` imports `utc_stamp` from a module it already
+  imported (limb 3), and `pages/4_Roster.py` calls
+  `assignment_service.duties_needing_review()` and
+  `clear_duty_review_flag()` — new attributes on a module it already
+  imports (limb 4, `AttributeError` at page load against a stale
+  `sys.modules`).
+
+  **THE ONE DOOR IS THE POINT.** `update_crew()` AND
+  `deactivate_crew()` both call `revalidate_crew_duties()`, because
+  `is_active` is not in `UPDATABLE_FIELDS` at all — a fix wired only
+  into `update_crew()` would have left taking a pilot out of service
+  while they hold future duties bypassing revalidation entirely.
+  `test_both_crew_writers_go_through_the_one_door` fails if a third
+  writer appears. The reverse import is a genuine cycle, so the call
+  imports inside the function body: the only place in `services/` that
+  does, and deliberate — wiring into the service rather than the page
+  is what stops a caller bypassing it.
+
+  **NEVER AUTO-CLEARS, and that is why the clear control shipped with
+  it.** A field corrected back in the safe direction leaves the flag
+  standing: the flag records that nobody has LOOKED since the data
+  changed, not that the data is currently bad. Until this branch
+  nothing anywhere could clear `NEEDS_REVIEW` and no page listed
+  flagged duties, so a second flagger without an exit would have made
+  the correction path something people route around.
+
+  **Before changing `changed_fields`:** it diffs old against new rather
+  than trusting the caller's dict, and that is load-bearing. The Crew
+  Data form submits every field on every save, so the naive version
+  would revalidate the whole roster on a no-op save — the feature would
+  have looked correct while producing pure noise, and the flags would
+  have stopped being believed.
+
 - **`roster-table-by-flight` merged into `main` (2026-09-03).** The
   Roster page's "Current assignments" is now one row per flight —
   Flight, Route, Commander, Second Pilot — with the serial column,
@@ -8640,3 +8684,158 @@ git diff main...HEAD -- 'pages/*.py' | grep -E '^\+\s*(import |from )'
 
 and then read any new attribute access on a service-built object,
 which grep cannot show you.
+
+## 2026-09-05: correcting a crew field now re-checks the duties already written
+
+Reported from live use: an OCC member set CPT-03's SIM expiry to a past
+date and saved it. CPT-03 stayed on already-written PLANNED rosters and
+nothing was flagged. Future assignments were correctly refused the whole
+time — the gate works — but **a pilot whose document lapses today stayed
+on next week's published roster silently**, and the only remedy was
+somebody noticing.
+
+Built to the GENERAL scope, not the reported slice: the scenario is an
+OCC member entering a crew field wrong and correcting it days later, and
+that is not only expiry dates. A wrong `base` corrected a week later is
+the same operator scenario as a wrong expiry, so all three tiers go
+behind **one entry point** — nobody should have to know which field is
+"cheap" to trust that correcting it revalidates the roster.
+
+### Two findings that changed the shape of the fix
+
+**1. `update_crew()` was not the only door.** `is_active` is not in
+`UPDATABLE_FIELDS` at all — it is written exclusively by
+`deactivate_crew()`, a different function with its own call site. A fix
+wired only into `update_crew()`, as originally scoped, would have left
+**taking a pilot out of service while they still hold future duties**
+bypassing revalidation entirely. Both writers now call the one door, and
+`test_both_crew_writers_go_through_the_one_door` fails if a third
+appears. (There is still no reactivate path anywhere: `is_active` can
+only ever go FALSE through the service.)
+
+**2. Nothing could clear `NEEDS_REVIEW`. Anywhere.** The only writer was
+`_recompute_one_duty_after_delay()`; no service, page or migration ever
+reversed it, and no page even LISTED flagged duties. Combined with "flag
+every affected duty, no cap", one corrected field could have permanently
+flagged thirty duties with no way back short of unassigning and
+reassigning every one — which is how a safety flag becomes a thing
+people route around instead of read.
+
+So the clear control shipped WITH the flagger that made it necessary,
+not after it. `clear_duty_review_flag()` is the only exit, it is
+deliberately human, and it **requires a reason** — the audit row has to
+say who decided this duty was fine and why.
+
+### The design
+
+`assignment_service.revalidate_crew_duties(crew_id, changed_fields)` —
+one door, three tiers resolved from the fields that ACTUALLY changed:
+
+* **tier 1** (expiries, `is_active`) — `_check_crew_qualifications()`
+* **tier 2** (`date_of_birth`) — partner via `_find_paired_pilot()`,
+  then `validate_pair()`, which is deliberately the fresh-data path
+* **tier 3** (`base`, `role`) — the full gate, `validate_schedule()`
+
+**No new legality logic anywhere.** Every check is the function the
+assignment gate already uses; this only re-asks them about duties that
+already exist. The tier sets were derived from what the engine actually
+consumes, checked rather than assumed: `CrewMember` carries only
+crew_id/name/home_base, so `base` feeds rest; `role` feeds
+`FTL_EXEMPT_ROLES` and seat eligibility.
+
+`_tier_for()` takes the HIGHEST tier among changed fields, because the
+higher check subsumes the lower — and returns 0 when nothing
+legality-relevant changed, which is what stops a corrected phone number
+walking the roster.
+
+**`changed_fields` is computed by DIFFING old against new**, not taken
+from the caller. `pages/2_Crew_Data.py` submits every field on every
+save, so trusting the caller's dict would have meant every save
+revalidated everything — including a save where the operator opened the
+form and changed nothing.
+
+### The decisions, all confirmed by the operator
+
+* **Every affected duty flagged, no cap.** If a correction affects
+  thirty duties then thirty duties are genuinely affected.
+* **Never auto-clear.** A field moving in the safe direction — a later
+  expiry, a base put right — does NOT clear an existing flag. The flag
+  does not record "the data is bad"; it records "nobody has looked at
+  this duty since the data changed".
+* **Future PLANNED only**, and the four exclusions are all deliberate:
+  OPERATED (a duty already flown does not retroactively un-happen),
+  NEEDS_REVIEW (already flagged; re-examining risks the auto-clear this
+  must never do), DISRUPTED (carries its own manual label), PROPOSED
+  (legacy rows only since accept began writing PLANNED on 2026-09-01).
+  "Future" is measured on `report_time`, not `duty_date` — a duty that
+  reported this morning has already started.
+* **Tier 2 flags both seats.** Age-pairing is a PAIR rule, so one
+  pilot's DOB can make the pair illegal in a way that is genuinely the
+  partner's problem too; flagging one seat and leaving the other reading
+  as fine is the seat-vs-grade half-truth this project keeps stamping
+  out.
+
+**Whole-schedule rules flag no single duty** (D23.1 mandatory days off,
+D23.2 seventh day). They belong to no one duty, so attributing one to an
+arbitrary duty would invent a precision the rule does not have — they
+are REPORTED loudly instead, because silently dropping a legality
+failure the change caused is the worse of the two errors.
+
+### The import cycle, broken deliberately in one place
+
+`assignment_service` imports `crew_service` at module level (including
+`from services.crew_service import ROLE_SYNONYMS`), so the reverse
+import at module level is a genuine cycle — crew_service would begin
+loading, hand control to assignment_service, and be asked for
+ROLE_SYNONYMS before it had defined it. `_revalidate_after_crew_change()`
+therefore imports **inside the function body**, and it is the only place
+in `services/` that does.
+
+Wiring this into the SERVICE rather than the page is the whole point —
+it is what stops a second caller bypassing revalidation — so the cycle
+had to be broken here rather than dodged by moving the call somewhere
+weaker.
+
+It also **never raises into the caller's write**: the crew edit has
+already committed by the time revalidation runs, and a failure here must
+not make the operator think their correction did not save. It audits
+`CREW_REVALIDATION_FAILED` and returns an empty result.
+
+### Two page defects found while wiring it
+
+* **The `st.rerun()` swallow again, on Crew Data** — both save handlers
+  ended `st.success(...); st.rerun()`, so even "Updated CPT-03" has
+  never been seen, and the revalidation report would have landed in
+  exactly that discarded space. Queued now. That is the fifth distinct
+  `session_state` case in the app and they are NOT interchangeable.
+* **`crew_names` was defined inside `if roster_rows:`** on the Roster
+  page and is now read by a second section that runs regardless — a
+  `NameError` on an empty roster. Hoisted. Same shape as the stale-module
+  outage: a name defined in one branch and read from another looks fine
+  right up until the first branch does not run.
+
+The flagged-duties section also sits **above** the assignment forms,
+because those begin `if flights_df.empty: st.stop()` — appended at the
+end it would have silently never rendered on a database with no flights.
+
+### Mutation-tested
+
+Six mutations, each failing a different test: the crew path flagging any
+status rather than PLANNED only; the tier router taking the lowest tier;
+`is_active` dropped from tier 1 (deactivation silently stops
+revalidating); `deactivate_crew` no longer calling the door;
+`changed_fields` trusting the caller instead of diffing; and
+`clear_duty_review_flag` losing its `NEEDS_REVIEW` guard.
+
+393 passed, 365 skipped locally; reachability clean.
+
+### ⚠ Reboot required — TWO limbs, and the check was RUN
+
+* `pages/2_Crew_Data.py` imports `utc_stamp` from
+  `services/display_labels.py`, a module it already imported — limb 3.
+* `pages/4_Roster.py` calls `assignment_service.duties_needing_review()`
+  and `clear_duty_review_flag()`, new attributes on a module it already
+  imports — limb 4. Against a stale `sys.modules` that is `AttributeError`
+  at page load.
+
+No migration.
