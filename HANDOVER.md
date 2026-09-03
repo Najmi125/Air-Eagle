@@ -8496,3 +8496,91 @@ check is owed to `pages/1_Control_Room.py`, `pages/4_Roster.py`,
 `pages/6_Roster_Generation.py` and `pages/7_Schedule_Templates.py`,
 which have not been audited for this. **NOT DONE — an honest open item
 rather than a claim of completeness.**
+
+## 2026-09-03: the Roster table reads as seats, not as rows
+
+"Current assignments" showed one row per crew member per sector, with
+`crew_id`, `role`, `duty_id`, `flight_id` and a serial column — internal
+identifiers on a screen nobody debugs from. It is now one row per
+flight: **Flight, Route, Commander, Second Pilot**.
+
+### Commander / Second Pilot, not PIC / SIC — a choice, not the schema leaking
+
+PIC and SIC are the operator's own words, and migrations/016 records
+them as equivalent to COMMANDER / SECOND_PILOT. The display could
+legitimately diverge from the data model here.
+
+It does not, because `roster_coverage`'s headers were standardised on
+Commander / Second Pilot on 2026-08-28, and **one concept with two names
+across two screens is worse than either name**. Operator decision
+(2026-09-03). Recorded so this reads as settled rather than as nobody
+having noticed the operator says PIC.
+
+### `crew_seat_name()` — the rule was chosen against the real names
+
+`CPT M Waqar`: grade, given-name initial, surname. Added to
+`display_labels` beside `crew_label()`/`flight_label()` rather than
+started as a new module.
+
+The rule was picked by running candidates over all ten of Air Eagle's
+actual crew records, not reasoned about in the abstract:
+
+* **first-name-only renders SIX OF TEN pilots as "Muhammad"** and
+  identifies nobody. The operator's own illustration ("CPT Fahim") was
+  a rule that worked on one name.
+* **initial-plus-surname separates all ten**, and gives `CPT S Mahmood`
+  for the pilot a controller may say aloud as "Fahim". Trade accepted
+  deliberately.
+* **one stored name begins with a rank** — `CAPT MUHAMMAD ASAD ALI` —
+  so the naive rule initials a pilot from their title: `CPT C Ali`.
+  `NAME_TITLES` strips it. Two names also carry trailing whitespace and
+  all are stored uppercase.
+
+### The same NULL means opposite things depending on grade
+
+`operating_position` is NULL in two unrelated situations, and the
+distinction is kept explicit in code rather than handled by analogy
+(operator decision):
+
+* **on a CPT or FO it is an ANOMALY.** Someone holds a flight-deck seat
+  the data failed to record; dropping them hides a real assignment.
+  Surfaced in a "Seat not recorded" column, and the seat they did not
+  fill still reads UNCOVERED rather than being treated as covered by
+  them. Same treatment as `roster_coverage`.
+* **on an LM or ENGR it is NORMAL.** They are outside the flight-deck
+  model by design — Air Eagle does not even hold them as crew records.
+  A flight carrying only them has no flight-deck assignment, so there
+  is nothing to omit, and it does not appear at all. Same reason a
+  wholly uncrewed flight stays out; Roster Generation's uncovered panel
+  owns those.
+
+**Conflating them fails in both directions**: treat LM like the anomaly
+and the table fills with cargo flights until the column is ignored;
+treat the anomaly like LM and a real assignment vanishes. Both
+mutation-tested.
+
+`COCKPIT_GRADES` is derived from `SEAT_ELIGIBLE_GRADES` rather than
+retyped, so a grade added there cannot quietly become "not cockpit"
+here — which is exactly what decides which of the two meanings applies.
+
+### A latent crash found by the fixture
+
+`a["operating_position"] or ""` was not safe. When EVERY roster row on
+a flight has a NULL seat — an LM/ENGR-only flight — pandas types the
+column float64, and **`nan or ""` evaluates to `nan`, because nan is
+truthy**. The unassign selectbox then concatenated a float to a string
+and the page raised `TypeError`.
+
+Latent rather than live, since Air Eagle holds no LM/ENGR crew records
+today — and it surfaced only because a DB-free fixture created what
+production has not. Now an explicit `pd.isna` check.
+
+### Mutation-tested
+
+Four mutations, each failing the test written for it: LM/ENGR treated as
+an anomaly, the cockpit anomaly silently dropped, flights with no
+flight-deck assignment included, and honorific stripping removed.
+
+370 passed, 365 skipped locally; reachability clean. No new module, no
+new page import, no new attribute read on a service-built object — so
+no reboot, and no migration.

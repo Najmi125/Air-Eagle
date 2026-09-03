@@ -19,11 +19,20 @@ stays None for them). Unassign is duty-scoped
 person's own duty in one call, not one flight leg at a time.
 """
 import streamlit as st
+import pandas as pd
 
 from services import crew_service, flight_service, assignment_service, auth_service
 from services.assignment_service import SEAT_ELIGIBLE_GRADES
+
+# The grades that can hold a flight-deck seat at all. Derived from
+# SEAT_ELIGIBLE_GRADES rather than retyped, so a grade added there
+# cannot quietly become "not cockpit" here — which is what would decide
+# whether a missing operating_position reads as an anomaly or as
+# normal.
+COCKPIT_GRADES = frozenset().union(*SEAT_ELIGIBLE_GRADES.values())
 from services.alert_summary import format_alert_lines
-from services.display_labels import (crew_label, format_timestamps,
+from services.display_labels import (crew_label, crew_seat_name, format_timestamps,
+                                      flight_label,
                                       flight_labels as build_flight_labels)
 
 st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
@@ -49,12 +58,87 @@ else:
                 "origin": flight["origin"], "destination": flight["destination"],
                 "dep_time_planned": flight["dep_time_planned"],
                 "crew_id": a["crew_id"], "role": a["role_assigned"],
-                "operating_position": a["operating_position"] or "",
+                # `a["operating_position"] or ""` was NOT safe: when
+                # every roster row on a flight has a NULL seat — an
+                # LM/ENGR-only flight — pandas gives the column
+                # float64, and `nan or ""` evaluates to nan because nan
+                # is TRUTHY. The unassign selectbox then concatenated a
+                # float to a string and the page raised TypeError.
+                # Latent rather than live, since Air Eagle holds no
+                # LM/ENGR crew records today; found by a fixture that
+                # did (2026-09-03).
+                "operating_position": ("" if pd.isna(a["operating_position"])
+                                       else str(a["operating_position"])),
                 "duty_id": a["duty_id"], "fdp_hours": a["fdp_hours"],
             })
+    # ONE ROW PER FLIGHT, not one per crew member per sector
+    # (2026-09-03). The seats are the point: a controller reads a
+    # flight and wants to know who is in each one. crew_id, role and
+    # duty_id were internal identifiers on a screen nobody debugs from,
+    # and flight_id has a flight number.
+    #
+    # COMMANDER / SECOND PILOT, not PIC / SIC. PIC and SIC are the
+    # operator's own words and migrations/016 records them as
+    # equivalent — but roster_coverage's headers were standardised on
+    # Commander/Second Pilot on 2026-08-28, and two screens naming one
+    # concept differently is worse than either name. A DELIBERATE
+    # choice, not the schema leaking through.
     if roster_rows:
-        import pandas as pd
-        st.dataframe(format_timestamps(pd.DataFrame(roster_rows)), width="stretch")
+
+        by_flight = {}
+        for row in roster_rows:
+            seats = by_flight.setdefault(row["flight_id"], {})
+            position = row["operating_position"]
+            if position in ("COMMANDER", "SECOND_PILOT"):
+                seats[position] = row["crew_id"]
+            elif row["role"] in COCKPIT_GRADES:
+                # A CPT or FO holding NO recorded seat is an ANOMALY —
+                # someone occupies a flight-deck position the data
+                # failed to record, and dropping them hides a real
+                # assignment. Same treatment as roster_coverage.
+                seats.setdefault("seatless", []).append(row["crew_id"])
+            # An LM or ENGR has no operating position BY DESIGN — they
+            # are outside the flight-deck model entirely, so there is
+            # nothing here to omit. Deliberately NOT the same case as
+            # the line above, and kept apart in code because the same
+            # NULL column means opposite things depending on grade;
+            # conflating them is how the anomaly gets swallowed.
+
+        crew_names = {
+            r["crew_id"]: crew_seat_name(r)
+            for _, r in crew_service.get_all_crew(active_only=False).iterrows()
+        }
+
+        def seat_cell(seats, position):
+            crew_id = seats.get(position)
+            return crew_names.get(crew_id, crew_id) if crew_id else "UNCOVERED"
+
+        table = []
+        for _, flight in flights_df.iterrows():
+            seats = by_flight.get(flight["flight_id"])
+            # A flight with no flight-deck assignment at all does not
+            # belong in "Current assignments" — including one because
+            # somebody loaded cargo would be noise, and it is the same
+            # reason a wholly uncrewed flight stays out. Roster
+            # Generation's uncovered panel is where those live.
+            if not seats:
+                continue
+            entry = {
+                "Flight": flight_label(flight),
+                "Route": f'{flight["origin"]}→{flight["destination"]}',
+                "Commander": seat_cell(seats, "COMMANDER"),
+                "Second Pilot": seat_cell(seats, "SECOND_PILOT"),
+            }
+            if seats.get("seatless"):
+                entry["Seat not recorded"] = ", ".join(
+                    crew_names.get(cid, cid) for cid in seats["seatless"])
+            table.append(entry)
+
+        if table:
+            st.dataframe(format_timestamps(pd.DataFrame(table)),
+                         width="stretch", hide_index=True)
+        else:
+            st.info("No crew assigned yet.")
     else:
         st.info("No crew assigned yet.")
 
@@ -259,7 +343,6 @@ st.caption(
 if flights_df.empty or not roster_rows:
     st.info("No active assignments to unassign.")
 else:
-    import pandas as pd
     active_df = pd.DataFrame(roster_rows).drop_duplicates(subset=["crew_id", "duty_id"])
     unassign_choice = st.selectbox(
         "Assignment to remove",
