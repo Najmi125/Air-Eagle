@@ -324,6 +324,41 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`roster-table-by-flight` merged into `main` (2026-09-03).** The
+  Roster page's "Current assignments" is now one row per flight —
+  Flight, Route, Commander, Second Pilot — with the serial column,
+  `role`, `duty_id` and `flight_id` gone and crew shown as
+  `CPT M Waqar`. **735/735 verified against real Postgres 16**,
+  reachability clean.
+
+  **⚠ NEEDS A REBOOT — limb three.** `pages/4_Roster.py` imports
+  `crew_seat_name` and `flight_label` from `services/display_labels.py`,
+  a module it already imported: a new NAME in an existing import, which
+  is an `ImportError` at page load against a stale `sys.modules`. **No
+  migration.**
+
+  I wrote "no reboot" in this branch's own entry and caught it only by
+  running the check mechanically before pushing — two days after
+  documenting that limb. **The rule is easy to remember and hard to
+  apply, because the diff looks unremarkable. Run the grep, do not
+  recall the conclusion.**
+
+  **`operating_position` NULL means OPPOSITE things depending on grade,
+  and the two must stay apart in code.** On a CPT or FO it is an
+  anomaly — a real assignment the data failed to place — and is
+  surfaced. On an LM or ENGR it is normal, and such a flight does not
+  appear at all. Conflating them fills the column with cargo flights
+  until it is ignored, which is how the anomaly then gets swallowed.
+  Both directions mutation-tested. `COCKPIT_GRADES` is derived from
+  `SEAT_ELIGIBLE_GRADES`, never retyped, because that set decides which
+  meaning applies.
+
+  **`nan or ""` does not fall back — nan is TRUTHY.** An all-NULL seat
+  column comes back float64 and crashed the unassign selectbox. Found
+  by a DB-free fixture constructing a state production does not have,
+  which is the argument for fixtures that build impossible states and
+  not only realistic ones.
+
 - **`sector-coherence-on-actuals` merged into `main` (2026-09-03).** A
   delay that made a duty physically impossible produced no warning —
   flight 53 recorded 2200-2345z while its second sector still read
