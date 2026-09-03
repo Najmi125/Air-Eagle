@@ -324,6 +324,50 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`crew-change-revalidation` merged into `main` (2026-09-05).**
+  Correcting a legality-relevant crew field now re-checks every future
+  PLANNED duty that crew member holds and flags whichever no longer
+  pass. Reported from live use: an OCC member set CPT-03's SIM expiry
+  to a past date and CPT-03 stayed on already-written PLANNED rosters
+  with nothing flagged. **758/758 verified against real Postgres 16**,
+  reachability clean, with the operator's exact scenario reproduced end
+  to end (`PLANNED` -> `NEEDS_REVIEW`, renewing forward leaves the flag
+  standing, `deactivate_crew()` routing through the same door).
+
+  **⚠ NEEDS A REBOOT — TWO LIMBS. No migration.**
+  `pages/2_Crew_Data.py` imports `utc_stamp` from a module it already
+  imported (limb 3), and `pages/4_Roster.py` calls
+  `assignment_service.duties_needing_review()` and
+  `clear_duty_review_flag()` — new attributes on a module it already
+  imports (limb 4, `AttributeError` at page load against a stale
+  `sys.modules`).
+
+  **THE ONE DOOR IS THE POINT.** `update_crew()` AND
+  `deactivate_crew()` both call `revalidate_crew_duties()`, because
+  `is_active` is not in `UPDATABLE_FIELDS` at all — a fix wired only
+  into `update_crew()` would have left taking a pilot out of service
+  while they hold future duties bypassing revalidation entirely.
+  `test_both_crew_writers_go_through_the_one_door` fails if a third
+  writer appears. The reverse import is a genuine cycle, so the call
+  imports inside the function body: the only place in `services/` that
+  does, and deliberate — wiring into the service rather than the page
+  is what stops a caller bypassing it.
+
+  **NEVER AUTO-CLEARS, and that is why the clear control shipped with
+  it.** A field corrected back in the safe direction leaves the flag
+  standing: the flag records that nobody has LOOKED since the data
+  changed, not that the data is currently bad. Until this branch
+  nothing anywhere could clear `NEEDS_REVIEW` and no page listed
+  flagged duties, so a second flagger without an exit would have made
+  the correction path something people route around.
+
+  **Before changing `changed_fields`:** it diffs old against new rather
+  than trusting the caller's dict, and that is load-bearing. The Crew
+  Data form submits every field on every save, so the naive version
+  would revalidate the whole roster on a no-op save — the feature would
+  have looked correct while producing pure noise, and the flags would
+  have stopped being believed.
+
 - **`roster-table-by-flight` merged into `main` (2026-09-03).** The
   Roster page's "Current assignments" is now one row per flight —
   Flight, Route, Commander, Second Pilot — with the serial column,
