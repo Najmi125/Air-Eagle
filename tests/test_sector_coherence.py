@@ -187,7 +187,17 @@ class _Conn:
 
     def execute(self, statement, params=None):
         self._statements.append((str(statement), params or {}))
+        # rowcount, because _mark_duty_needs_review() reads it (added
+        # 2026-09-05, when the flag write was extracted so the delay
+        # path and the crew-change path could not drift apart). The
+        # delay path ignores the return value, but a fake that omits
+        # what a real result carries fails for a reason that has
+        # nothing to do with the thing under test.
         return self
+
+    @property
+    def rowcount(self):
+        return 1
 
     def fetchall(self):
         return []

@@ -82,6 +82,17 @@ def roster_page(monkeypatch):
                          "duty_id", "fdp_hours", "status"]))
         monkeypatch.setattr(crew_service, "get_all_crew",
                             lambda **k: pd.DataFrame(CREW))
+        # The flagged-for-review section (2026-09-05) reads on every
+        # render. Unfaked it reaches for a real database and the
+        # AppTest times out, which reads like a hang rather than a
+        # missing patch — and against this machine's .env it would be
+        # a live query.
+        monkeypatch.setattr(
+            assignment_service, "duties_needing_review",
+            lambda **k: pd.DataFrame(columns=[
+                "duty_id", "crew_id", "duty_date", "report_time", "debrief_time",
+                "role_assigned", "operating_position", "flight_id",
+                "flight_no", "origin", "destination"]))
         return authed_app_test("pages/4_Roster.py").run()
     return render
 

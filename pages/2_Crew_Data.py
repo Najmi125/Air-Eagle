@@ -14,11 +14,87 @@ import pandas as pd
 import streamlit as st
 
 from services import crew_service, auth_service
-from services.display_labels import crew_label
+from services.display_labels import crew_label, utc_stamp
 
 st.set_page_config(page_title="Crew Data", page_icon="👨‍✈️", layout="wide")
 app_user = auth_service.require_login()
 st.title("Crew Data")
+
+# Messages that must OUTLIVE the st.rerun() at the end of each save.
+# st.rerun() ABANDONS the current run, so anything written before it
+# never reaches the browser (HANDOVER 2026-09-03). Both save handlers
+# on this page ended `st.success(...); st.rerun()`, so even the
+# "Updated CPT-03" confirmation has never actually been seen — and the
+# revalidation report added on 2026-09-05 would have landed in exactly
+# that discarded space, which is the one message on this page nobody
+# can afford to miss.
+#
+# This is the FIFTH distinct session_state case in the app and they are
+# not interchangeable: Schedule Templates needs generation-keyed widget
+# keys, Crew Data (below) must have none for its FORM state, Roster
+# Generation holds computed work deliberately not persisted, Flt
+# Schedule carries a delay notice across one rerun, and this carries a
+# revalidation report across one rerun. Do not "consolidate" them.
+_CREW_NOTICES = "crew_data_notices"
+
+for _notice in st.session_state.pop(_CREW_NOTICES, []):
+    {"error": st.error, "warning": st.warning}.get(
+        _notice["level"], st.success)(_notice["headline"])
+    for _line in _notice["lines"]:
+        st.write(_line)
+
+
+def queue_crew_notice(level, headline, lines=()):
+    """Hold a message for the run AFTER the imminent st.rerun()."""
+    st.session_state.setdefault(_CREW_NOTICES, []).append(
+        {"level": level, "headline": headline, "lines": list(lines)})
+
+
+def queue_revalidation_report(crew_id, outcome):
+    """Say what the correction did to the roster, in the caller's own
+    terms.
+
+    A crew edit that silently flags nine duties is as bad as one that
+    silently flags none: the operator has to know their correction
+    reached the roster, and which duties a human now has to look at.
+    """
+    if not outcome:
+        return
+    if outcome.get("error"):
+        queue_crew_notice(
+            "error",
+            f"{crew_id} was saved, but its duties could NOT be re-checked "
+            f"({outcome['error']}). Re-check them by hand.")
+        return
+
+    flagged = outcome.get("flagged") or []
+    checked = outcome.get("checked", 0)
+
+    if not outcome.get("tier"):
+        return  # nothing legality-relevant changed; the roster is untouched
+    if not flagged:
+        queue_crew_notice(
+            "success",
+            f"{crew_id} updated — {checked} future duty(ies) re-checked, "
+            f"all still legal.")
+    else:
+        queue_crew_notice(
+            "warning",
+            f"⚠️ {crew_id} updated — {len(flagged)} of {checked} future "
+            f"duty(ies) NO LONGER PASS and are now flagged NEEDS_REVIEW. "
+            f"Clear them on the Roster page once a human has looked.",
+            [f"- {utc_stamp(f['report_time'])} (duty {f['duty_id']}): "
+             f"{'; '.join(f['reasons'])}"
+             for f in flagged])
+
+    for message in outcome.get("schedule_level") or []:
+        # Whole-schedule patterns belong to no single duty, so nothing
+        # was flagged for them — which is exactly why they have to be
+        # said out loud rather than left in a return value.
+        queue_crew_notice(
+            "warning",
+            f"⚠️ {crew_id}: schedule-level rule now failing — {message}. "
+            f"No single duty carries this, so none was flagged.")
 
 # CPT/FO only, per the operator's 2026-08-02 decision: Air Eagle's
 # crew records are CPT and FO — LM/AME are the operator's own
@@ -199,7 +275,7 @@ else:
                 deactivate_submitted = st.form_submit_button("Deactivate this crew member")
 
             if update_submitted:
-                crew_service.update_crew(selected_id, {
+                outcome = crew_service.update_crew(selected_id, {
                     "phone": new_phone or None,
                     "email": new_email or None,
                     "base": new_base or None,
@@ -214,11 +290,13 @@ else:
                     "crm_expiry": new_crm_expiry,
                     "dg_expiry": new_dg_expiry,
                 }, app_user=app_user)
-                st.success(f"Updated {selected_id}")
+                queue_crew_notice("success", f"Updated {selected_id}")
+                queue_revalidation_report(selected_id, outcome)
                 st.rerun()
 
             if deactivate_submitted:
-                crew_service.deactivate_crew(
+                outcome = crew_service.deactivate_crew(
                     selected_id, reason="Deactivated via Crew Data page", app_user=app_user)
-                st.success(f"Deactivated {selected_id}")
+                queue_crew_notice("success", f"Deactivated {selected_id}")
+                queue_revalidation_report(selected_id, outcome)
                 st.rerun()

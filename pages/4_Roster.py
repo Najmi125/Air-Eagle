@@ -39,8 +39,36 @@ st.set_page_config(page_title="Roster", page_icon="🗓️", layout="wide")
 app_user = auth_service.require_login()
 st.title("Roster")
 
+# Messages that must OUTLIVE an st.rerun() — see HANDOVER 2026-09-03.
+# Anything written before st.rerun() is discarded and never reaches the
+# browser, so a confirmation written next to the action that triggers
+# the rerun is a confirmation nobody sees.
+_ROSTER_NOTICES = "roster_notices"
+
+for _notice in st.session_state.pop(_ROSTER_NOTICES, []):
+    {"error": st.error, "warning": st.warning}.get(
+        _notice["level"], st.success)(_notice["headline"])
+
+
+def queue_roster_notice(level, headline):
+    """Hold a message for the run AFTER the imminent st.rerun()."""
+    st.session_state.setdefault(_ROSTER_NOTICES, []).append(
+        {"level": level, "headline": headline})
+
 OTHER_ROLE_OPTIONS = ["LM", "ENGR", "Other"]
 
+
+# Built ONCE, unconditionally, and used by two sections. It sat inside
+# `if roster_rows:` until 2026-09-05, which was safe only while the
+# one section that used it lived in the same branch — the flagged-for-
+# review section below runs whether or not anything is assigned, and
+# would have raised NameError on an empty roster. Same shape as the
+# stale-module page outage: a name defined in one branch and read from
+# another looks fine right up until the first branch does not run.
+crew_names = {
+    r["crew_id"]: crew_seat_name(r)
+    for _, r in crew_service.get_all_crew(active_only=False).iterrows()
+}
 
 # ================= CURRENT ROSTER =================
 st.subheader("Current assignments")
@@ -104,11 +132,6 @@ else:
             # NULL column means opposite things depending on grade;
             # conflating them is how the anomaly gets swallowed.
 
-        crew_names = {
-            r["crew_id"]: crew_seat_name(r)
-            for _, r in crew_service.get_all_crew(active_only=False).iterrows()
-        }
-
         def seat_cell(seats, position):
             crew_id = seats.get(position)
             return crew_names.get(crew_id, crew_id) if crew_id else "UNCOVERED"
@@ -141,6 +164,93 @@ else:
             st.info("No crew assigned yet.")
     else:
         st.info("No crew assigned yet.")
+
+
+# ================= DUTIES FLAGGED FOR REVIEW =================
+# PLACED HERE, above the assignment forms, for two reasons. The
+# forms below begin `if flights_df.empty: st.stop()`, so anything
+# after them silently never renders on a database with no flights.
+# And a duty nobody has looked at yet is the first thing a
+# controller should meet on this page, not the last.
+# Added 2026-09-05 with crew-change revalidation, and it is the half
+# that makes the other half safe to ship.
+#
+# Until now NOTHING could clear a NEEDS_REVIEW flag. The only writer
+# was _recompute_one_duty_after_delay(); no service, page or migration
+# ever reversed it, and no page even LISTED the flagged duties. Adding
+# a second flagger — a crew correction, which can flag many duties at
+# once — without an exit would have made the correction path something
+# people avoid rather than use, and a safety flag nobody can close is a
+# safety flag people learn to ignore.
+#
+# Clearing is deliberately human and deliberately explained: the flag
+# does not record "the data is bad", it records "nobody has looked at
+# this duty since the data changed". Only a person can retire that, and
+# the reason goes in the audit trail.
+st.divider()
+st.subheader("Duties flagged for review")
+
+# WRAPPED, like every other read this codebase has learned to wrap: a
+# section added to a page must not be able to take that page off the
+# air. The Roster page's real job is assigning crew, and a listing of
+# flagged duties is an affordance on top of it — the same reasoning as
+# the Schedule Templates delete control, which DID take its page down
+# on 2026-08-19 before it was wrapped.
+try:
+    flagged = assignment_service.duties_needing_review()
+except Exception as exc:
+    flagged = None
+    st.caption(f"Flagged duties unavailable ({type(exc).__name__}).")
+
+if flagged is None:
+    pass
+elif flagged.empty:
+    st.caption("No duties are currently flagged for review.")
+else:
+    st.warning(
+        f"{flagged['duty_id'].nunique()} duty(ies) need a human to look at "
+        f"them. They were flagged because something they depend on changed "
+        f"after they were written — a crew record corrected, or a delay "
+        f"recorded — and nothing clears that automatically."
+    )
+    st.dataframe(
+        format_timestamps(pd.DataFrame([
+            {
+                "Duty": row["duty_id"],
+                "Crew": crew_names.get(row["crew_id"], row["crew_id"]),
+                "Seat": (row["operating_position"] or "").replace("_", " ").title(),
+                "Flight": f'{row["flight_no"] or "#" + str(row["flight_id"])} '
+                          f'{row["origin"]}→{row["destination"]}',
+                "Reports": row["report_time"],
+            }
+            for _, row in flagged.iterrows()
+        ])),
+        width="stretch", hide_index=True,
+    )
+
+    review_choice = st.selectbox(
+        "Duty to clear", sorted(flagged["duty_id"].unique()), key="review_clear_choice")
+    review_reason = st.text_input(
+        "What did you check? (required)", key="review_clear_reason")
+
+    if st.button("Clear review flag"):
+        try:
+            cleared = assignment_service.clear_duty_review_flag(
+                review_choice, review_reason, app_user=app_user)
+        except ValueError as exc:
+            # A reason is required, and saying so beats a traceback.
+            st.error(str(exc))
+        else:
+            if cleared:
+                queue_roster_notice(
+                    "success",
+                    f"Review flag cleared on duty {review_choice} "
+                    f"({cleared} roster row(s) back to PLANNED).")
+            else:
+                queue_roster_notice(
+                    "warning",
+                    f"Duty {review_choice} was not flagged — nothing changed.")
+            st.rerun()
 
 
 # ================= ASSIGN FLIGHT-DECK PAIR =================
