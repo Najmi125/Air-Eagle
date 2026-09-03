@@ -8581,6 +8581,27 @@ Four mutations, each failing the test written for it: LM/ENGR treated as
 an anomaly, the cockpit anomaly silently dropped, flights with no
 flight-deck assignment included, and honorific stripping removed.
 
-370 passed, 365 skipped locally; reachability clean. No new module, no
-new page import, no new attribute read on a service-built object — so
-no reboot, and no migration.
+370 passed, 365 skipped locally; reachability clean. No migration.
+
+### ⚠ Reboot required — and I wrote "no reboot" first
+
+`pages/4_Roster.py` imports `crew_seat_name` and `flight_label` from
+`services/display_labels.py`, a module it already imported. That is
+**limb three** — a new NAME in an existing import — which needs a
+reboot, and against a stale `sys.modules` it is an `ImportError` at
+page load.
+
+I documented that limb on 2026-09-01, wrote "no new page import, so no
+reboot" here, and only caught it by running the check mechanically
+before pushing rather than trusting the sentence I had just written.
+
+Which is the point worth keeping: **the rule is not hard to remember,
+it is hard to APPLY, because the diff looks unremarkable.** Run the
+check, do not recall the conclusion:
+
+```bash
+git diff main...HEAD -- 'pages/*.py' | grep -E '^\+\s*(import |from )'
+```
+
+and then read any new attribute access on a service-built object,
+which grep cannot show you.
