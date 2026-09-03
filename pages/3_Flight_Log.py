@@ -35,6 +35,26 @@ st.title("Flt Schedule")
 
 STATUS_OPTIONS = ["All", "PLANNED", "OPERATED", "CANCELLED", "DISRUPTED"]
 
+# Messages that must OUTLIVE the st.rerun() that follows recording an
+# actual. st.rerun() abandons the current run, so anything written
+# before it in that same run is discarded and never reaches the
+# browser — which is where the legality warnings after a delay were
+# being written. The durable NEEDS_REVIEW flag on the roster row
+# survived; the sentence explaining it did not.
+#
+# THIS IS THE FOURTH DISTINCT session_state CASE in this app, and they
+# are not interchangeable: Schedule Templates needs generation-keyed
+# widget keys, Crew Data must have none, Roster Generation holds
+# computed work deliberately not persisted, and this one carries a
+# message across exactly one rerun and then drops it. Do not
+# "consolidate" them.
+_DELAY_NOTICES = "flt_schedule_delay_notices"
+
+for _notice in st.session_state.pop(_DELAY_NOTICES, []):
+    (st.error if _notice["level"] == "error" else st.warning)(_notice["headline"])
+    for _line in _notice["lines"]:
+        st.write(_line)
+
 
 # ================= DISPLAY =================
 status_choice = st.selectbox("Filter by status", STATUS_OPTIONS)
@@ -240,28 +260,42 @@ else:
                             selected_id, dep_time_actual=dep_actual, arr_time_actual=arr_actual,
                             app_user=app_user)
                         st.success(f"Updated flight {selected_id}")
+                        # QUEUED, not written here. The st.rerun() below
+                        # discards this run's output, so every one of
+                        # these warnings was being thrown away — the
+                        # swap alerts included, since the day they were
+                        # written. They are rendered at the top of the
+                        # NEXT run instead.
+                        notices = []
                         for outcome in outcomes:
                             result = outcome["validation_result"]
                             if result.status in ("ILLEGAL", "NEEDS_MANUAL_REVIEW"):
-                                st.warning(
-                                    f"⚠️ {outcome['crew_id']}'s duty {outcome['duty_id']} "
-                                    f"flagged NEEDS_REVIEW after this delay — {result.status.value}."
-                                )
-                                for line in format_alert_lines(outcome["alert_summary"]):
-                                    st.write(line)
+                                notices.append({
+                                    "level": "warning",
+                                    "headline": (
+                                        f"⚠️ {outcome['crew_id']}'s duty {outcome['duty_id']} "
+                                        f"flagged NEEDS_REVIEW after this delay — "
+                                        f"{result.status.value}."
+                                    ),
+                                    "lines": format_alert_lines(outcome["alert_summary"]),
+                                })
                             if outcome["downstream_conflicts"]:
-                                st.error(
-                                    f"⚠️ Swap alert — this delay breaks the legality of "
-                                    f"{len(outcome['downstream_conflicts'])} already-scheduled "
-                                    f"future duty(ies) for {outcome['crew_id']}:"
-                                )
-                                for conflict in outcome["downstream_conflicts"]:
-                                    st.write(
+                                notices.append({
+                                    "level": "error",
+                                    "headline": (
+                                        f"⚠️ Swap alert — this delay breaks the legality of "
+                                        f"{len(outcome['downstream_conflicts'])} already-scheduled "
+                                        f"future duty(ies) for {outcome['crew_id']}:"
+                                    ),
+                                    "lines": [
                                         f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
                                         f"reports {conflict.report_time}): "
                                         + (f"legal candidates: {', '.join(conflict.candidates)}"
                                            if conflict.candidates else "**no legal candidates found**")
-                                    )
+                                        for conflict in outcome["downstream_conflicts"]
+                                    ],
+                                })
+                        st.session_state[_DELAY_NOTICES] = notices
                         st.rerun()
                     elif not occupants_changed:
                         # Only when NOTHING was submitted. Saving an

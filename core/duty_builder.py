@@ -37,7 +37,7 @@ actually passed in, not a lookup table.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Sequence
 
 # Report/debrief buffers per ANO-012 D7.1.2
 DOMESTIC_PRE_FLIGHT_MINUTES = 45
@@ -60,6 +60,51 @@ class DutyResult:
     debrief_time: datetime
     fdp_hours: float
     sector_count: int
+
+
+def sector_continuity_problems(legs: Sequence["FlightLeg"]) -> List[str]:
+    """Every way this sequence of legs fails to be one physically
+    continuous duty, as sentences. Empty list means coherent.
+
+    EXTRACTED 2026-09-03, and the extraction is the point. The rule
+    already existed and was already correct — inside build_duty(),
+    which RAISES. build_duty() runs when a duty is PLANNED, on planned
+    times, and nothing ran it again when actuals were recorded, so a
+    delay that made a duty physically impossible produced no warning at
+    all (flight 53, EPE 786, planned 1900-2045z recorded 2200-2345z
+    while its second sector still read 2200-2345z — sector 1 landing at
+    the moment sector 2 departs).
+
+    Two callers, one copy of the rule, and they need OPPOSITE
+    behaviour, which is why this returns problems rather than raising:
+
+      * PLANNING must refuse. You cannot schedule a duty that is
+        impossible, so build_duty() turns any problem into ValueError.
+      * RECORDING must not. What happened, happened; a controller
+        entering an actual time mid-duty is doing their job, and
+        blocking it would leave the record less accurate rather than
+        more. The caller raises an alert instead.
+
+    A second copy of these two comparisons living in the recording path
+    is exactly how the two would drift into disagreeing about what
+    "continuous" means.
+    """
+    problems = []
+    for i in range(len(legs) - 1):
+        if legs[i].arr_time >= legs[i + 1].dep_time:
+            problems.append(
+                f"Leg {i} arrives ({legs[i].arr_time}) at or after leg {i + 1} "
+                f"departs ({legs[i + 1].dep_time}) — legs must be in "
+                f"chronological, non-overlapping order with time for turnaround"
+            )
+        if legs[i].destination != legs[i + 1].origin:
+            problems.append(
+                f"Leg {i} arrives at {legs[i].destination} but leg {i + 1} "
+                f"departs from {legs[i + 1].origin} — a crew member can't be "
+                f"in two places at once. These flights don't form one "
+                f"physically continuous duty."
+            )
+    return problems
 
 
 def build_duty(legs: List[FlightLeg], domestic: bool) -> DutyResult:
@@ -85,20 +130,8 @@ def build_duty(legs: List[FlightLeg], domestic: bool) -> DutyResult:
     if not legs:
         raise ValueError("build_duty() requires at least one flight leg")
 
-    for i in range(len(legs) - 1):
-        if legs[i].arr_time >= legs[i + 1].dep_time:
-            raise ValueError(
-                f"Leg {i} arrives ({legs[i].arr_time}) at or after leg {i + 1} "
-                f"departs ({legs[i + 1].dep_time}) — legs must be in "
-                f"chronological, non-overlapping order with time for turnaround"
-            )
-        if legs[i].destination != legs[i + 1].origin:
-            raise ValueError(
-                f"Leg {i} arrives at {legs[i].destination} but leg {i + 1} "
-                f"departs from {legs[i + 1].origin} — a crew member can't be "
-                f"in two places at once. These flights don't form one "
-                f"physically continuous duty."
-            )
+    for problem in sector_continuity_problems(legs):
+        raise ValueError(problem)
 
     pre = DOMESTIC_PRE_FLIGHT_MINUTES if domestic else INTERNATIONAL_PRE_FLIGHT_MINUTES
     post = DOMESTIC_POST_FLIGHT_MINUTES if domestic else INTERNATIONAL_POST_FLIGHT_MINUTES

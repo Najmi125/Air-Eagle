@@ -43,6 +43,7 @@ from services import crew_service, flight_service
 from services.crew_service import ROLE_SYNONYMS
 from core.duty_builder import (
     build_duty, recompute_fdp_after_delay, FlightLeg,
+    sector_continuity_problems,
     DOMESTIC_POST_FLIGHT_MINUTES, INTERNATIONAL_POST_FLIGHT_MINUTES,
 )
 from core.legality.pcaa_ano012_core import (
@@ -2357,7 +2358,20 @@ def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
     ))
     # duty.sectors already reflect actual times where recorded
     # (COALESCE(actual, planned) — see _load_duty_records_for_crew).
-    new_debrief_time = duty.sectors[-1].arrival_utc + post_buffer
+    #
+    # MAX ARRIVAL, NOT sectors[-1] (corrected 2026-09-03). Sectors are
+    # appended in query order — ORDER BY r.report_time,
+    # f.dep_time_planned — and never re-sorted once actuals arrive. So
+    # sectors[-1] is the last sector by PLANNED departure, which after
+    # a delay need not be the sector that actually finishes last.
+    #
+    # THE FAILURE WAS IN THE DANGEROUS DIRECTION. A delay on a
+    # non-final sector left debrief_time computed from an untouched
+    # later sector, so the duty ENDED EARLIER on paper than the crew
+    # actually finished, and the recorded FDP understated it. A
+    # plausible number that is too low is worse than a missing one:
+    # nothing about it invites a second look.
+    new_debrief_time = max(s.arrival_utc for s in duty.sectors) + post_buffer
     new_fdp_hours = recompute_fdp_after_delay(duty.start_utc, new_debrief_time)
 
     with engine.begin() as conn:
@@ -2379,6 +2393,39 @@ def _recompute_one_duty_after_delay(engine, crew_id: str, duty_id: str,
         other_duties = [r["duty"] for r in history_records if r["duty"].duty_id != duty_id]
         all_duties = sorted(other_duties + [duty], key=lambda d: d.start_utc)
         validation_result = validator.validate_schedule(crew_member, all_duties)
+
+    # The continuity rule, asked of the ACTUAL times this time. It has
+    # always existed and has always been correct — in build_duty(),
+    # which only ever ran at planning time on planned times, so a delay
+    # that made a duty physically impossible produced no warning at all
+    # (flight 53 on 2026-09-02: recorded 2200-2345z while its second
+    # sector still read 2200-2345z, so sector 1 landed at the moment
+    # sector 2 departed, and the status went to OPERATED in silence).
+    #
+    # NEEDS_MANUAL_REVIEW, not ILLEGAL and not a WARNING. It is not a
+    # regulatory violation — no ANO-012 limit has been exceeded — it is
+    # a duty whose recorded times cannot be assessed at all, which is
+    # exactly what that status means. It also flags every roster row
+    # sharing this duty_id as NEEDS_REVIEW below, so the duty carries a
+    # durable marker for a human instead of a message that prints once
+    # and is gone on the next rerun.
+    #
+    # It does NOT refuse the recording. What happened, happened; a
+    # controller entering an actual mid-duty is doing their job, and
+    # blocking them would leave the record less accurate, not more.
+    ordered_legs = [
+        FlightLeg(dep_time=s.departure_utc, arr_time=s.arrival_utc,
+                  origin=s.origin, destination=s.destination)
+        for s in duty.sectors
+    ]
+    for problem in sector_continuity_problems(ordered_legs):
+        validation_result.add_alert(RuleAlert(
+            rule_code="SECTOR_CONTINUITY",
+            status=AlertStatus.NEEDS_MANUAL_REVIEW,
+            severity="HIGH",
+            message=f"Recorded sector times are not physically continuous. {problem}",
+            duty_id=duty_id,
+        ))
 
     for alert in _check_crew_qualifications(crew_row, new_debrief_time.date()):
         validation_result.add_alert(alert)
