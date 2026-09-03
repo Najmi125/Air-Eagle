@@ -324,6 +324,35 @@ forward.
   Apply 018 and 019, then seed the accounts, then deploy. Production was
   at 017 as of the flight-deck merge.
 
+- **`sector-coherence-on-actuals` merged into `main` (2026-09-03).** A
+  delay that made a duty physically impossible produced no warning —
+  flight 53 recorded 2200-2345z while its second sector still read
+  2200-2345z. **725/725 verified against real Postgres 16**,
+  reachability clean, with the live scenario reproduced: both crew
+  flagged NEEDS_MANUAL_REVIEW, the rule named, the legs and times
+  given. **No reboot, no migration.**
+
+  **⚠ FDP VALUES CHANGE ON EXISTING DELAYED DUTIES.** `debrief_time`
+  now comes from `max(arrival)` across sectors rather than
+  `sectors[-1]`, which was the last sector by PLANNED departure and
+  never re-sorted once actuals landed. A delay on a non-final sector
+  was ending duties earlier on paper than the crew finished, so the
+  recorded FDP UNDERSTATED them. Only duties where a sector overtook
+  another change; ones still in order are bit-identical, and that is
+  pinned.
+
+  **⚠ SEE ALSO the standalone `st.rerun()` entry**, found beside this
+  and larger than it: every delay warning on that page had been
+  discarded before reaching the browser since the day it was written,
+  swap alerts included, and no AppTest assertion can tell the
+  difference.
+
+  **Before touching `sector_continuity_problems()`:** it has two
+  callers that need OPPOSITE behaviour from one copy of the rule —
+  planning must refuse an impossible duty, recording must not, because
+  it already happened. That is why it returns sentences instead of
+  raising.
+
 - **`uncovered-reason-summary` merged into `main` (2026-09-02).**
   "Why each one could not be crewed" was every attempted pair
   concatenated into a paragraph, the same commander rejection repeating
@@ -8408,3 +8437,62 @@ itself defanged.
 
 No new module, no new page import, no new attribute read by a page — so
 **no reboot**, and no migration.
+
+## 2026-09-03: anything written before `st.rerun()` is discarded — and no test can see it
+
+Its own entry, because it is not about the bug it was found beside and
+it will happen again.
+
+`st.rerun()` **abandons the current script run**. Every `st.warning`,
+`st.error` and `st.write` issued earlier in that same run is thrown
+away and never reaches the browser. The user sees the page re-render
+with none of it.
+
+`pages/3_Flight_Log.py` did exactly this after recording an actual:
+computed the revalidation outcomes, wrote the warnings, then called
+`st.rerun()` to refresh the flight table.
+
+**So the swap alerts have never been visible.** Not since a regression
+— since the day they were written. A feature that was designed, built,
+tested, verified against real Postgres and merged, and never once
+reached a controller's screen.
+
+### Why the suite could not catch it, and still cannot
+
+`AppTest.run()` executes the script, and a `st.rerun()` inside it runs
+the script AGAIN within that same `at.run()`. Both passes enqueue into
+one `ForwardMsgQueue`, and `enqueue()` replaces messages by delta-path
+index — so a message from the discarded first pass **survives into the
+parsed tree** wherever the second pass is shorter. (Same mechanism as
+the 2026-09-01 finding about asserting a control is gone.)
+
+The consequence is worth being blunt about: **an AppTest assertion that
+a warning appears can pass while the browser shows nothing.** The test
+is not merely blind to this defect; it actively reports the opposite of
+the truth. No amount of care writing that assertion helps.
+
+### What to do instead
+
+Queue the messages and render them at the top of the NEXT run:
+
+```python
+_NOTICES = "some_page_notices"
+for notice in st.session_state.pop(_NOTICES, []):
+    st.warning(notice)          # rendered on the run AFTER the rerun
+...
+st.session_state[_NOTICES] = notices
+st.rerun()
+```
+
+**The check to apply when reviewing any page:** find every
+`st.rerun()`, and read upward. Anything written between the top of that
+branch and the rerun is invisible. If it matters, it must survive the
+rerun; if it does not matter, it should not have been written.
+
+Three other `st.rerun()` calls on that page write only `st.success`
+lines for actions whose result is visible in the refreshed table, so
+they are harmless — but that was checked, not assumed, and the same
+check is owed to `pages/1_Control_Room.py`, `pages/4_Roster.py`,
+`pages/6_Roster_Generation.py` and `pages/7_Schedule_Templates.py`,
+which have not been audited for this. **NOT DONE — an honest open item
+rather than a claim of completeness.**
