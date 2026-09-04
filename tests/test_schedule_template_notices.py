@@ -109,6 +109,37 @@ def _click(at, label):
     return at.run()
 
 
+def _queued(at, marker):
+    """Everything rendered ABOVE the control named by `marker` — i.e.
+    by the queue drain near the top of the page.
+
+    POSITION, NOT PRESENCE, and the difference decides whether these
+    tests measure anything at all. Asserting that a message merely
+    EXISTS passes either way: st.rerun() runs the script twice inside
+    one at.run(), and the discarded first pass survives in the element
+    tree wherever the second render is shorter.
+
+    Verified directly (2026-09-06) rather than reasoned about: with
+    queue_*_notice() mutated to write immediately — exactly the
+    pre-fix behaviour — every presence-based assertion in this file
+    still passed while nothing rendered above the control. The
+    narrower mutation (one call site converted back) DID fail, which
+    is why the weakness was not obvious; a test that catches a
+    one-line regression but not a wholesale one is worth knowing about
+    rather than trusting.
+
+    A queued notice can only appear above the control, because the
+    drain runs before it. A discarded one cannot.
+    """
+    out = []
+    for element in at.main:
+        text = str(getattr(element, "label", "") or getattr(element, "value", ""))
+        if marker in text and type(element).__name__ in ("Button", "Subheader", "Header"):
+            break
+        out.append(str(getattr(element, "value", "")))
+    return out
+
+
 def _select_both(at):
     for iid in (11, 12):
         [c for c in at.checkbox if c.key == f"select_{iid}"][0].check()
@@ -124,7 +155,8 @@ def test_the_approval_confirmation_survives_the_rerun(templates):
     at = _click(at, "Approve selected")
 
     assert not at.exception, at.exception
-    assert any("2 rotation(s) approved" in s.value for s in at.success), (
+    assert any("2 rotation(s) approved" in line
+               for line in _queued(at, "Approve selected")), (
         "the confirmation was written before st.rerun() and discarded"
     )
 
@@ -138,14 +170,14 @@ def test_a_refused_approval_says_which_one_and_why(templates):
     at = _click(at, "Approve selected")
 
     assert not at.exception, at.exception
-    errors = [e.value for e in at.error]
-    assert any("Instance 12" in e for e in errors), (
+    top = _queued(at, "Approve selected")
+    assert any("Instance 12" in line for line in top), (
         "a controller has never seen this: the refusal named no instance"
     )
-    assert any("rotation date is in the past" in e for e in errors), (
+    assert any("rotation date is in the past" in line for line in top), (
         "the service's own reason must survive, not just the fact of failure"
     )
-    assert any("1 rotation(s) approved" in s.value for s in at.success), (
+    assert any("1 rotation(s) approved" in line for line in top), (
         "the partial success must survive alongside the partial failure"
     )
 
@@ -157,9 +189,10 @@ def test_a_refused_rejection_says_which_one_and_why(templates):
     at = _click(at, "Reject selected")
 
     assert not at.exception, at.exception
-    assert any("Instance 12" in e.value for e in at.error)
-    assert any("already approved" in e.value for e in at.error)
-    assert any("1 rotation(s) rejected" in s.value for s in at.success)
+    top = _queued(at, "Reject selected")
+    assert any("Instance 12" in line for line in top)
+    assert any("already approved" in line for line in top)
+    assert any("1 rotation(s) rejected" in line for line in top)
 
 
 # ------------------------------------------------------------------
@@ -182,15 +215,25 @@ def test_select_all_writes_no_message_and_needs_no_queue(templates):
     )
 
 
-def test_nothing_is_left_over_for_the_next_run(templates):
-    """The queue is popped, not read. A notice that survives into a
-    SECOND rerun is a message that reappears on an unrelated action —
-    the failure mode of a queue nobody drains."""
+def test_the_queue_is_popped_not_read(templates):
+    """A notice that stays in session_state reappears on the next
+    unrelated action — the failure mode of a queue nobody drains.
+
+    Asserted on SESSION STATE rather than on the next render, and
+    deliberately so: AppTest keeps stale elements from an earlier
+    at.run() wherever the newer render is shorter, so "the message is
+    not on screen any more" is not a question the element tree answers
+    honestly. Whether the queue is empty is a question with one
+    answer.
+    """
     at = _select_both(templates())
     at = _click(at, "Approve selected")
-    assert any("approved" in s.value for s in at.success)
+    assert any("approved" in line for line in _queued(at, "Approve selected"))
 
-    at = _click(at, "Select all visible")
-    assert not any("approved" in s.value for s in at.success), (
-        "a stale confirmation reappeared on an unrelated click"
+    # `not in`, not `.get(...)`: AppTest's session_state raises
+    # KeyError on a missing key rather than returning None, so the
+    # absence has to be asked about directly. A drain that READ the
+    # queue would leave the key behind with its list intact.
+    assert "schedule_template_notices" not in at.session_state, (
+        "the drain read the queue instead of popping it"
     )

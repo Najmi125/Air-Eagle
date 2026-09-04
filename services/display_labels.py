@@ -258,9 +258,40 @@ def flight_label(row: Any, include_route: bool = False) -> str:
 # plus a writer is a lot of machinery for a dict with a handful of
 # lines. The column becomes the better home the moment OCC wants to
 # edit these themselves.
+# EVERY crew_id BELOW WAS VERIFIED AGAINST THE crew TABLE before it was
+# committed (read-only SELECT, 2026-09-06). The mapping came from an
+# operator list, not from the database, and a mis-keyed entry would
+# label the WRONG PILOT on the roster board — silently, because a
+# plausible name in the wrong seat looks exactly like a correct one.
+# The stored name is quoted beside each so the check is repeatable
+# without a database.
+#
+# What the table is FOR shows up in this list: the mechanical rule
+# picks the surname, and the operator picks the given name people are
+# actually known by. Those disagree for six of the ten.
 CREW_DISPLAY_NAMES: dict[str, str] = {
-    # crew_id: what a controller calls them
-    "CPT-03": "Fahim",
+    # crew_id   preferred      stored name              rule would give
+    "CPT-01": "Waqar",     # MUHAMMAD WAQAR             CPT M Waqar
+    "CPT-03": "Fahim",     # SYED FAHIM MAHMOOD         CPT S Mahmood
+    "CPT-04": "Tahir",     # TAHIR MAHMOOD RAJA         CPT T Raja
+    "CPT-05": "Adnan",     # ADNAN SARWAR KHAN          CPT A Khan
+    "CPT-06": "Asad",      # CAPT MUHAMMAD ASAD ALI     CPT M Ali
+    "FO-01": "Ibtisam",    # IBTISAM MUZZAFAR           FO I Muzzafar
+    "FO-02": "Wasim",      # MUHAMMAD WASIM             FO M Wasim
+    "FO-03": "Shahbaz",    # MUHAMMAD SHAHBAZ           FO M Shahbaz
+    "FO-04": "Suleman",    # MUHAMMAD SULEMAN AZIZ      FO M Aziz
+
+    # CPT-02 (MUHAMMAD SALEEM) IS DELIBERATELY ABSENT. The operator
+    # supplied nine names; "Saleem" was inferred from the stored name
+    # rather than given, and this table exists precisely because the
+    # preferred name is NOT derivable from the stored one — so
+    # inferring one entry would contradict the reason for the other
+    # nine. The database confirms CPT-02 is MUHAMMAD SALEEM; it cannot
+    # confirm what a controller calls him.
+    #
+    # Until the operator says, he falls through to the rule and reads
+    # `CPT M Saleem`, which is correct and unambiguous. That is the
+    # fallback doing its job, not a gap.
 }
 
 

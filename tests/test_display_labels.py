@@ -139,17 +139,55 @@ def test_the_lookup_wins_over_the_mechanical_rule():
 
 
 def test_an_unlisted_crew_member_still_reads_exactly_as_before():
-    """The fallback is not a defensive branch — it is the path almost
-    every crew member takes, and a table that made unlisted people
-    render worse would not be safe to fill in gradually."""
-    assert "CPT-01" not in CREW_DISPLAY_NAMES
-    assert crew_seat_name(_seat()) == "CPT M Waqar"
+    """The fallback is not a defensive branch. Nine of Air Eagle's ten
+    pilots are listed now, but CPT-02 is not — the operator gave nine
+    names and his was not among them — and he must still read cleanly
+    rather than becoming the one broken row.
+
+    Every crew member added later is a crew member who spends some time
+    on this path, so it is the live case, not a hypothetical one."""
+    assert "CPT-02" not in CREW_DISPLAY_NAMES, (
+        "CPT-02's preferred name was never given by the operator; "
+        "inferring it would contradict the reason this table exists"
+    )
+    assert crew_seat_name(_seat("CPT-02", "CPT", "MUHAMMAD SALEEM")) == "CPT M Saleem"
 
 
 def test_a_title_stored_inside_the_name_is_still_stripped():
-    """CPT-06 is "CAPT MUHAMMAD ASAD ALI" in production. The lookup
-    supersedes this rule for listed crew; it does not replace it."""
-    assert crew_seat_name(_seat("CPT-06", "CPT", "CAPT MUHAMMAD ASAD ALI ")) == "CPT M Ali"
+    """CPT-06 is "CAPT MUHAMMAD ASAD ALI" in production, and the naive
+    rule would initial him from his rank: "CPT C Ali".
+
+    Measured on an id that is NOT in the lookup, using that same stored
+    name. CPT-06 is listed now and renders "CPT Asad" without the rule
+    running, so asserting on him would have left the stripping untested
+    while still passing — which is how a rule stops being covered
+    without anyone deleting a test."""
+    assert "CPT-99" not in CREW_DISPLAY_NAMES
+    assert crew_seat_name(_seat("CPT-99", "CPT", "CAPT MUHAMMAD ASAD ALI ")) == "CPT M Ali"
+
+
+def test_every_listed_pilot_renders_from_the_table_not_the_rule():
+    """The nine entries, exercised as a set. Each was verified against
+    the crew table before being committed, because a mis-keyed entry
+    labels the WRONG PILOT on the roster board — and a plausible name in
+    the wrong seat looks exactly like a correct one."""
+    expected = {
+        "CPT-01": ("MUHAMMAD WAQAR", "CPT Waqar"),
+        "CPT-03": ("SYED FAHIM MAHMOOD", "CPT Fahim"),
+        "CPT-04": ("TAHIR MAHMOOD RAJA", "CPT Tahir"),
+        "CPT-05": ("ADNAN SARWAR KHAN", "CPT Adnan"),
+        "CPT-06": ("CAPT MUHAMMAD ASAD ALI ", "CPT Asad"),
+        "FO-01": ("IBTISAM MUZZAFAR ", "FO Ibtisam"),
+        "FO-02": ("MUHAMMAD WASIM", "FO Wasim"),
+        "FO-03": ("MUHAMMAD SHAHBAZ", "FO Shahbaz"),
+        "FO-04": ("MUHAMMAD SULEMAN AZIZ", "FO Suleman"),
+    }
+    assert set(expected) == set(CREW_DISPLAY_NAMES), (
+        "the table and this test disagree about who is listed"
+    )
+    for crew_id, (stored, label) in expected.items():
+        grade = crew_id.split("-")[0]
+        assert crew_seat_name(_seat(crew_id, grade, stored)) == label
 
 
 def test_the_grade_comes_from_the_record_not_the_table(monkeypatch):

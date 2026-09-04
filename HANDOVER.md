@@ -9208,3 +9208,207 @@ process keeps the old sort and the old names until it is restarted. Not
 a crash, not a limb; simply invisible. Recorded because "no reboot
 required" has meant "nothing will break" on this project, and here the
 honest answer is "nothing will break, and nothing will change either".
+
+## 2026-09-06: the picker scoped by time, three swallows the first Roster audit missed, and a test that measured nothing
+
+Second pass on `roster-ui-and-display-names`, after the operator
+confirmed the #1 finding and supplied the display names.
+
+### The pair form's picker: scoped by time, and by PLANNED
+
+The operator's original request was to scope it to what appears in
+"Current assignments". **Checked before building, and it was wrong on
+both counts** — the operator agreed and asked for the alternative
+instead:
+
+1. **It would strand every crew-TBC flight.** `grep assign_pair_to_duty(`
+   returns this page and the generator, nothing else, so **this form is
+   the only UI path to crew an existing flight** — and Control Room
+   says so to the controller's face: *"Both cockpit seats will show as
+   UNCOVERED until assigned in Roster."* "Current assignments"
+   deliberately excludes flights with no flight-deck crew
+   (`if not seats: continue`). Scoping to it removes exactly the
+   flights that need crewing.
+2. **It would not have fixed the reported problem.** "Current
+   assignments" lists every crewed flight regardless of date and spans
+   the same 20 Aug – 21 Sep. It removes uncrewed flights, not old ones.
+
+**Built instead: PLANNED, in a date window that defaults to today
+onwards.**
+
+The PLANNED half is **a correctness fix, not tidying**:
+`assign_pair_to_duty()` does not check flight status at all, so the old
+picker would happily crew a CANCELLED or already-OPERATED flight and
+nothing downstream would object — and cancelling a flight cascades
+CANCELLED to its roster rows, so crew assigned to a cancelled flight is
+written and immediately meaningless.
+
+**The window reaches backwards, and that is the part that keeps this
+from repeating the mistake it replaced.** A PLANNED flight in the past
+was never flown and never cancelled: it is uncrewed work, and there is
+no other UI that can crew it. So:
+
+* the default starts at today **only when there is something on or
+  after today to start with** — a database whose only uncrewed work is
+  overdue opens on those flights, not on an empty picker;
+* widening the "Flights from" date reaches them in every other case;
+* the captions say what the scope and the window leave out, because a
+  picker that quietly drops flights is how *"not listing all flights"*
+  gets reported a second time.
+
+**Both forms share the scope.** The LM/ENGR picker had the identical
+problem and takes the identical fix — two pickers onto one flight list
+must not disagree about which flights exist.
+
+### Three `st.rerun()` sites this page's FIRST audit missed
+
+Found while editing the file for the scoping, and worth recording as a
+miss rather than as a discovery: **the 2026-09-05 Roster audit
+converted only the flagged-for-review section.** It left:
+
+* the pair form's ALLOWED branch — success line, pair alerts and
+  **swap alerts**;
+* the LM/ENGR form's ALLOWED branch — success, legality status and its
+  alert lines, and **swap alerts**;
+* the unassign confirmation.
+
+So the swap alert — *"this assignment breaks the legality of N
+already-scheduled future duty(ies)"* — was found and fixed on Control
+Room on 2026-09-05 **and left broken here**, on the page a controller
+actually crews scheduled flights from. `queue_roster_notice()` gained a
+`lines` parameter to carry the per-duty detail, matching Control
+Room's.
+
+The lesson is narrow and worth keeping: **a page is not "audited"
+because one section of it was.** The grep to run is `st.rerun()` on the
+page, every hit, not the memory of having looked at the file.
+
+### THE IMPORTANT ONE: a presence assertion measures nothing here
+
+The three notice test files asserted that a message EXISTS after the
+click. **That passes whether or not the fix is present.**
+
+`st.rerun()` runs the script twice inside one `at.run()`, and the
+discarded first pass survives in the element tree **wherever the second
+render is shorter** — which on these pages it is, because the form that
+wrote the message collapses after a successful submit. So the
+discarded message is still in `at.error` / `at.success`.
+
+**Verified rather than reasoned about.** Mutating
+`queue_roster_notice()` to write immediately — exactly the pre-fix
+behaviour — left all thirteen Roster tests green. The same mutation
+left `test_control_room_notices.py` and
+`test_schedule_template_notices.py` green too, **including tests this
+project had already reported as mutation-verified**. That earlier
+evidence was a NARROWER mutation (one call site converted back to a
+direct write), which does fail; a test that catches a one-line
+regression but not a wholesale one is worth knowing about rather than
+trusting.
+
+**The fix is to assert POSITION, not presence.** A queued notice can
+only render above the control that triggered it, because the drain runs
+at the top of the page. A discarded one cannot. All three files now
+collect the elements rendered before that control and assert on those,
+and all three now FAIL under the general mutation:
+
+```
+tests/test_control_room_notices.py     3 failed
+tests/test_roster_flight_scope.py      2 failed
+tests/test_schedule_template_notices.py 3 failed
+```
+
+> **RULE.** A test for the `st.rerun()` swallow may not assert that a
+> message merely exists. It must assert WHERE the message rendered —
+> above the control that produced it. Presence-based assertions on
+> these pages pass in both directions and are worse than no test,
+> because they read as coverage.
+
+One test moved further still: "the queue is popped, not read" is now
+asserted on `session_state` (`"..._notices" not in at.session_state`)
+rather than on the next render, because AppTest keeps stale elements
+from an EARLIER `at.run()` too — so "the message is gone from the
+screen" is not a question the element tree answers honestly, while "is
+the queue empty" has one answer. Note `at.session_state.get(key)`
+raises `KeyError` on a missing key rather than returning `None`; the
+membership test is the one that works.
+
+### The display names, all ten verified
+
+`CREW_DISPLAY_NAMES` now carries nine entries. **Every `crew_id` was
+verified against the `crew` table by read-only SELECT before being
+committed** — the mapping came from an operator list, not from the
+database, and a mis-keyed entry would label the WRONG PILOT on the
+roster board, silently, because a plausible name in the wrong seat
+looks exactly like a correct one. The stored name sits beside each
+entry so the check is repeatable without a database.
+
+What the table is for shows up in the list itself — the rule picks the
+surname, the operator picks the given name people are known by, and
+those disagree for six of the ten:
+
+| crew_id | stored | rule gives | operator says |
+| --- | --- | --- | --- |
+| CPT-01 | MUHAMMAD WAQAR | CPT M Waqar | CPT Waqar |
+| CPT-03 | SYED FAHIM MAHMOOD | CPT S Mahmood | **CPT Fahim** |
+| CPT-04 | TAHIR MAHMOOD RAJA | CPT T Raja | **CPT Tahir** |
+| CPT-05 | ADNAN SARWAR KHAN | CPT A Khan | **CPT Adnan** |
+| CPT-06 | CAPT MUHAMMAD ASAD ALI | CPT M Ali | **CPT Asad** |
+| FO-01 | IBTISAM MUZZAFAR | FO I Muzzafar | **FO Ibtisam** |
+| FO-02 | MUHAMMAD WASIM | FO M Wasim | FO Wasim |
+| FO-03 | MUHAMMAD SHAHBAZ | FO M Shahbaz | FO Shahbaz |
+| FO-04 | MUHAMMAD SULEMAN AZIZ | FO M Aziz | **FO Suleman** |
+
+**CPT-02 (MUHAMMAD SALEEM) IS DELIBERATELY ABSENT.** The operator
+supplied nine names and his was not among them; "Saleem" was an
+inference from the stored name. This table exists precisely because the
+preferred name is NOT derivable from the stored one, so inferring one
+entry would contradict the reason for the other nine. The database
+confirms he is MUHAMMAD SALEEM; it cannot confirm what a controller
+calls him. Until the operator says, he falls through to the rule and
+reads `CPT M Saleem` — correct and unambiguous. **That is the fallback
+doing its job, not a gap.**
+
+**A test had to be re-pointed, and the reason generalises.**
+`test_a_title_stored_inside_the_name_is_not_taken_for_a_given_name`
+measured the `NAME_TITLES` stripping on CPT-06 ("CAPT MUHAMMAD ASAD
+ALI"). CPT-06 is in the lookup now and never reaches the rule — so the
+test would have kept passing while testing nothing. It now runs against
+`CPT-99`, a fixture-only id carrying the same stored name and
+deliberately absent from the table. **Adding real data to a lookup can
+silently retire the coverage of the fallback beneath it.**
+
+#### The `display_name` column: recorded trigger
+
+Confirmed by the operator. The column is the better home **eventually**
+— it would let OCC fix a name through Crew Data without a deploy — and
+the code table is right today: ten pilots, names that change about
+never, a wrong entry that is cosmetic rather than operational. Checked
+that such a column would score **tier 0** against crew-change
+revalidation (`LEGALITY_FIELDS_TIER1/2/3` are explicit allowlists), so
+it could not accidentally flag duties.
+
+> **TRIGGER TO SWITCH:** OCC wanting to edit these names themselves, or
+> the crew list passing roughly thirty.
+
+### Headings
+
+"Replace crew" (the flight-deck pair) and **"Assign other occupants
+(LM / ENGR / Other)"**. The two used to read as a contradiction — both
+said *assign* — when they are different acts on different people: the
+flight-deck pair is a SEAT that gets replaced, and an LM/ENGR is an
+occupant added to a duty who holds no `operating_position` at all.
+
+### Reboot: unchanged from the first pass, and stated from the check
+
+```
+added imports in pages/          : (none)
+new service attribute reads      : (none)
+migrations                       : (none)
+```
+
+No limb applies, so nothing can raise `AttributeError` on a stale
+module. **A restart is still required for anything to CHANGE**, for the
+separate reason recorded on 2026-09-05: the `ORDER BY` in
+`flight_service` and the lookup in `display_labels` live in imported
+service modules, which Streamlit keeps in `sys.modules` for the life of
+the process. Nothing will break, and nothing will change either.

@@ -46,14 +46,22 @@ st.title("Roster")
 _ROSTER_NOTICES = "roster_notices"
 
 for _notice in st.session_state.pop(_ROSTER_NOTICES, []):
-    {"error": st.error, "warning": st.warning}.get(
+    {"error": st.error, "warning": st.warning, "info": st.info}.get(
         _notice["level"], st.success)(_notice["headline"])
+    for _line in _notice["lines"]:
+        st.write(_line)
 
 
-def queue_roster_notice(level, headline):
-    """Hold a message for the run AFTER the imminent st.rerun()."""
+def queue_roster_notice(level, headline, lines=()):
+    """Hold a message for the run AFTER the imminent st.rerun().
+
+    `lines` carries the DETAIL under a headline — the per-duty lines of
+    a swap alert, the per-alert lines of a legality result. Added
+    2026-09-06 with the three sites this page's first audit missed; a
+    headline-only queue is why they looked already-handled.
+    """
     st.session_state.setdefault(_ROSTER_NOTICES, []).append(
-        {"level": level, "headline": headline})
+        {"level": level, "headline": headline, "lines": list(lines)})
 
 OTHER_ROLE_OPTIONS = ["LM", "ENGR", "Other"]
 
@@ -272,11 +280,93 @@ commander_pool = commander_pool[commander_pool["role"].isin(SEAT_ELIGIBLE_GRADES
 second_pilot_pool_full = crew_service.get_all_crew(active_only=True)
 second_pilot_pool_full = second_pilot_pool_full[second_pilot_pool_full["role"].isin(SEAT_ELIGIBLE_GRADES["SECOND_PILOT"])]
 
+# ------------------------------------------------------------------
+# WHICH FLIGHTS CAN STILL BE CREWED
+# ------------------------------------------------------------------
+# Reported by the operator: this picker offered all 103 flights,
+# 20 Aug – 21 Sep, so reaching tomorrow meant scrolling through a month
+# of history.
+#
+# SCOPED BY TIME, NOT BY WHETHER THE FLIGHT IS ALREADY CREWED. The
+# obvious narrowing — "only show what's in Current assignments" — was
+# checked and rejected, because it fails twice. It would remove exactly
+# the flights that still need crew: this form is the ONLY UI path to
+# crew an existing flight (grep assign_pair_to_duty — this page and the
+# generator, nothing else), and Control Room tells the controller so in
+# as many words when a flight is saved uncrewed: "Both cockpit seats
+# will show as UNCOVERED until assigned in Roster." And it would not
+# have fixed the reported problem anyway, because Current assignments
+# lists every crewed flight regardless of date and spans the same
+# 20 Aug – 21 Sep.
+#
+# PLANNED ONLY, which is a correctness fix and not only tidying:
+# assign_pair_to_duty() does not check flight status at all, so the old
+# picker would crew a CANCELLED or already-OPERATED flight and nothing
+# downstream would object. Cancelling a flight cascades CANCELLED to
+# its roster rows, so crew assigned to one is written and immediately
+# meaningless.
+#
+# NOTHING IS HIDDEN SILENTLY, which is the rule this page has to keep:
+# the captions say what the scope and the window leave out, and the
+# window REACHES BACKWARDS. A PLANNED flight in the past that was never
+# crewed is exactly the case a "future only" filter would strand, which
+# is the same mistake as the Current-assignments version in a different
+# place — so the default only starts at today when there is something
+# on or after today to start with.
+assignable = flights_df[flights_df["status"] == "PLANNED"]
+not_planned = len(flights_df) - len(assignable)
+
+if assignable.empty:
+    st.info(
+        "No PLANNED flights to crew — every flight on file has operated, "
+        "been cancelled or been disrupted."
+    )
+    selectable = assignable
+else:
+    # UTC, not local: everything this system schedules against is UTC,
+    # and a local "today" would move the window either side of midnight
+    # for a controller in a different offset.
+    today = pd.Timestamp.now("UTC").date()
+    planned_dates = assignable["dep_time_planned"].dt.date
+    default_from = today if (planned_dates >= today).any() else planned_dates.min()
+    default_to = max(planned_dates.max(), default_from)
+
+    st.caption(
+        "Starts from today; widen it to reach a PLANNED flight already in "
+        "the past."
+    )
+    pair_col1, pair_col2 = st.columns(2)
+    window_from = pair_col1.date_input(
+        "Flights from", value=default_from, key="pair_window_from")
+    window_to = pair_col2.date_input(
+        "Flights to", value=default_to, key="pair_window_to")
+
+    selectable = assignable[planned_dates.between(window_from, window_to)]
+    hidden = len(assignable) - len(selectable)
+    if hidden:
+        st.caption(
+            f"{len(selectable)} of {len(assignable)} PLANNED flights shown — "
+            f"{hidden} outside {window_from} – {window_to}."
+        )
+    if selectable.empty:
+        st.info("No PLANNED flights in this date range — widen it to reach them.")
+
+if not_planned:
+    st.caption(
+        f"{not_planned} flight(s) not offered: only PLANNED flights can be "
+        f"crewed."
+    )
+
 # Flight number leading, not flight_id: a controller thinks "EPE 786".
 # The date is part of it because numbers repeat daily, and the route
 # distinguishes two same-numbered options. flight_id stays the
 # identifier — it is only the LABEL that changes.
-flight_labels = build_flight_labels(flights_df, include_route=True)
+#
+# Built from `selectable`, so BOTH forms below inherit the scope. The
+# LM/ENGR form had the identical problem and the identical fix; two
+# pickers onto one flight list must not disagree about which flights
+# exist.
+flight_labels = build_flight_labels(selectable, include_route=True)
 
 if commander_pool.empty or second_pilot_pool_full.empty:
     st.warning("Need at least one active CPT (Commander) and one active CPT/FO (Second Pilot) on file.")
@@ -340,35 +430,48 @@ else:
                         for alert in result.validation.pair_alerts:
                             st.write(f"Pair — {alert.message}")
                     else:
-                        st.success(
+                        # MISSED BY THIS PAGE'S FIRST AUDIT (2026-09-05),
+                        # which converted only the flagged-for-review
+                        # section and left the two assignment handlers
+                        # writing straight into the discarded run. The
+                        # identical defect was found and fixed on Control
+                        # Room the same day — and THIS is the page a
+                        # controller crews scheduled flights from, so the
+                        # swap alert had never reached a browser here
+                        # either.
+                        queue_roster_notice("success", (
                             f"ALLOWED — {commander_id} assigned as Commander, "
                             f"{second_pilot_id} assigned as Second Pilot (duties "
                             f"{result.commander_duty_id} / {result.second_pilot_duty_id})"
-                        )
-                        for alert in result.validation.pair_alerts:
-                            st.info(f"Pair — {alert.message}")
+                        ), [f"Pair — {alert.message}"
+                            for alert in result.validation.pair_alerts])
 
                         for label, conflicts in (
                             ("Commander", result.commander_downstream_conflicts),
                             ("Second Pilot", result.second_pilot_downstream_conflicts),
                         ):
                             if conflicts:
-                                st.error(
+                                queue_roster_notice("error", (
                                     f"⚠️ Swap alert — this assignment breaks the legality of "
                                     f"{len(conflicts)} already-scheduled future duty(ies) for the {label}:"
-                                )
-                                for conflict in conflicts:
-                                    st.write(
-                                        f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
-                                        f"reports {conflict.report_time}): "
-                                        + (f"legal candidates: {', '.join(conflict.candidates)}"
-                                           if conflict.candidates else "**no legal candidates found**")
-                                    )
+                                ), [
+                                    f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
+                                    f"reports {conflict.report_time}): "
+                                    + (f"legal candidates: {', '.join(conflict.candidates)}"
+                                       if conflict.candidates else "**no legal candidates found**")
+                                    for conflict in conflicts
+                                ])
                         st.rerun()
 
 
 # ================= ASSIGN LM/ENGR/OTHER =================
-st.subheader("Assign other crew (LM / ENGR / Other)")
+# "Replace crew" above, "Assign other occupants" here (operator
+# request, 2026-09-06). The two headings used to read as a
+# contradiction — one said assign, the other said assign — when they
+# are different acts on different people: the flight-deck pair is a
+# SEAT that gets replaced, and an LM/ENGR is an occupant added to a
+# duty who holds no operating_position at all.
+st.subheader("Assign other occupants (LM / ENGR / Other)")
 
 crew_df = crew_service.get_all_crew(active_only=True)
 if crew_df.empty:
@@ -427,25 +530,31 @@ else:
                                 f"FDP {result.computed_fdp_hours}h"
                             )
                     else:
-                        st.success(f"ALLOWED — assigned as {role_choice} (duty {result.duty_id})")
+                        queue_roster_notice(
+                            "success",
+                            f"ALLOWED — assigned as {role_choice} (duty {result.duty_id})")
                         if result.legality_status != "LEGAL":
-                            st.warning(f"Status: {result.legality_status}")
-                            for line in format_alert_lines(result.alert_summary):
-                                st.write(line)
+                            # A LEGAL-but-not-clean result: the status
+                            # and its alert lines are the whole content
+                            # of the warning, so they travel together
+                            # rather than as a headline with the reasons
+                            # dropped.
+                            queue_roster_notice(
+                                "warning", f"Status: {result.legality_status}",
+                                list(format_alert_lines(result.alert_summary)))
 
                         if result.downstream_conflicts:
-                            st.error(
+                            queue_roster_notice("error", (
                                 f"⚠️ Swap alert — this assignment breaks the legality of "
                                 f"{len(result.downstream_conflicts)} already-scheduled future "
                                 f"duty(ies) for {crew_id}:"
-                            )
-                            for conflict in result.downstream_conflicts:
-                                st.write(
-                                    f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
-                                    f"reports {conflict.report_time}): "
-                                    + (f"legal candidates: {', '.join(conflict.candidates)}"
-                                       if conflict.candidates else "**no legal candidates found**")
-                                )
+                            ), [
+                                f"- Duty {conflict.duty_id} ({conflict.role_assigned}, "
+                                f"reports {conflict.report_time}): "
+                                + (f"legal candidates: {', '.join(conflict.candidates)}"
+                                   if conflict.candidates else "**no legal candidates found**")
+                                for conflict in result.downstream_conflicts
+                            ])
                         st.rerun()
 
 
@@ -477,5 +586,7 @@ else:
         row = active_df.loc[unassign_choice]
         assignment_service.remove_assignment_from_duty(
             row["crew_id"], row["duty_id"], reason=reason or None, app_user=app_user)
-        st.success(f"Unassigned {row['crew_id']} from duty {row['duty_id']}")
+        queue_roster_notice(
+            "success",
+            f"Unassigned {row['crew_id']} from duty {row['duty_id']}")
         st.rerun()
