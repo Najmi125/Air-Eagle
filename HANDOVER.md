@@ -1271,6 +1271,28 @@ resuming towards merge. See `Current active task` above for actual
 merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
+- **`assign_pair_to_duty()` DOES NOT CHECK FLIGHT STATUS, and that is
+  still true on `main` (found 2026-09-06).** It validates crew legality
+  exhaustively and never asks what state the flight is in. So crew can
+  be assigned to a **CANCELLED** flight, or to one that has already
+  **OPERATED**, and nothing in the service layer objects.
+
+  Cancelling a flight cascades `CANCELLED` to its roster rows
+  (`cancel_flight()`), so crew written onto a cancelled flight is
+  written and immediately meaningless — the roster row exists, says
+  CANCELLED, and nobody was told the assignment was pointless.
+
+  **The Roster picker now refuses to OFFER a non-PLANNED flight**
+  (2026-09-06), which closes the only UI path that reached this. The
+  SERVICE is unguarded still, so the generator, a future page, or a
+  script can all do it. Recorded as a real gap rather than treated as
+  fixed by the UI narrowing that happens to sit in front of it — a
+  guard in the picker is a guard on one caller, not on the function.
+
+  Not fixed here deliberately: it is a service-layer legality decision
+  (which statuses may be crewed — PLANNED certainly, DISRUPTED
+  arguably, OPERATED for retroactive record-keeping possibly) and that
+  is an operator question, not a UI one.
 - **`query_parser.py`: "how close is Waqar to his 1000 hour limit"
   resolves to `utilization` correctly but with no `window_days`, so the
   report has nothing to compute against — found 2026-08-08 by the user
@@ -1746,6 +1768,72 @@ against the legality-gate work above.
   non-ASCII characters (em dashes), and the OS-default codec (cp1252
   on Windows) silently mis-decodes them without raising, not a
   hypothetical risk.
+- **A TEST FOR THE `st.rerun()` SWALLOW MAY NOT ASSERT THAT A MESSAGE
+  MERELY EXISTS. It must assert WHERE the message rendered** — above
+  the control that produced it (rule added 2026-09-06; it invalidates
+  a whole style of assertion, so it is stated here rather than left
+  inside a dated entry).
+
+  `st.rerun()` runs the script twice inside one `at.run()`, and the
+  discarded first pass **survives in the element tree wherever the
+  second render is shorter** — which on every page carrying this fix it
+  is, because the form that wrote the message collapses after a
+  successful submit. So `any("Swap alert" in e.value for e in
+  at.error)` is TRUE whether the message was queued or thrown away. A
+  presence assertion cannot distinguish the two states it exists to
+  distinguish.
+
+  Only a QUEUED message can render above the control, because the drain
+  runs at the top of the page. That is the property to assert, and the
+  helper for it (`_queued(at, marker)`) is in
+  `tests/test_control_room_notices.py`,
+  `tests/test_schedule_template_notices.py` and
+  `tests/test_roster_flight_scope.py`.
+
+  **Verified, not reasoned about.** Mutating `queue_*_notice()` to
+  write immediately — exactly the pre-fix behaviour — left all three
+  files green while nothing rendered above the control. A NARROWER
+  mutation (one call site converted back to a direct write) does fail,
+  which is why the weakness was not obvious and why two of these files
+  had already been reported as mutation-verified. **A test that catches
+  a one-line regression but not a wholesale one is worth knowing about
+  rather than trusting**; when mutation-testing a queue, mutate the
+  QUEUE, not one of its callers.
+
+  Corollary: "the message is gone from the screen now" is also not a
+  question the element tree answers honestly, because AppTest keeps
+  stale elements from EARLIER `at.run()` calls too. Assert the queue is
+  empty instead — `"..._notices" not in at.session_state`. Note
+  `at.session_state.get(key)` raises `KeyError` on a missing key rather
+  than returning `None`; the membership test is the one that works.
+- **A PAGE IS NOT "AUDITED" BECAUSE ONE SECTION OF IT WAS**
+  (2026-09-06). The 2026-09-05 Roster audit converted the
+  flagged-for-review section and stopped, leaving both assignment
+  handlers and the unassign confirmation writing into the discarded
+  run. So the swap alert — *"this assignment breaks the legality of N
+  already-scheduled future duty(ies)"* — was found and fixed on Control
+  Room on 5 September and **left broken on Roster**, which is the page
+  a controller actually crews scheduled flights from: the more
+  important of the two.
+
+  The check is `grep -n "st.rerun()" <page>` and then reading EVERY
+  hit, not the memory of having looked at the file. Same shape as the
+  reboot rule: run the grep, don't recall the conclusion.
+- **ADDING REAL DATA TO A LOOKUP CAN SILENTLY RETIRE THE COVERAGE OF
+  THE FALLBACK BENEATH IT** (2026-09-06). `crew_seat_name()` consults
+  `CREW_DISPLAY_NAMES` first and falls back to the
+  strip-titles/initial-plus-surname rule.
+  `test_a_title_stored_inside_the_name_is_not_taken_for_a_given_name`
+  measured that stripping on **CPT-06**, the real pilot stored as
+  "CAPT MUHAMMAD ASAD ALI". The moment CPT-06 was added to the lookup,
+  he stopped reaching the rule at all — and the test **kept passing
+  while testing nothing**.
+
+  It now runs against `CPT-99`, a fixture-only id carrying the same
+  stored name and deliberately absent from the table. General rule: a
+  test for a FALLBACK must use an input that cannot be captured by the
+  layer in front of it, and that input must be one the production data
+  cannot grow into.
 
 ## 2026-07-21: real data arrived — data quality findings, FTL
 ## exemption, schema reconciliation (unpushed as of this snapshot)
