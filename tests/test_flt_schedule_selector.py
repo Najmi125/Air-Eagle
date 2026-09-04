@@ -65,11 +65,12 @@ def _flights(n=FLIGHT_COUNT):
             "other_occupants_operating": "", "other_occupants_non_operating": "",
             "remarks": "", "rotation_instance_id": i + 1,
         })
-    # The page sorts newest-first in SQL (ORDER BY dep_time_planned
-    # DESC); the fake read has to reproduce that, not the insertion
-    # order, or the test measures a list the page never receives.
+    # The page sorts CHRONOLOGICALLY in SQL (ORDER BY dep_time_planned
+    # ASC, changed from DESC 2026-09-05); the fake read has to
+    # reproduce that, not the insertion order, or the test measures a
+    # list the page never receives.
     return pd.DataFrame(rows, columns=FLIGHT_COLUMNS).sort_values(
-        "dep_time_planned", ascending=False).reset_index(drop=True)
+        "dep_time_planned", ascending=True).reset_index(drop=True)
 
 
 @pytest.fixture
@@ -130,19 +131,47 @@ def test_the_actuals_selector_offers_every_flight_in_its_window(flt_schedule):
     )
 
 
-def test_the_oldest_flight_is_reachable_not_just_the_newest(flt_schedule):
-    """Ordering is newest-first, so a cap would take the tail. With the
-    window open, the far end must be present — that is the specific way
-    "not listing all flights" would have been literally true."""
+def test_both_ends_of_the_list_are_reachable(flt_schedule):
+    """A row cap takes one end or the other, so BOTH ends must be
+    present — that is the specific way "not listing all flights" would
+    have been literally true.
+
+    Written when ordering was newest-first and a cap would have taken
+    the tail. Ordering is chronological now (2026-09-05), which moves
+    which end a cap would eat — so the test asserts both ends by
+    POSITION rather than by direction, and does not have to be rewritten
+    the next time the sort changes."""
     at = _widen(authed_app_test("pages/3_Flight_Log.py").run(), flt_schedule)
     options = list(_selector(at).options)
 
-    oldest = flight_label(flt_schedule.iloc[-1], include_route=True)
-    newest = flight_label(flt_schedule.iloc[0], include_route=True)
-    assert newest in options
-    assert oldest in options, (
-        "the oldest flight is missing — consistent with a row cap taking "
-        "the tail of a newest-first list"
+    last = flight_label(flt_schedule.iloc[-1], include_route=True)
+    first = flight_label(flt_schedule.iloc[0], include_route=True)
+    assert first in options
+    assert last in options, (
+        "one end of the list is missing — consistent with a row cap"
+    )
+
+
+def test_the_list_runs_earliest_first(flt_schedule):
+    """The PAGE does not re-order what the service hands it.
+
+    Deliberately NOT a test of the ORDER BY: the fake read is already
+    sorted, so this would keep passing if the SQL clause were deleted.
+    What it catches is a page-level sort or a dict round-trip quietly
+    rearranging the options between the query and the selectbox —
+    which is the failure that would make Flt Schedule disagree with the
+    pair form on Roster, where duties are built in departure order.
+
+    The direction itself is measured in test_flight_service.py, against
+    a real database, because that is where ORDER BY actually runs."""
+    at = _widen(authed_app_test("pages/3_Flight_Log.py").run(), flt_schedule)
+    options = list(_selector(at).options)
+
+    chronological = [flight_label(row, include_route=True)
+                     for _, row in flt_schedule.sort_values(
+                         "dep_time_planned").iterrows()]
+    assert options == chronological, (
+        "the selector is not in departure order"
     )
 
 

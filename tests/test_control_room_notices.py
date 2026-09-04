@@ -105,6 +105,37 @@ def control_room(monkeypatch):
     return render
 
 
+def _queued(at, marker):
+    """Everything rendered ABOVE the control named by `marker` — i.e.
+    by the queue drain near the top of the page.
+
+    POSITION, NOT PRESENCE, and the difference decides whether these
+    tests measure anything at all. Asserting that a message merely
+    EXISTS passes either way: st.rerun() runs the script twice inside
+    one at.run(), and the discarded first pass survives in the element
+    tree wherever the second render is shorter.
+
+    Verified directly (2026-09-06) rather than reasoned about: with
+    queue_*_notice() mutated to write immediately — exactly the
+    pre-fix behaviour — every presence-based assertion in this file
+    still passed while nothing rendered above the control. The
+    narrower mutation (one call site converted back) DID fail, which
+    is why the weakness was not obvious; a test that catches a
+    one-line regression but not a wholesale one is worth knowing about
+    rather than trusting.
+
+    A queued notice can only appear above the control, because the
+    drain runs before it. A discarded one cannot.
+    """
+    out = []
+    for element in at.main:
+        text = str(getattr(element, "label", "") or getattr(element, "value", ""))
+        if marker in text and type(element).__name__ in ("Button", "Subheader", "Header"):
+            break
+        out.append(str(getattr(element, "value", "")))
+    return out
+
+
 def _fill(at, flight_no="EPE 786"):
     for t in at.text_input:
         if t.label.startswith("Flight No"):
@@ -135,7 +166,8 @@ def test_the_flight_saved_confirmation_survives_the_rerun(control_room):
 
     assert not at.exception, at.exception
     assert written, "the flight was not saved at all"
-    assert any("saved with no crew assigned" in s.value for s in at.success), (
+    assert any("saved with no crew assigned" in line
+               for line in _queued(at, "Check legality")), (
         "the confirmation was written before st.rerun() and discarded"
     )
 
@@ -150,10 +182,11 @@ def test_the_swap_alert_survives_the_rerun(control_room):
     at = _save(at)
 
     assert not at.exception, at.exception
-    assert any("Swap alert" in e.value for e in at.error), (
+    top = _queued(at, "Check legality")
+    assert any("Swap alert" in line for line in top), (
         "a controller has never seen this"
     )
-    assert any("no legal candidates found" in w.value for w in at.markdown), (
+    assert any("no legal candidates found" in line for line in top), (
         "the detail lines must survive too, not just the headline"
     )
 
@@ -164,7 +197,7 @@ def test_the_allowed_confirmation_survives_the_rerun(control_room):
     at = _save(at)
 
     assert not at.exception, at.exception
-    assert any("ALLOWED" in s.value for s in at.success)
+    assert any("ALLOWED" in line for line in _queued(at, "Check legality"))
 
 
 def test_a_rejected_pair_still_reports_without_queueing(control_room):
@@ -179,6 +212,10 @@ def test_a_rejected_pair_still_reports_without_queueing(control_room):
 
     assert not at.exception, at.exception
     assert any("REJECTED" in e.value for e in at.error)
+    assert not any("REJECTED" in line for line in _queued(at, "Check legality")), (
+        "REJECTED does not rerun, so it must NOT be routed through the "
+        "queue — it belongs beside the form the controller just used"
+    )
 
 
 # ------------------------------------------------------------------

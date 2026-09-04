@@ -220,5 +220,50 @@ def test_get_all_flights_status_filter_narrows_correctly(_patch_engine):
     assert list(cancelled_only["flight_id"]) == [id2]
 
 
+def test_get_all_flights_runs_earliest_first(_patch_engine):
+    """The shared sort, measured where it actually lives.
+
+    ORDER BY is SQL, so the page-level tests cannot see it: their fake
+    reads hand back a frame someone already sorted, and would keep
+    passing if this clause were deleted outright. This is the only test
+    that fails if the direction changes.
+
+    Chronological since 2026-09-05, at the operator's request, and it
+    is ONE sort with five consumers — Control Room's day board, Flt
+    Schedule's table and actuals selector, Roster's pair form, and two
+    assistant reports. Ordering is presentation for every one of them;
+    nothing takes a head, a tail or an .iloc[0] off this frame.
+    """
+    late = flight_service.add_flight(_valid_flight(
+        dep_time_planned=dt.datetime(2026, 7, 22, 5, 0),
+        arr_time_planned=dt.datetime(2026, 7, 22, 7, 0)))
+    early = flight_service.add_flight(_valid_flight(
+        dep_time_planned=dt.datetime(2026, 7, 20, 5, 0),
+        arr_time_planned=dt.datetime(2026, 7, 20, 7, 0)))
+    middle = flight_service.add_flight(_valid_flight(
+        dep_time_planned=dt.datetime(2026, 7, 21, 5, 0),
+        arr_time_planned=dt.datetime(2026, 7, 21, 7, 0)))
+
+    # Inserted late/early/middle deliberately: insertion order and
+    # flight_id order both differ from departure order, so a frame that
+    # merely came back in the order it was written would fail here.
+    ordered = flight_service.get_all_flights()
+    assert list(ordered["flight_id"]) == [early, middle, late]
+
+
+def test_the_ordering_survives_a_filter(_patch_engine):
+    """The ORDER BY is appended after the WHERE clause is assembled, so
+    a filtered read is where a mis-built query would drop it."""
+    late = flight_service.add_flight(_valid_flight(
+        dep_time_planned=dt.datetime(2026, 7, 22, 5, 0),
+        arr_time_planned=dt.datetime(2026, 7, 22, 7, 0)))
+    early = flight_service.add_flight(_valid_flight(
+        dep_time_planned=dt.datetime(2026, 7, 20, 5, 0),
+        arr_time_planned=dt.datetime(2026, 7, 20, 7, 0)))
+
+    ordered = flight_service.get_all_flights(status_filter="PLANNED")
+    assert list(ordered["flight_id"]) == [early, late]
+
+
 def test_get_flight_returns_none_for_missing(_patch_engine):
     assert flight_service.get_flight(999999) is None

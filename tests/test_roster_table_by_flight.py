@@ -34,9 +34,17 @@ from tests.conftest import authed_app_test
 
 D = dt.datetime
 
+# CPT-01, CPT-06 and FO-01 are all in CREW_DISPLAY_NAMES as of
+# 2026-09-06, so they now render as the operator names them and the
+# mechanical rule never runs for them. CPT-99 exists here for the
+# tests that measure the RULE: it carries the same awkward stored name
+# CPT-06 does and is deliberately NOT in the lookup, so the title
+# stripping stays covered instead of quietly becoming untested the
+# moment a real pilot was added to the table.
 CREW = [
     {"crew_id": "CPT-01", "role": "CPT", "name": "MUHAMMAD WAQAR"},
     {"crew_id": "CPT-06", "role": "CPT", "name": "CAPT MUHAMMAD ASAD ALI "},
+    {"crew_id": "CPT-99", "role": "CPT", "name": "CAPT MUHAMMAD ASAD ALI "},
     {"crew_id": "FO-01", "role": "FO", "name": "IBTISAM MUZZAFAR "},
     {"crew_id": "LM-01", "role": "LM", "name": "ABDULGHANI KHAN"},
 ]
@@ -114,8 +122,8 @@ def test_one_row_per_flight_not_one_per_crew_member(roster_page):
 
     assert len(table) == 1, "two crew on one flight must collapse to one row"
     row = table.iloc[0]
-    assert row["Commander"] == "CPT M Waqar"
-    assert row["Second Pilot"] == "FO I Muzzafar"
+    assert row["Commander"] == "CPT Waqar"
+    assert row["Second Pilot"] == "FO Ibtisam"
 
 
 def test_internal_identifiers_are_gone(roster_page):
@@ -150,9 +158,22 @@ def test_the_columns_say_commander_and_second_pilot(roster_page):
 
 def test_a_title_stored_inside_the_name_is_not_taken_for_a_given_name(roster_page):
     """CPT-06 is stored as "CAPT MUHAMMAD ASAD ALI" in production, so
-    the naive rule initials a pilot from a rank: "CPT C Ali"."""
-    table = _table(roster_page({1: [_assignment("CPT-06", "CPT", "COMMANDER")]}))
+    the naive rule initials a pilot from a rank: "CPT C Ali".
+
+    Measured on CPT-99, which carries that same stored name and is NOT
+    in CREW_DISPLAY_NAMES. CPT-06 himself is in the lookup now and
+    renders "CPT Asad" without the rule running at all — pointing this
+    test at him would have left the stripping untested while still
+    passing."""
+    table = _table(roster_page({1: [_assignment("CPT-99", "CPT", "COMMANDER")]}))
     assert table.iloc[0]["Commander"] == "CPT M Ali"
+
+
+def test_a_pilot_in_the_lookup_is_named_the_way_the_operator_names_him(roster_page):
+    """The other half of the pair above, on the same stored name: the
+    rule gives "CPT M Ali", the operator says "Asad"."""
+    table = _table(roster_page({1: [_assignment("CPT-06", "CPT", "COMMANDER")]}))
+    assert table.iloc[0]["Commander"] == "CPT Asad"
 
 
 # ------------------------------------------------------------------
@@ -172,7 +193,7 @@ def test_a_cockpit_crew_member_with_no_recorded_seat_is_surfaced(roster_page):
     table = _table(at)
 
     assert "Seat not recorded" in table.columns
-    assert "FO I Muzzafar" in table.iloc[0]["Seat not recorded"]
+    assert "FO Ibtisam" in table.iloc[0]["Seat not recorded"]
     # And the seat they did not fill is still uncovered, not quietly
     # treated as covered by them.
     assert table.iloc[0]["Second Pilot"] == "UNCOVERED"
@@ -211,4 +232,4 @@ def test_a_crewed_flight_still_appears_beside_a_cargo_only_one(roster_page):
     }))
 
     assert len(table) == 1
-    assert table.iloc[0]["Commander"] == "CPT M Waqar"
+    assert table.iloc[0]["Commander"] == "CPT Waqar"
