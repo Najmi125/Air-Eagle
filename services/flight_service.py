@@ -334,7 +334,31 @@ def get_all_flights(
         params["destination"] = destination
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY dep_time_planned DESC"
+    # CHRONOLOGICAL ASCENDING, changed from DESC on 2026-09-05 at the
+    # operator's request. ONE shared sort with five consumers, so the
+    # change was checked against each rather than assumed local:
+    #
+    #   pages/1_Control_Room.py   today's board — single day, and a
+    #                             day reads earliest-first
+    #   pages/3_Flight_Log.py     the table AND the actuals selector,
+    #                             whose own comment already called
+    #                             newest-first the problem: "103
+    #                             options ordered newest-first is not
+    #                             something you can find a three-week-
+    #                             old flight in"
+    #   pages/4_Roster.py         the pair form's flight list, which
+    #                             then re-sorts the SELECTION ascending
+    #                             anyway before building the duty — so
+    #                             the picker and the duty now agree
+    #   services/assistant/reports.py  flight_records and
+    #                             roster_coverage: row ORDER changes,
+    #                             row CONTENT does not
+    #
+    # Nothing computes from the position of a row: no caller takes a
+    # head, a tail, or an .iloc[0] off this frame. The one place that
+    # DID depend on the direction was a test's fake read
+    # (test_flt_schedule_selector.py), updated with this.
+    query += " ORDER BY dep_time_planned ASC"
     return pd.read_sql(text(query), engine, params=params)
 
 

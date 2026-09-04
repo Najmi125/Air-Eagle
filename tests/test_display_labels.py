@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
-from services.display_labels import (crew_label, crew_labels, flight_label,
-                                      flight_labels)
+from services.display_labels import (CREW_DISPLAY_NAMES, crew_label, crew_labels,
+                                      crew_seat_name, flight_label, flight_labels)
 
 
 def _crew(crew_id="CPT-01", staff="AE92", name="Ali Raza"):
@@ -113,3 +113,87 @@ def test_flight_labels_maps_every_row():
         4242: "EPE 786 · 20 Aug 1900z",
         99: "#99 · 21 Aug 0600z",
     }
+
+
+# ------------------------------------------------------------------
+# crew_seat_name — the lookup, and the rule behind it
+# ------------------------------------------------------------------
+# CREW_DISPLAY_NAMES carries what a controller actually calls each
+# pilot, because that is not derivable from the stored name: CPT-03 is
+# SYED FAHIM MAHMOOD and is called "Fahim". The mechanical rule stays
+# as the FALLBACK for anyone unlisted, which is what lets the table be
+# filled in one name at a time instead of having to be complete before
+# it is correct.
+
+
+def _seat(crew_id="CPT-01", role="CPT", name="MUHAMMAD WAQAR"):
+    return pd.Series({"crew_id": crew_id, "role": role, "name": name})
+
+
+def test_the_lookup_wins_over_the_mechanical_rule():
+    """The whole point. The rule renders SYED FAHIM MAHMOOD as
+    `CPT S Mahmood` — correct, unambiguous, and not what anybody on the
+    frequency would recognise."""
+    row = _seat("CPT-03", "CPT", "SYED FAHIM MAHMOOD")
+    assert crew_seat_name(row) == "CPT Fahim"
+
+
+def test_an_unlisted_crew_member_still_reads_exactly_as_before():
+    """The fallback is not a defensive branch — it is the path almost
+    every crew member takes, and a table that made unlisted people
+    render worse would not be safe to fill in gradually."""
+    assert "CPT-01" not in CREW_DISPLAY_NAMES
+    assert crew_seat_name(_seat()) == "CPT M Waqar"
+
+
+def test_a_title_stored_inside_the_name_is_still_stripped():
+    """CPT-06 is "CAPT MUHAMMAD ASAD ALI" in production. The lookup
+    supersedes this rule for listed crew; it does not replace it."""
+    assert crew_seat_name(_seat("CPT-06", "CPT", "CAPT MUHAMMAD ASAD ALI ")) == "CPT M Ali"
+
+
+def test_the_grade_comes_from_the_record_not_the_table(monkeypatch):
+    """So a promotion changes the label without anyone editing
+    display_labels.py — which is the reason the table stores the PERSON
+    part only."""
+    monkeypatch.setitem(CREW_DISPLAY_NAMES, "FO-09", "Bilal")
+    assert crew_seat_name(_seat("FO-09", "FO", "MUHAMMAD BILAL")) == "FO Bilal"
+    assert crew_seat_name(_seat("FO-09", "CPT", "MUHAMMAD BILAL")) == "CPT Bilal"
+
+
+def test_a_listed_crew_member_is_named_even_with_no_stored_name(monkeypatch):
+    """Checked BEFORE the missing-name branch: a blank name field is
+    exactly where knowing what people call this person is worth most,
+    and falling through to `CPT CPT-09` would waste the one source that
+    still has the answer."""
+    monkeypatch.setitem(CREW_DISPLAY_NAMES, "CPT-09", "Kamran")
+    assert crew_seat_name(_seat("CPT-09", "CPT", None)) == "CPT Kamran"
+
+
+def test_an_unlisted_crew_member_with_no_name_falls_back_to_the_id():
+    """Never "None" in front of the operator: an id is more use than a
+    blank cell."""
+    label = crew_seat_name(_seat("LM-01", "LM", None))
+    assert label == "LM LM-01"
+    assert "None" not in label
+
+
+def test_every_entry_is_keyed_by_crew_id_not_by_name():
+    """A name-keyed table would map six of Air Eagle's ten pilots onto
+    one entry — six are stored as some form of "MUHAMMAD". crew_id is
+    the foreign key across roster and audit_log, and it does not
+    collide."""
+    for key, value in CREW_DISPLAY_NAMES.items():
+        assert "-" in key and key == key.upper(), (
+            f"{key!r} does not look like a crew_id"
+        )
+        assert value and value == value.strip(), f"{key}: {value!r}"
+
+
+def test_the_lookup_does_not_leak_into_the_full_identity_label():
+    """crew_label() is the AUDIT-facing label — staff id, crew_id and
+    the name as STORED. A support conversation is about the record, so
+    the friendly name deliberately stops at the roster table."""
+    row = pd.Series({"crew_id": "CPT-03", "operator_staff_id": "AE-97",
+                     "name": "SYED FAHIM MAHMOOD"})
+    assert crew_label(row) == "AE-97 (CPT-03) — SYED FAHIM MAHMOOD"

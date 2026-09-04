@@ -55,6 +55,38 @@ if "template_form_generation" not in st.session_state:
     st.session_state.template_form_generation = 0
 
 
+# Messages that must OUTLIVE the st.rerun() ending a successful action.
+# st.rerun() ABANDONS the current run, so anything written before it in
+# that run never reaches the browser (HANDOVER 2026-09-03). This was
+# the LAST un-audited page, and it had five discarding sites.
+#
+# The two that matter are the bulk review buttons. "Approve selected"
+# and "Reject selected" loop over the selection, collect the ones that
+# FAILED, write `Instance 12: <why>` for each — and then rerun. So a
+# controller who approved five drafts and had two refused saw no error
+# at all: just a shorter list, with the two refusals still sitting in
+# it and nothing on screen saying why. Same shape as the swap alert on
+# Control Room (2026-09-05) — a partial failure reported into a run
+# that was already being thrown away.
+#
+# NOT every rerun on this page was broken, and the two that were not
+# are deliberately left alone: "Select all visible" and "Clear
+# selection" write no messages at all, they only stage session_state
+# for the next run. Queueing them would be a change with no defect
+# behind it.
+_ST_NOTICES = "schedule_template_notices"
+
+for _notice in st.session_state.pop(_ST_NOTICES, []):
+    {"error": st.error, "warning": st.warning, "info": st.info}.get(
+        _notice["level"], st.success)(_notice["headline"])
+
+
+def queue_st_notice(level, headline):
+    """Hold a message for the run AFTER the imminent st.rerun()."""
+    st.session_state.setdefault(_ST_NOTICES, []).append(
+        {"level": level, "headline": headline})
+
+
 
 
 def _render_leg_rows(key_prefix: str, defaults: list | None = None) -> list[dict]:
@@ -331,10 +363,10 @@ def render_change_this_schedule(cv_code, app_user):
                 except Exception as e:
                     st.error(f"Could not create new version: {e}")
                 else:
-                    st.success(
+                    queue_st_notice("success", (
                         f"New version created for {cv_code} — version "
                         f"{int(cv_current['version'])} now ends {cv_day_before}."
-                    )
+                    ))
                     # Same reason as the create form: the next render of
                     # this section must honor the NEW current version's
                     # legs as defaults, which stale widget keys would
@@ -492,7 +524,9 @@ else:
                 except Exception as e:
                     st.error(f"Could not delete {code}: {e}")
                 else:
-                    st.success(f"Template {code} deleted — it had produced no rotations.")
+                    queue_st_notice(
+                        "success",
+                        f"Template {code} deleted — it had produced no rotations.")
                     st.rerun()
 
 st.subheader("Create a new template")
@@ -559,7 +593,9 @@ with st.form("create_template_form"):
                 except Exception as e:
                     st.error(f"Could not create template: {e}")
                 else:
-                    st.success(f"Template {ct_rotation_code.strip()} v1 created with {len(ct_legs)} leg(s).")
+                    queue_st_notice(
+                        "success",
+                        f"Template {ct_rotation_code.strip()} v1 created with {len(ct_legs)} leg(s).")
                     # Retire this form's widget keys so the next
                     # template starts genuinely blank rather than
                     # inheriting whatever was just saved.
@@ -743,9 +779,16 @@ else:
                     approved.append(iid)
                     total_flights += len(flight_ids)
             if approved:
-                st.success(f"{len(approved)} rotation(s) approved — {total_flights} flight(s) created.")
+                queue_st_notice(
+                    "success",
+                    f"{len(approved)} rotation(s) approved — {total_flights} flight(s) created.")
+            # THE reason this page needed auditing. A bulk approve that
+            # refuses two of five drafts said WHICH two and why — into
+            # a run st.rerun() then discarded. The refused drafts stay
+            # in the list, so the only thing the controller saw was a
+            # list that had not fully emptied.
             for iid, msg in failed:
-                st.error(f"Instance {iid}: {msg}")
+                queue_st_notice("error", f"Instance {iid}: {msg}")
             st.rerun()
 
     with reject_col:
@@ -761,7 +804,7 @@ else:
                 else:
                     rejected.append(iid)
             if rejected:
-                st.success(f"{len(rejected)} rotation(s) rejected.")
+                queue_st_notice("success", f"{len(rejected)} rotation(s) rejected.")
             for iid, msg in failed:
-                st.error(f"Instance {iid}: {msg}")
+                queue_st_notice("error", f"Instance {iid}: {msg}")
             st.rerun()

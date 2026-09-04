@@ -213,6 +213,57 @@ def flight_label(row: Any, include_route: bool = False) -> str:
     return " · ".join(parts)
 
 
+# ------------------------------------------------------------------
+# What a controller actually calls each pilot
+# ------------------------------------------------------------------
+# THE LOOKUP WINS. Everything below it — title stripping, the
+# initial-plus-surname rule — is the FALLBACK for a crew member who is
+# not listed here, not the primary path (operator decision,
+# 2026-09-05).
+#
+# Why a table and not a cleverer rule: there is no rule. The name a
+# controller says aloud is not derivable from the name in the database.
+# CPT-03 is stored as a MAHMOOD and is called "Fahim"; the mechanical
+# rule renders him `CPT S Mahmood`, which is correct, unambiguous, and
+# not what anybody on the frequency would recognise. No amount of
+# parsing gets from the stored string to "Fahim", because the
+# information is not in the string.
+#
+# So the rule stays — as the fallback that keeps an unlisted crew
+# member readable rather than blank — and the table carries the
+# knowledge the data does not.
+#
+# TO ADD SOMEONE: one line, keyed by crew_id. The value is the PERSON
+# part only; the grade is prefixed from the crew record, so that a
+# promotion changes the label without anyone editing this file.
+#
+# crew_id is the key rather than the name, deliberately: it is the
+# foreign key across roster and audit_log, it does not change, and it
+# does not collide — six of Air Eagle's ten pilots are stored as some
+# form of "MUHAMMAD", so a name-keyed table would map six people onto
+# one entry.
+#
+# AN UNLISTED CREW MEMBER IS NOT A BUG and must never render as blank
+# or as "None": they fall through to the rule below and read exactly as
+# they did before this table existed. That is what makes the table safe
+# to fill in gradually, one name at a time, instead of needing to be
+# complete before it is correct.
+#
+# WHETHER THIS BELONGS IN A COLUMN INSTEAD is a live question, recorded
+# in HANDOVER rather than settled here. Short version: a
+# `crew.display_name` column would let OCC fix a name through Crew Data
+# without a deploy, which is the real advantage. Against it today --
+# ten pilots, a name that changes about never, and a wrong entry that
+# is cosmetic rather than operational — a migration plus a form field
+# plus a writer is a lot of machinery for a dict with a handful of
+# lines. The column becomes the better home the moment OCC wants to
+# edit these themselves.
+CREW_DISPLAY_NAMES: dict[str, str] = {
+    # crew_id: what a controller calls them
+    "CPT-03": "Fahim",
+}
+
+
 # Titles that appear INSIDE the stored name field. Air Eagle's crew
 # records were imported from a spreadsheet where at least one name
 # reads "CAPT MUHAMMAD ASAD ALI" (checked in production 2026-09-03), so
@@ -232,12 +283,18 @@ def crew_seat_name(row: Any) -> str:
     `AE-95 (CPT-01) — MUHAMMAD WAQAR` of crew_label() does not fit. A
     controller reads the seat and wants to know who is in it.
 
+    CREW_DISPLAY_NAMES IS CONSULTED FIRST (2026-09-05). A crew member
+    listed there renders as the operator names them — `CPT Fahim` --
+    and the mechanical rule below never runs for them.
+
     THE RULE WAS CHOSEN AGAINST THE REAL NAMES, not in the abstract
-    (2026-09-03). First-name-only renders six of Air Eagle's ten pilots
-    as "Muhammad", which identifies nobody; initial-plus-surname
-    separates all ten. It also means CPT-03 reads `CPT S Mahmood` rather
-    than the "Fahim" a controller might say aloud — the trade accepted
-    deliberately, because a rule that works on one name is not a rule.
+    (2026-09-03), and remains the FALLBACK for anyone unlisted.
+    First-name-only renders six of Air Eagle's ten pilots as
+    "Muhammad", which identifies nobody; initial-plus-surname separates
+    all ten. It also meant CPT-03 read `CPT S Mahmood` rather than the
+    "Fahim" a controller says aloud — which is the specific gap the
+    lookup exists to close, and the reason the trade is no longer
+    accepted silently.
 
     Titles stored inside the name are stripped (see NAME_TITLES), so
     "CAPT MUHAMMAD ASAD ALI" gives `CPT M Ali` and not `CPT C Ali`.
@@ -250,6 +307,16 @@ def crew_seat_name(row: Any) -> str:
     grade = _clean(row["role"]) if "role" in row else None
     name = _clean(row["name"]) if "name" in row else None
     crew_id = _clean(row["crew_id"]) if "crew_id" in row else None
+
+    # The lookup, ahead of everything. Note it is checked BEFORE the
+    # missing-name branch: a crew record with a blank name is exactly
+    # the case where knowing what people call this person is worth
+    # most, and falling through to `CPT CPT-03` because the stored
+    # string is empty would waste the one source that still has the
+    # answer.
+    preferred = CREW_DISPLAY_NAMES.get(crew_id) if crew_id else None
+    if preferred:
+        return f"{grade} {preferred}" if grade else preferred
 
     if not name:
         # Never render "None": a crew record with no name still has an

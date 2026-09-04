@@ -254,7 +254,15 @@ else:
 
 
 # ================= ASSIGN FLIGHT-DECK PAIR =================
-st.subheader("Assign flight-deck pair (Commander + Second Pilot)")
+# LABEL ONLY (operator request, 2026-09-05). The form underneath is
+# untouched: it still calls assignment_service.assign_pair_to_duty(),
+# which validates the Commander and the Second Pilot TOGETHER and
+# commits both or neither — the atomic-pair guarantee — and still
+# runs the full legality check plus the downstream swap-alert scan on
+# every submission. Renaming a heading cannot reach any of that; it is
+# checked here rather than asserted because "label only" is the kind of
+# claim that is worth being able to point at.
+st.subheader("Replace crew")
 
 if flights_df.empty:
     st.stop()
