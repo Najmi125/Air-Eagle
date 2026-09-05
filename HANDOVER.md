@@ -9967,3 +9967,127 @@ whereas the expiry gap has **already happened** and the backup gap is
 one accident from being permanent. But it is above every remaining
 nicety, and it should be built deliberately rather than slotted in
 behind other work.
+
+## 2026-09-05: both branches failed verification, and both failures were mine
+
+Reported from real Postgres 16. Two different faults, both introduced by
+me in the same session, and both are worth recording because neither was
+visible on the machine that wrote them.
+
+### 1. An em dash where a SQL comment marker belonged
+
+`seat-occupancy-and-stale-handover`: **770 passed, 52 failed.**
+
+```
+LINE 4:   — operating_position added 2026-08-21, additi...
+```
+
+A blanket `" -- "` → `" — "` pass over `services/assignment_service.py`
+— run to make the comments I had just written match house style —
+rewrote **eleven lines inside a SQL string literal**:
+
+```sql
+SELECT r.roster_id, ..., r.debrief_time,
+       — operating_position added 2026-08-21, additive: no
+       — existing consumer selects columns by position.
+       r.operating_position,
+```
+
+SQL comments are `--`. An em dash is not syntax, so
+`get_roster_for_flight()` failed to parse on every call, and the 52
+failures were five test files plus the four inherited from the base
+branch — `roster_generator_service` (17), `roster_generation_page`
+(11), `seat_occupancy` (9), `assistant_page` (6),
+`assistant_reports` (5).
+
+**THIS IS THE MOJIBAKE CLASS AGAIN**, in a new form: *a typographic
+character standing where a syntactic one was needed, which reads
+correctly and parses as nothing.* The previous instance was em dashes
+inside regex alternations, which compiled fine and then matched nothing
+forever. Both were introduced by a well-meaning pass that made prose
+nicer **without asking what each occurrence WAS**.
+
+The aggravating detail: earlier the same session I checked that this
+file already held 32 `" -- "` on `main`, concluded a blanket replace
+would "pollute the diff", and decided against it — then ran one anyway
+two steps later. **The check was done and the conclusion was not
+applied.**
+
+Restored byte-identical to `main`; `git diff main` over that block is
+empty.
+
+> **RULE.** Never run a cosmetic character replace across a whole
+> source file. A file contains Python, prose, SQL, regex and format
+> strings, and `--`, `-`, `'` and `"` are syntax in some of them.
+> Convert the lines you wrote, by anchor, or leave the file alone.
+
+**`tests/test_sql_string_hygiene.py` is the thing that notices**, since
+reading the diff did not. It parses every file under `services/`,
+`core/`, `db/`, `pages/` and `scripts/` with `ast`, finds the string
+literals that are SQL, strips each line's `-- comment` tail, and fails
+on an em dash, en dash, minus sign, smart quote or non-breaking space
+in what remains.
+
+Three things it took to make that test honest, each a small lesson:
+
+* **`ast`, not a regex.** "Is this line inside a string" is not a
+  question a regex answers reliably.
+* **A statement, not a word.** The first version asked whether
+  `"UPDATE "` appeared anywhere and flagged four docstrings and a Crew
+  Data caption ("Renewing a document? Update its expiry date"). Prose
+  about the database is not SQL, and a hygiene test that cries wolf
+  gets suppressed rather than fixed. It now requires a line that BEGINS
+  a statement AND a clause keyword, and skips docstrings entirely.
+* **Only what the database parses.** `get_roster_for_flight()`'s query
+  has carried `-- role_assigned is NOT — under the pair model` since
+  2026-08-21 and is perfectly valid: Postgres stops reading at the
+  `--`. Flagging it would have demanded that correct code change. The
+  test strips comment tails, so the em dash that broke everything is
+  caught precisely because it was standing WHERE the `--` should have
+  been — and the test pins BOTH directions with that exact pair of
+  strings.
+
+### 2. A "DB-free" test that reached `get_engine()`
+
+`enforce-planned-only-crewing`: **806 passed, 4 failed**, all
+`RuntimeError: DATABASE_URL not set` from
+`services/assignment_service.py:1782` — `engine = get_engine()`, which
+runs at the top of `assign_pair_to_duty()` BEFORE any guard.
+
+They passed here because this machine's `.env` supplies the URL. **They
+were not DB-free; they were .env-dependent** — which is a worse state
+than a DB-gated test, because a DB-gated test skips honestly.
+
+Same class as the round-trip guards of 2026-08-27, and the fix is the
+net that already exists: `isolate_from_database()` from
+`tests/test_generation_round_trips.py`, which replaces `get_engine` and
+`log_audit` on EVERY service module — necessary because
+`from db.db import get_engine` binds a COPY into each module's
+namespace, so patching one module does nothing to another. The engine
+it installs raises on any use, so a guard that lets something through
+now fails loudly instead of opening a connection to production.
+
+Wired into `tests/test_planned_only_crewing.py` and
+`tests/test_seat_occupancy.py`. Both also needed `tests/` on
+`sys.path`, the same two lines
+`tests/test_partial_accept.py` and `tests/test_cross_rotation_legality.py`
+already carry.
+
+> **RULE.** A test that calls a service entry point is not DB-free
+> because it patches the reads. Entry points take `engine =
+> get_engine()` first, so the test is only DB-free once `get_engine`
+> itself is isolated. **Verify it by running with `.env` moved aside**,
+> not by observing that it passes.
+
+That last line is the operational half: this file's tests now run with
+`.env` temporarily renamed before being pushed, because "passes on my
+machine" is exactly the state that produced both of these.
+
+### What did NOT change
+
+The #6 finding stands entirely. A form labelled "Replace crew" that
+added a second Commander instead of replacing one, reachable in one
+move, latent only because production happened to hold no duplicate. The
+guard, its placement, the refuse-don't-overwrite decision and the
+`_read_duty_rows()` routing are all unchanged — the SQL fault was in a
+cosmetic pass over the same file, not in the fix.

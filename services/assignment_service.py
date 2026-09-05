@@ -3163,17 +3163,17 @@ def search_roster(crew_ids: Optional[List[str]] = None, role: Optional[str] = No
     query = """
         SELECT r.roster_id, r.crew_id, c.name AS crew_name, r.flight_id,
                r.duty_id, r.duty_date, r.report_time, r.debrief_time,
-               — operating_position added 2026-08-21, additive: no
-               — existing consumer selects columns by position. It is
-               — the SEAT (COMMANDER / SECOND_PILOT), which
-               — role_assigned is NOT — under the pair model a CPT can
-               — legitimately occupy the Second Pilot seat, so deriving
-               — seat coverage from role_assigned reports the wrong
-               — seat filled. That grade-versus-position conflation is
-               — exactly what the flight-deck crew package existed to
-               — remove; Control Room's operational-status board needs
-               — the seat, and needs it for a whole day in ONE query
-               — rather than a get_roster_for_flight() per flight.
+               -- operating_position added 2026-08-21, additive: no
+               -- existing consumer selects columns by position. It is
+               -- the SEAT (COMMANDER / SECOND_PILOT), which
+               -- role_assigned is NOT — under the pair model a CPT can
+               -- legitimately occupy the Second Pilot seat, so deriving
+               -- seat coverage from role_assigned reports the wrong
+               -- seat filled. That grade-versus-position conflation is
+               -- exactly what the flight-deck crew package existed to
+               -- remove; Control Room's operational-status board needs
+               -- the seat, and needs it for a whole day in ONE query
+               -- rather than a get_roster_for_flight() per flight.
                r.operating_position,
                r.fdp_hours, r.role_assigned, r.status,
                f.flight_no, f.origin, f.destination,

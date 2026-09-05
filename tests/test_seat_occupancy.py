@@ -24,16 +24,37 @@ DB-free. `_read_duty_rows()` is the one-line seam every duty read goes
 through, so faking it fakes the roster without a database — and on this
 machine `.env` points at production, so "without a database" is a
 safety property, not a convenience.
+
+DB-FREE MEANS get_engine() TOO, and that is the correction this file
+needed (2026-09-05). These reached `engine = get_engine()` at the top
+of the entry point before any guard ran. On a machine with a .env they
+passed; on one without, all four failed with "DATABASE_URL not set" —
+so the tests were not DB-free, they were .env-dependent. Same class as
+the round-trip guards of 2026-08-27.
+
+`isolate_from_database()` is the existing net for exactly this: it
+replaces `get_engine` and `log_audit` on EVERY service module, because
+`from db.db import get_engine` binds a COPY into each module's
+namespace and patching one module does nothing to another. The engine
+it installs raises on any use, so a guard that let something through
+fails loudly here rather than opening a connection — which, against
+this machine's .env, would mean opening one to production.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# tests/ as well as the repo root: isolate_from_database() lives in
+# test_generation_round_trips and is imported by bare module name, the
+# same way tests/test_partial_accept.py and
+# tests/test_cross_rotation_legality.py already reach it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pandas as pd
 import pytest
 
 from services import assignment_service, flight_service
+from test_generation_round_trips import isolate_from_database
 
 
 def _planned_flight(flight_id):
@@ -64,6 +85,7 @@ def roster(monkeypatch):
             }
             return pd.DataFrame({"crew_id": sorted(matched)})
 
+        isolate_from_database(monkeypatch)
         monkeypatch.setattr(assignment_service, "_read_duty_rows", fake_read)
         monkeypatch.setattr(flight_service, "get_flight", _planned_flight)
         return reads
