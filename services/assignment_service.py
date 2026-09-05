@@ -472,6 +472,61 @@ def _get_flight_row(flight_id: int, prefetch=None):
     return flight_service.get_flight(flight_id)
 
 
+# ------------------------------------------------------------------
+# Which flights may be crewed at all
+# ------------------------------------------------------------------
+# PLANNED ONLY (operator decision, 2026-09-05). Anything else, OCC
+# handles outside the system.
+#
+# This closes a real gap rather than tidying one: until now
+# assign_crew_to_duty() and assign_pair_to_duty() validated crew
+# legality exhaustively and NEVER ASKED WHAT STATE THE FLIGHT WAS IN.
+# Crew could be written onto a CANCELLED flight -- where cancel_flight()
+# has already cascaded CANCELLED to that flight's roster rows, so the
+# assignment is dead the moment it is made and nobody is told -- or onto
+# one that had already OPERATED, which is a record of what happened
+# rather than a plan anyone can still change.
+#
+# ENFORCED HERE, NOT IN THE PICKER. pages/4_Roster.py stopped OFFERING
+# non-PLANNED flights on 2026-09-06, and that guarded exactly one
+# caller: the generator, a future page, a script or a console session
+# all still reached this function directly. A guard in front of one
+# door is not a guard on the room.
+#
+# A frozenset rather than a literal, because the question "which
+# statuses may be crewed" is one the operator may revisit -- DISRUPTED
+# is the plausible next candidate -- and it must be answerable in one
+# place. services/roster_generator_service.py reads THIS name rather
+# than repeating the rule.
+CREWABLE_FLIGHT_STATUSES = frozenset({"PLANNED"})
+
+
+def _refuse_uncrewable_flights(flight_ids: List[int], prefetch=None) -> None:
+    """Raise if any of these flights is in a status that may not be
+    crewed. Silent about flights that do not exist: "no such flight" is
+    a different error with its own message further down each caller,
+    and reporting it twice, differently, from two places is worse than
+    reporting it once.
+    """
+    blocked = []
+    for flight_id in flight_ids:
+        row = _get_flight_row(flight_id, prefetch)
+        if row is None:
+            continue
+        status = row["status"]
+        if status not in CREWABLE_FLIGHT_STATUSES:
+            blocked.append((flight_id, status))
+
+    if blocked:
+        detail = ", ".join(f"{fid} is {status}" for fid, status in blocked)
+        raise ValueError(
+            f"Only PLANNED flights can be crewed: {detail}. A cancelled "
+            f"flight's roster rows are cancelled with it, and a flight that "
+            f"has operated is a record rather than a plan -- OCC handles "
+            f"both outside the system."
+        )
+
+
 def _read_duty_rows(query: str, engine, params: dict) -> pd.DataFrame:
     """The single statement that actually goes to the database for duty
     history. A one-line seam, so a test can count round-trips while the
@@ -1034,6 +1089,14 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
     sees only published."
     """
     engine = get_engine()
+
+    # FIRST, before the partner lookup below spends a query looking for
+    # a colleague on a flight nobody may be assigned to at all.
+    #
+    # assign_crew_to_new_flights() deliberately does NOT get this guard:
+    # it CREATES the flights it assigns to, and flights.status defaults
+    # to PLANNED (migrations/002), so there is nothing yet to refuse.
+    _refuse_uncrewable_flights(flight_ids, prefetch)
 
     normalized_role = ROLE_SYNONYMS.get(role_assigned.strip().upper(), role_assigned.strip().upper())
     if normalized_role in ("CPT", "FO"):
@@ -1717,6 +1780,16 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
         byte-identical under both settings.
     """
     engine = get_engine()
+
+    # BEFORE _validate_pair_internal(), so the refusal costs nothing and
+    # lands before any audit row could be written. Deliberately NOT
+    # inside that function: it is shared with validate_pair(), which is
+    # read-only and is what the swap-alert scan asks "could this seat be
+    # filled by someone else" through. A scan is a question, not an
+    # assignment, and making a question raise on a cancelled flight
+    # would turn a report into a crash.
+    _refuse_uncrewable_flights(flight_ids, prefetch)
+
     core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids,
                                   prefetch=prefetch)
     overall_status = core["overall_status"]

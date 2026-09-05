@@ -1271,28 +1271,29 @@ resuming towards merge. See `Current active task` above for actual
 merge status, rather than repeating it here.
 
 ## Open stubs / known blockers
-- **`assign_pair_to_duty()` DOES NOT CHECK FLIGHT STATUS, and that is
-  still true on `main` (found 2026-09-06).** It validates crew legality
-  exhaustively and never asks what state the flight is in. So crew can
-  be assigned to a **CANCELLED** flight, or to one that has already
-  **OPERATED**, and nothing in the service layer objects.
+- **RESOLVED 2026-09-05 — only PLANNED flights may be crewed, enforced
+  at the service.** Operator decision: PLANNED only; anything else, OCC
+  handles outside the system. `assignment_service.
+  CREWABLE_FLIGHT_STATUSES` is the one place that says so, and
+  `_refuse_uncrewable_flights()` is called at the top of BOTH write
+  doors — `assign_crew_to_duty()` and `assign_pair_to_duty()` — before
+  the partner lookup and before any audit row can be written.
 
-  Cancelling a flight cascades `CANCELLED` to its roster rows
-  (`cancel_flight()`), so crew written onto a cancelled flight is
-  written and immediately meaningless — the roster row exists, says
-  CANCELLED, and nobody was told the assignment was pointless.
+  Kept here rather than deleted because the SHAPE of the gap is worth
+  remembering: the Roster picker had already stopped offering
+  non-PLANNED flights the day before, and that looked like the fix. It
+  guarded one caller. The generator, a future page, a script and a
+  console session all reached the function directly. **A guard in front
+  of one door is not a guard on the room** — and the picker version
+  would have kept looking correct indefinitely, because the only way to
+  notice is to call the service yourself.
 
-  **The Roster picker now refuses to OFFER a non-PLANNED flight**
-  (2026-09-06), which closes the only UI path that reached this. The
-  SERVICE is unguarded still, so the generator, a future page, or a
-  script can all do it. Recorded as a real gap rather than treated as
-  fixed by the UI narrowing that happens to sit in front of it — a
-  guard in the picker is a guard on one caller, not on the function.
-
-  Not fixed here deliberately: it is a service-layer legality decision
-  (which statuses may be crewed — PLANNED certainly, DISRUPTED
-  arguably, OPERATED for retroactive record-keeping possibly) and that
-  is an operator question, not a UI one.
+  NOT added to `_validate_pair_internal()`, which the two write doors
+  share with the read-only `validate_pair()`. That function is what the
+  swap-alert scan asks "could this seat be filled by someone else"
+  through. A scan is a QUESTION, not an assignment, and making a
+  question raise on a flight that has since been cancelled would turn a
+  report into a crash.
 - **`query_parser.py`: "how close is Waqar to his 1000 hour limit"
   resolves to `utilization` correctly but with no `window_days`, so the
   report has nothing to compute against — found 2026-08-08 by the user
@@ -9022,25 +9023,42 @@ without a number (`rotation_template_service` raises, saying numberless
 flights go through Control Room), and the import script creates crew,
 not flights. **This form was the only path that ever produced a NULL.**
 
-### `cargo_dg` is recorded and checked against nothing (NOT fixed)
+### `cargo_dg` — SETTLED 2026-09-05: the current behaviour is correct
 
-Worth writing down because it is easy to assume otherwise:
-`flights.cargo_dg` flags a flight as carrying dangerous goods, and the
-legality gate never reads it. Meanwhile `dg_expiry` sits in
-`QUALIFICATION_EXPIRY_FIELDS`, so **a DG certificate is checked on
-EVERY duty for EVERY crew member regardless of whether the flight
-carries dangerous goods at all.**
+**Operator decision (Arif, 2026-09-05): assume YES — every Air Eagle
+flight potentially carries dangerous goods.** The question raised on
+2026-09-04 is answered, and the answer makes the code right as it
+stands. NO CODE CHANGE, deliberately.
 
-That is not a missing check — it is a check applied where it does not
-belong, and it fails toward refusal, so it is an availability cost
-rather than a safety hole. `_check_crew_qualifications()` takes a crew
-row and a date and could not consult `cargo_dg` even in principle.
-**Whether every Air Eagle flight is potentially DG-carrying is an
-operator question**, with Arif as of 2026-09-04. Recorded, not fixed,
-at the operator's instruction.
+What was flagged, and why it is not a defect: `dg_expiry` sits in
+`QUALIFICATION_EXPIRY_FIELDS`, so a DG certificate is checked on EVERY
+duty for EVERY crew member regardless of `flights.cargo_dg`. That
+reads like a check applied where it does not belong — until the
+operator's answer, which is that the premise was wrong rather than the
+check. If any flight may carry DG, then **every duty is a DG duty**,
+and checking on every duty is exactly right.
 
-(The LM/AME side of the same gap is recorded separately from
-2026-08-02.)
+**`flights.cargo_dg` is therefore RECORDED FOR REPORTING ONLY and is
+DELIBERATELY NOT CONSULTED BY THE LEGALITY GATE.** Not an oversight,
+not a TODO: making the check conditional on it would introduce a way
+for a crew member with a lapsed DG certificate to be legal for a
+flight that turns out to carry DG after the roster was written. The
+column answers "did this flight carry DG", which is a reporting
+question; it must not become an input to "may this person fly".
+
+`_check_crew_qualifications()` takes a crew row and a date and could
+not consult `cargo_dg` even in principle. That is now a property to
+PRESERVE rather than a limitation to work around — if a future change
+wants to pass a flight into the qualification gate, this entry is the
+reason to stop and ask why.
+
+**The LM/AME side is SEPARATE and STILL OPEN** (recorded 2026-08-02):
+neither role has a crew record, so a free-text occupant name cannot be
+checked against `dg_expiry` at all. Worth noting that this decision
+makes that gap MATTER MORE, not less — if every flight is potentially
+DG-carrying, then whoever actually handles the goods is the person
+whose certification is untracked. Unchanged, and unchanged
+deliberately, but no longer a gap that only applies to some flights.
 
 ### The positional-access rule, extended to `at.dataframe[`
 
@@ -9500,3 +9518,133 @@ separate reason recorded on 2026-09-05: the `ORDER BY` in
 `flight_service` and the lookup in `display_labels` live in imported
 service modules, which Streamlit keeps in `sys.modules` for the life of
 the process. Nothing will break, and nothing will change either.
+
+## 2026-09-05: two operator questions answered, and PLANNED-only enforced where it belongs
+
+Both long-standing operator questions closed on the same day. One
+needed no code; the other needed code in a different place from where
+it looked like it belonged.
+
+### DG: assume yes, and the current behaviour was already right
+
+Settled in the 2026-09-05 rescue entry above (`cargo_dg` section).
+Short version: **every Air Eagle flight potentially carries dangerous
+goods**, so checking `dg_expiry` on every duty is correct, and
+`flights.cargo_dg` is **recorded for reporting only and deliberately
+not consulted by the legality gate**. No code change.
+
+Worth restating the direction of that decision, because it is the
+opposite of what the 2026-09-04 note assumed: the flag looked like a
+check applied where it did not belong. The premise was wrong, not the
+check.
+
+### Only PLANNED flights may be crewed
+
+Operator decision: **PLANNED only. Anything else, OCC handles outside
+the system.**
+
+`assignment_service.CREWABLE_FLIGHT_STATUSES` is the single place the
+rule lives, and `_refuse_uncrewable_flights()` runs at the top of BOTH
+write doors — `assign_crew_to_duty()` and `assign_pair_to_duty()` —
+before the partner lookup, and before any audit row could be written.
+The refusal names every offending leg and its status, because a duty is
+a list of sectors and naming only the first would send a controller to
+fix one leg and meet the same refusal again.
+
+**Where it is NOT** is the more interesting half:
+
+* **Not in `_validate_pair_internal()`**, which the write doors share
+  with the read-only `validate_pair()`. That is what the swap-alert
+  scan asks *"could this seat be filled by someone else"* through. A
+  scan is a QUESTION, not an assignment, and making a question raise on
+  a flight that has since been cancelled would turn a report into a
+  crash.
+* **Not in `assign_crew_to_new_flights()` / `assign_pair_to_new_flights()`**,
+  which CREATE the flights they assign to. `flights.status` defaults to
+  PLANNED (migrations/002), so there is nothing yet to refuse.
+* **Not left to the picker.** `pages/4_Roster.py` stopped offering
+  non-PLANNED flights on 2026-09-06 and that looked like the fix. It
+  guarded one caller.
+
+### THE GENERATOR IS NOT UNAFFECTED, and the reason is a real data shape
+
+Checked rather than assumed, and the expected answer was wrong.
+
+`rotation_template_service._promoted_flight_ids()` selects an approved
+rotation's legs **by `rotation_instance_id`, with no status filter**.
+So a leg cancelled after its rotation was approved is *still handed to
+the generator*. Harmless while `assign_pair_to_duty()` accepted any
+status; from this change it raises.
+
+And the two generator call sites differ:
+
+| call site | before this change | after, unguarded |
+| --- | --- | --- |
+| `accept_preview()` write path | already inside `try/except ValueError` | that rotation REJECTED with the reason — fine |
+| `generate_preview()` candidate search | **no try/except**, called C x S times | **the whole window's preview dies** |
+
+So the guard is also applied **once per rotation** in
+`generate_preview()`, before the search loops: the rotation is marked
+`OUTCOME_UNCOVERED` with a reason naming the leg and its status, and
+the run continues. Caught there rather than by wrapping the loops
+because the answer does not vary by candidate — and because *"this
+rotation's flights cannot be crewed"* is a different fact from *"nobody
+was legal for it"*, which is what wrapping the loop would have made it
+look like.
+
+The rotation stays IN the preview rather than disappearing from it, and
+`accept_preview()` already records an UNCOVERED rotation's per-seat
+reasons into `uncovered_seats`, so the explanation outlives the
+session.
+
+### What the existing data actually holds (READ-ONLY, nothing migrated)
+
+Checked against production before shipping the rule, at the operator's
+instruction to report rather than migrate:
+
+```
+flights:   99 PLANNED, 3 OPERATED, 1 CANCELLED
+roster rows whose flight is not PLANNED:  4  (all OPERATED, none CANCELLED)
+  2 x roster PLANNED   on flight 53 (EPE 786, dep 2026-09-04)
+  2 x roster PROPOSED  on flight  9 (EPE 786, dep 2026-08-26)
+approved rotations with a leg no longer PLANNED: 4
+  instance 2  EPE-786-787     2026-08-21 -> flight  3 CANCELLED
+  instance 5  EPE-786-787     2026-08-26 -> flight  9 OPERATED
+  instance 20 EPE-786-787     2026-09-04 -> flight 53 OPERATED
+  instance 33 EPE-802-804-805 2026-09-04 -> flight 50 OPERATED
+```
+
+**NONE OF THIS IS A VIOLATION, and saying so precisely matters more
+than the count.** A crewed flight becomes OPERATED *after* it is
+crewed: `update_flight()` sets OPERATED once both actual times are
+recorded. Every one of those four roster rows is the ORDINARY
+LIFECYCLE — crewed while PLANNED, flown, marked OPERATED. The new rule
+governs when an assignment is MADE, not what the flight becomes
+afterwards, and nothing here was written in a state the rule would have
+refused.
+
+**No roster row points at the CANCELLED flight.** That is the case that
+would have been genuinely wrong, and it does not exist.
+
+The two `PROPOSED` rows on flight 9 are the one loose end, and a benign
+one: a generator proposal from 2026-08-26 that was never published, on
+a flight that has since flown. Drafts, not assignments. Left alone.
+
+The four approved rotations with a non-PLANNED leg are what the
+generator will now mark UNCOVERED if that window is re-run — expected,
+visible, and explained on screen rather than silent.
+
+### Tests
+
+`tests/test_planned_only_crewing.py` (14, DB-free) covers the rule, the
+message, both write doors, the ordering (refusal before the partner
+lookup), the silence about a missing flight, and the two places the
+guard must NOT be — asserted structurally, because the alternative is a
+DB-gated test that skips exactly where it would break. Mutation-checked:
+removing both entry-point guards fails four of them.
+
+`tests/test_roster_generator_service.py` gained one DB-GATED test —
+two rotations, one leg cancelled after approval, asserting the broken
+rotation comes back UNCOVERED with a reason **and the other is crewed
+normally**. It skips where Postgres is absent, so it is unverified on
+the development machine and needs the operator's run.
