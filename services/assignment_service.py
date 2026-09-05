@@ -456,6 +456,13 @@ class Prefetch:
         # ONLY — provisional duties are unioned on after this is read,
         # never stored in it, so this stays valid for a whole preview.
         self.duty_rows = {}
+        # (tuple(flight_ids), operating_position) -> [crew_id, ...].
+        # Seat occupancy cannot change during a preview, because a
+        # preview writes nothing at all — so one read per duty is
+        # correct, and without it the seat guard would fire once per
+        # CANDIDATE TRIAL (C x S per rotation), which is the quadratic
+        # term generation spent 2026-08-22 removing.
+        self.seat_holders = {}
         self.provisional = provisional
 
 
@@ -481,9 +488,9 @@ def _get_flight_row(flight_id: int, prefetch=None):
 # This closes a real gap rather than tidying one: until now
 # assign_crew_to_duty() and assign_pair_to_duty() validated crew
 # legality exhaustively and NEVER ASKED WHAT STATE THE FLIGHT WAS IN.
-# Crew could be written onto a CANCELLED flight -- where cancel_flight()
+# Crew could be written onto a CANCELLED flight — where cancel_flight()
 # has already cascaded CANCELLED to that flight's roster rows, so the
-# assignment is dead the moment it is made and nobody is told -- or onto
+# assignment is dead the moment it is made and nobody is told — or onto
 # one that had already OPERATED, which is a record of what happened
 # rather than a plan anyone can still change.
 #
@@ -494,8 +501,8 @@ def _get_flight_row(flight_id: int, prefetch=None):
 # door is not a guard on the room.
 #
 # A frozenset rather than a literal, because the question "which
-# statuses may be crewed" is one the operator may revisit -- DISRUPTED
-# is the plausible next candidate -- and it must be answerable in one
+# statuses may be crewed" is one the operator may revisit — DISRUPTED
+# is the plausible next candidate — and it must be answerable in one
 # place. services/roster_generator_service.py reads THIS name rather
 # than repeating the rule.
 CREWABLE_FLIGHT_STATUSES = frozenset({"PLANNED"})
@@ -522,8 +529,95 @@ def _refuse_uncrewable_flights(flight_ids: List[int], prefetch=None) -> None:
         raise ValueError(
             f"Only PLANNED flights can be crewed: {detail}. A cancelled "
             f"flight's roster rows are cancelled with it, and a flight that "
-            f"has operated is a record rather than a plan -- OCC handles "
+            f"has operated is a record rather than a plan — OCC handles "
             f"both outside the system."
+        )
+
+
+def _seat_holders(engine, flight_ids: List[int], operating_position: str,
+                   prefetch=None) -> List[str]:
+    """Who ALREADY holds this seat on any of these flights.
+
+    Non-cancelled rows only, and PROPOSED COUNTS: a generator proposal
+    is a real claim on the seat until somebody rejects it, and letting
+    a manual assignment land on top of one produces exactly the two
+    holders this exists to prevent.
+
+    Goes through _read_duty_rows(), the same one-line seam every other
+    duty read uses, rather than opening its own connection — that seam
+    is what the round-trip budget tests count, and a read that bypasses
+    it is a read nothing can measure.
+    """
+    key = (tuple(flight_ids), operating_position)
+    if prefetch is not None and key in prefetch.seat_holders:
+        return prefetch.seat_holders[key]
+
+    rows = _read_duty_rows("""
+        SELECT DISTINCT crew_id FROM roster
+        WHERE flight_id = ANY(:flight_ids)
+          AND operating_position = :operating_position
+          AND status <> 'CANCELLED'
+    """, engine, {"flight_ids": list(flight_ids),
+                  "operating_position": operating_position})
+    holders = [] if rows.empty else list(rows["crew_id"])
+    if prefetch is not None:
+        prefetch.seat_holders[key] = holders
+    return holders
+
+
+def _refuse_occupied_seats(engine, flight_ids: List[int], seats: dict,
+                            prefetch=None) -> None:
+    """Raise if any of these seats is already held by somebody else.
+
+    THE HOLE THIS CLOSES (found 2026-09-05, latent — production had no
+    duplicate at the time): nothing anywhere refused a second holder of
+    the same seat. Not the database — migrations/005's partial unique
+    index is on (crew_id, flight_id, role_assigned), so two DIFFERENT
+    Captains both written as COMMANDER on one flight collide on
+    nothing. Not the service — assign_pair_to_duty() went from
+    _validate_pair_internal() (which checks crew existence, grade
+    eligibility and legality, and never reads the roster) straight to
+    _write_pair_rows(), which INSERTs unconditionally.
+
+    And it was reachable from the UI in one obvious move: the Roster
+    pair form offers every PLANNED future flight including crewed ones,
+    so selecting an already-crewed flight and assigning a different
+    pair produced TWO Commanders and TWO Second Pilots, silently. The
+    form is labelled "Replace crew" (2026-09-06), which is precisely
+    the operation that was NOT implemented — it added.
+
+    REFUSED RATHER THAN AUTO-REPLACED, deliberately. Cancelling
+    somebody's duty is a decision with its own audit trail and its own
+    reason field, and remove_assignment_from_duty() already exists to
+    make it: it cancels EVERY sector of that person's duty, which a
+    silent overwrite here would not. An assignment path that quietly
+    unassigns somebody is worse than one that refuses and says who is
+    in the seat.
+    """
+    occupied = []
+    for operating_position, crew_id in seats.items():
+        # The crew member being assigned is excluded IN MEMORY rather
+        # than in the WHERE clause, so the cached answer is the same
+        # regardless of who is being trialled for the seat — otherwise
+        # the cache key would have to include the candidate and would
+        # never hit during a candidate search.
+        holders = [h for h in _seat_holders(engine, flight_ids, operating_position,
+                                            prefetch=prefetch)
+                   if h != crew_id]
+        if holders:
+            occupied.append((operating_position, holders))
+
+    if occupied:
+        detail = "; ".join(
+            f"{position.replace('_', ' ').title()} is already held by "
+            f"{', '.join(holders)}"
+            for position, holders in occupied
+        )
+        raise ValueError(
+            f"{detail}. Unassign the current holder first (Roster -> "
+            f"Unassign) — assigning over them would leave two crew in "
+            f"one seat, and cancelling somebody's duty is a decision "
+            f"that needs its own reason and audit record."
         )
 
 
@@ -980,14 +1074,14 @@ def _validate_new_duty(engine, crew_id: str, legs: List[FlightLeg], domestic: bo
             engine, crew_id, crew_row["base"], start=lookback_start,
             end=duty_result.debrief_time, prefetch=prefetch)
         # Exclude any existing record covering the EXACT SAME flight_ids
-        # as the duty being validated here -- that's not real history,
+        # as the duty being validated here — that's not real history,
         # it's this same duty already written (publish_window()
         # re-validating an already-PROPOSED pair is the one real caller
         # that hits this: without this filter, the pilot's own
         # already-committed row for these flights would sit alongside
         # the freshly-built candidate `new_duty` for the identical
         # report/debrief window, and the validator would see two
-        # simultaneous duties with zero rest between them -- a
+        # simultaneous duties with zero rest between them — a
         # self-inflicted rest violation, not a genuine one. Fresh
         # assignments (assign_crew_to_duty()/assign_pair_to_duty() at
         # write time) never have an existing duty for these exact
@@ -1107,6 +1201,14 @@ def assign_crew_to_duty(crew_id: str, flight_ids: List[int], role_assigned: str,
                 "assigning a fresh pair goes through assign_pair_to_duty() instead, "
                 "which validates and commits both seats together."
             )
+        # This function fills the REMAINING seat of an already-real
+        # pair, so the seat being filled must be empty and the OTHER
+        # one must not be. Both halves are checked: the partner lookup
+        # below has always confirmed the other seat is taken, and
+        # nothing confirmed this one was free.
+        _refuse_occupied_seats(engine, flight_ids, {operating_position: crew_id},
+                                prefetch=prefetch)
+
         partner = _find_paired_pilot(engine, flight_ids, operating_position, crew_id)
         if partner is None:
             raise ValueError(
@@ -1789,6 +1891,15 @@ def assign_pair_to_duty(commander_crew_id: str, second_pilot_crew_id: str, fligh
     # assignment, and making a question raise on a cancelled flight
     # would turn a report into a crash.
     _refuse_uncrewable_flights(flight_ids, prefetch)
+
+    # Both seats, before any validation work and before any audit row.
+    # dry_run is NOT exempt: the generator's candidate search runs
+    # dry, and a preview that proposes a pilot for a seat somebody
+    # already holds is a preview that cannot be accepted.
+    _refuse_occupied_seats(engine, flight_ids, {
+        "COMMANDER": commander_crew_id,
+        "SECOND_PILOT": second_pilot_crew_id,
+    }, prefetch=prefetch)
 
     core = _validate_pair_internal(engine, commander_crew_id, second_pilot_crew_id, flight_ids,
                                   prefetch=prefetch)
@@ -2655,7 +2766,7 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
 # past date and saved it. CPT-03 stayed on already-written PLANNED
 # rosters and nothing was flagged. Future assignments were correctly
 # refused, but a pilot whose document lapses today stayed on next
-# week's published roster silently -- the only remedy being for
+# week's published roster silently — the only remedy being for
 # somebody to notice.
 #
 # The GENERAL shape, not the reported slice: an OCC member enters a
@@ -2667,7 +2778,7 @@ def update_flight_actual_times_and_revalidate(flight_id: int,
 
 # Which crew fields legality actually depends on, and what each costs
 # to re-check. The tiers are about COST, not about whether the field
-# matters -- every one of these re-checks every affected duty.
+# matters — every one of these re-checks every affected duty.
 #
 # Derived from what the engine actually consumes, checked rather than
 # assumed: CrewMember carries only crew_id/name/home_base, so `base`
@@ -2680,8 +2791,8 @@ LEGALITY_FIELDS_TIER3 = frozenset({"base", "role"})
 LEGALITY_RELEVANT_FIELDS = (
     LEGALITY_FIELDS_TIER1 | LEGALITY_FIELDS_TIER2 | LEGALITY_FIELDS_TIER3
 )
-# Everything else on the crew record -- operator_staff_id, name,
-# nationality, phone, email, license_no, remarks -- changes nothing a
+# Everything else on the crew record — operator_staff_id, name,
+# nationality, phone, email, license_no, remarks — changes nothing a
 # legality rule reads, so correcting a phone number does not walk the
 # roster.
 
@@ -2701,20 +2812,20 @@ def _future_planned_duties(engine, crew_id: str, now=None) -> List[dict]:
     Its own query rather than a column added to _cached_db_duty_rows().
     That loader is the cached hot path the 2026-08-22 round-trip work
     took from 4,822 to 133, and it answers a different question --
-    "this crew member's duty history, for legality" -- which is why it
+    "this crew member's duty history, for legality" — which is why it
     filters status != 'CANCELLED' and does not carry status at all.
     "Which duties are future and PLANNED" is a scoping question, not a
     legality one, and conflating the two is how that loader accretes.
 
     THE FOUR EXCLUSIONS, all deliberate:
 
-      * OPERATED -- a duty already flown does not retroactively
+      * OPERATED — a duty already flown does not retroactively
         un-happen because a crew record was corrected afterwards.
-      * NEEDS_REVIEW -- already flagged. Re-flagging says nothing new,
+      * NEEDS_REVIEW — already flagged. Re-flagging says nothing new,
         and re-examining risks the auto-clear this must never do.
-      * DISRUPTED -- carries its own manual label and its own reason;
+      * DISRUPTED — carries its own manual label and its own reason;
         a crew edit must not quietly overwrite that state.
-      * PROPOSED -- legacy rows only. Accept has written PLANNED
+      * PROPOSED — legacy rows only. Accept has written PLANNED
         directly since 2026-09-01, so these are pre-change leftovers
         rather than commitments anyone is flying.
 
@@ -2747,7 +2858,7 @@ def _future_planned_duties(engine, crew_id: str, now=None) -> List[dict]:
 
 def _tier_for(changed_fields) -> int:
     """The HIGHEST tier among the changed fields, because the higher
-    check subsumes the lower one -- tier 3 runs the whole gate, which
+    check subsumes the lower one — tier 3 runs the whole gate, which
     includes the qualification check tier 1 runs alone.
 
     Returns 0 when nothing legality-relevant changed, which is what
@@ -2765,7 +2876,7 @@ def _tier_for(changed_fields) -> int:
 
 def _reasons_duty_fails(engine, crew_row, duty: dict, *, tier: int,
                          schedule_result=None) -> List[str]:
-    """Why this one duty no longer passes, as sentences -- or [] if it
+    """Why this one duty no longer passes, as sentences — or [] if it
     still does.
 
     NO NEW LEGALITY LOGIC. Tier 1 asks _check_crew_qualifications(),
@@ -2776,7 +2887,7 @@ def _reasons_duty_fails(engine, crew_row, duty: dict, *, tier: int,
     reasons: List[str] = []
     blocking = (AlertStatus.ILLEGAL, AlertStatus.NEEDS_MANUAL_REVIEW)
 
-    # Tier 1 applies at EVERY tier -- the higher tiers subsume it
+    # Tier 1 applies at EVERY tier — the higher tiers subsume it
     # rather than replace it, and a lapsed document is a reason a duty
     # fails whatever else changed.
     debrief = duty.get("debrief_time")
@@ -2829,8 +2940,8 @@ def revalidate_crew_duties(crew_id: str, changed_fields,
     deactivate_crew() matters as much as update_crew() and is easy to
     miss: is_active is not in UPDATABLE_FIELDS at all, so a fix wired
     only into update_crew() would have left the single most
-    consequential crew change -- removing a pilot from service while
-    they still hold future duties -- bypassing revalidation entirely.
+    consequential crew change — removing a pilot from service while
+    they still hold future duties — bypassing revalidation entirely.
 
     Returns {"tier", "checked", "flagged", "schedule_level"}, where
     flagged is a list of {duty_id, report_time, reasons}. Callers
@@ -2841,7 +2952,7 @@ def revalidate_crew_duties(crew_id: str, changed_fields,
     and quietly showing five would be the reassuring-but-false record
     this project keeps stamping out.
 
-    NEVER CLEARS -- see _mark_duty_needs_review(). A correction in the
+    NEVER CLEARS — see _mark_duty_needs_review(). A correction in the
     safe direction leaves existing flags standing, because the flag
     records that nobody has looked yet, not that the data is currently
     bad. clear_duty_review_flag() is the only exit.
@@ -2905,7 +3016,7 @@ def revalidate_crew_duties(crew_id: str, changed_fields,
     if schedule_result is not None:
         # Whole-schedule patterns (D23.1 mandatory days off, D23.2
         # seventh day) belong to no single duty, so they flag no single
-        # duty -- attributing one to an arbitrary duty would invent a
+        # duty — attributing one to an arbitrary duty would invent a
         # precision the rule does not have. They are REPORTED instead,
         # loudly, because silently dropping a legality failure the
         # change caused is the worse of the two errors.
@@ -2926,7 +3037,7 @@ def clear_duty_review_flag(duty_id: str, reason: str,
     THE ONLY EXIT, and deliberately a human one. Nothing in this system
     clears a review flag automatically: a crew field corrected back in
     the safe direction leaves the flag standing, because the flag does
-    not record "the data is bad" -- it records "nobody has looked at
+    not record "the data is bad" — it records "nobody has looked at
     this duty since the data changed". Only a person retires that, and
     they have to say so.
 
@@ -2936,7 +3047,7 @@ def clear_duty_review_flag(duty_id: str, reason: str,
     or migration ever reversed it. Combined with flagging every
     affected duty, one corrected field could have permanently flagged
     thirty duties with no way back short of unassigning and reassigning
-    every one -- which is how a safety flag becomes a thing people
+    every one — which is how a safety flag becomes a thing people
     route around instead of read.
 
     A reason is REQUIRED, for the same purpose the flag has: the audit
@@ -2969,7 +3080,7 @@ def duties_needing_review(date_from=None, date_to=None) -> pd.DataFrame:
     can find what they are being asked to look at.
 
     Without this the flag is invisible: it lives in roster.status, and
-    no page listed it before 2026-09-05 -- which is the other half of
+    no page listed it before 2026-09-05 — which is the other half of
     why flagging duties was safe to add only once clearing them was
     possible.
     """

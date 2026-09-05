@@ -1444,16 +1444,30 @@ merge status, rather than repeating it here.
   the 2026-08-02 plan had been waiting on; see that entry for the
   fuller design (self-contained `users` table + password hashing,
   `require_login()` at the top of each page).
-  **The important half of this isn't restriction, it's attribution**:
-  `audit_log.app_user` is `NULL` on every row today, because no page
-  passes it through — the audit trail currently records WHAT happened
-  and WHEN, but never WHO. For a PCAA-regulated operator, that's a
-  real deficiency in what's supposed to be the permanent regulatory
-  record, not a cosmetic gap. When this gets built, every service
-  write must carry the logged-in user's identity through to
-  `log_audit()` — no service-layer signature changes needed, every
-  write function already accepts `app_user: Optional[str] = None`,
-  it's just never populated by any page today.
+  **The important half of this isn't restriction, it's attribution**,
+  and **THAT HALF IS NOW DONE — CORRECTED 2026-09-05.** The paragraph
+  that stood here said `audit_log.app_user` was `NULL` on every row
+  because no page passed it through. That was true when written and
+  quietly stopped being true when auth shipped. Measured against
+  production on 2026-09-05, read-only:
+
+  ```
+  occ1           261 rows   2026-08-19 .. 2026-09-04
+  import_script   10 rows   2026-08-18
+  occ3             6 rows   2026-09-03 .. 2026-09-04
+  ```
+
+  **277 audit rows, every one attributed.** The permanent regulatory
+  record now says WHO as well as what and when, which is what this
+  entry was asking for. Every write function already accepted
+  `app_user: Optional[str] = None`; the pages now populate it.
+
+  Left here rather than deleted because the reasoning still governs
+  anything new: a service write that does not carry the logged-in
+  user's identity through to `log_audit()` is a gap in a
+  PCAA-regulated operator's regulatory record, not a cosmetic
+  omission. A new write path has to thread `app_user` the way the
+  existing ones do.
   **Trigger to actually build this — shared with the Supabase item
   below**: the moment any real crew or flight data enters the
   production Supabase database. Not before.
@@ -1467,13 +1481,30 @@ merge status, rather than repeating it here.
   time) and cross-checked directly against Supabase's own dashboard
   (see the "DB changes" entry near the top of this file for the full
   detail, including the Direct-vs-Session-Pooler connection detour that
-  made this possible). What's actually true now: migrations 008-015
-  (`type_rating`/`contract_expiry` drop through this piece's
-  `snack_provided` columns) have never been applied to Supabase —
-  eight migrations behind, not zero. The GitHub-integration collision
-  risk (Supabase's native migration deploy expects a
-  `supabase/migrations/` folder this repo doesn't use) was explained
-  but not yet confirmed resolved one way or the other.
+  made this possible). **CORRECTED AGAIN 2026-09-05: the "eight
+  migrations behind" claim below was itself stale.** It said 008-015
+  had never been applied. Measured against production on 2026-09-05 by
+  reading `schema_migrations` directly (read-only — deliberately NOT
+  `run_migrations.py --status`, which calls `ensure_tracking_table()`
+  and is therefore DDL against production):
+
+  ```
+  000 .. 020 applied — ALL 21.  Pending: (none)
+  ```
+
+  Production is fully migrated, including 018_users and 019. Nothing
+  is behind. The GitHub-integration collision risk (Supabase's native
+  migration deploy expects a `supabase/migrations/` folder this repo
+  does not use) was never confirmed resolved either way, and is moot
+  while nothing is pending.
+
+  **The pattern is worth more than either correction.** This entry has
+  now been stale TWICE in opposite directions — first claiming nothing
+  was applied when 000-007 were, then claiming eight were outstanding
+  when all of them had landed. A migration-status claim written into
+  prose goes out of date the next time anybody deploys, and reading it
+  is not a substitute for querying `schema_migrations`. **Ask the
+  database.**
   **Backup research findings, recorded now so they don't need
   rediscovering later**: Supabase's own docs recommend free-tier
   projects export via the `supabase db dump` CLI command and keep an
@@ -4834,6 +4865,13 @@ section, just not reflected in the `Open stubs` entry itself). What's
 actually true now: migrations 008-015 have never been applied to
 Supabase — eight migrations behind, not zero. Corrected in place; see
 that entry's own 2026-08-08 note.
+
+**SUPERSEDED 2026-09-05:** that "eight behind" figure is itself long
+out of date — production has all 21 migrations (000-020) applied,
+verified by reading `schema_migrations`. Left as written because it is
+a dated log entry recording what was true that day; the live status
+lives in the `Open stubs` entry, and the only reliable answer comes
+from querying the database rather than from either paragraph.
 
 **Files**: `migrations/015_snack_provided_columns.sql` (new).
 `services/rotation_template_service.py`, `services/flight_service.py`,
@@ -9648,3 +9686,408 @@ two rotations, one leg cancelled after approval, asserting the broken
 rotation comes back UNCOVERED with a reason **and the other is crewed
 normally**. It skips where Postgres is absent, so it is unverified on
 the development machine and needs the operator's run.
+
+## 2026-09-05: one seat, one pilot — a latent hole, confirmed and closed
+
+Flagged as an unverified lead in the operational-readiness assessment,
+confirmed in ten minutes, and it was real.
+
+### Nothing refused a second holder of the same seat
+
+Not the database. `migrations/005`'s partial unique index is on
+`(crew_id, flight_id, role_assigned)`, so two **different** Captains
+both written as COMMANDER on one flight collide on nothing — different
+`crew_id`, no conflict. The index prevents the same person twice, which
+is a different question.
+
+Not the service. `assign_pair_to_duty()` went from
+`_validate_pair_internal()` — which checks crew existence, grade
+eligibility and legality, and **never reads the roster at all** —
+straight to `_write_pair_rows()`, which INSERTs unconditionally.
+Verified by extracting both function bodies and listing every `SELECT`,
+`FROM roster` and `raise ValueError` in them: the only refusals are
+same-crew-twice, missing crew, wrong grade for the seat, and missing
+flight.
+
+**And it was reachable from the UI in one obvious move.** The Roster
+pair form offers every PLANNED future flight, crewed ones included
+(deliberately — scoping it to uncrewed flights would strand the
+crew-TBC case, see 2026-09-06). So selecting an already-crewed flight
+and assigning a different pair produced **two Commanders and two Second
+Pilots**, silently, with no error and nothing flagged.
+
+The form is labelled **"Replace crew"** as of 2026-09-06. That is
+precisely the operation that was not implemented. It added.
+
+**LATENT, NOT LIVE.** Checked against production read-only before
+fixing: no flight had two active holders of one seat (24 COMMANDER
+rows, 24 SECOND_PILOT rows, no duplicates at any status). Closed before
+it was reached, which is the only good time to close something.
+
+### Refused, not auto-replaced
+
+`_refuse_occupied_seats()` names who holds the seat and sends the
+controller to Unassign. It does NOT quietly cancel the incumbent, and
+that is the design decision worth recording:
+
+> Cancelling somebody's duty is a decision with its own reason field
+> and its own audit row. `remove_assignment_from_duty()` already exists
+> to make it, and it cancels EVERY sector of that person's duty — which
+> a silent overwrite in the assignment path would not. An assignment
+> path that quietly unassigns somebody is worse than one that refuses
+> and says who is in the seat.
+
+Both write doors are guarded — `assign_pair_to_duty()` for both seats,
+`assign_crew_to_duty()` for the one it fills. `assign_crew_to_duty()`
+had always confirmed the OTHER seat was taken (that is what
+`_find_paired_pilot()` is for); nothing had ever confirmed the seat
+being filled was free.
+
+**PROPOSED counts as a holder; CANCELLED does not.** A generator
+proposal is a real claim until somebody rejects it, and production
+holds 24 PROPOSED rows today, so that is a live case rather than a
+hypothetical. Cancelled rows must not block, or unassign-then-reassign
+— the exact workflow the refusal sends people to — would be impossible.
+
+### The cost had to be engineered, not just accepted
+
+The first version opened its own connection per call. That broke twelve
+tests, and the reason is the interesting part: the generator's
+candidate search calls `assign_pair_to_duty()` **C x S times per
+rotation**, so a naive seat read reintroduces the quadratic term
+generation spent 2026-08-22 removing.
+
+Two changes fixed it, and both are properties to preserve:
+
+* **The read goes through `_read_duty_rows()`**, the one-line seam
+  every other duty read uses. That seam is what the round-trip budget
+  tests count — *a read that bypasses it is a read nothing can
+  measure*, which is why the DB-free generator tests failed on the
+  fake engine rather than on the query count.
+* **`Prefetch` caches seat holders per `(duty, seat)`.** Correct as
+  well as cheap: a preview writes nothing, so occupancy cannot change
+  during one. Accept builds a FRESH `Prefetch` per rotation, so
+  rotation N+1 sees rotation N's writes.
+
+The candidate being trialled is excluded **in memory**, not in the
+WHERE clause — otherwise the cache key would have to include the
+candidate and would never hit during a search.
+
+After both, the full suite passes with the round-trip budgets unchanged.
+
+### Mutation-checked
+
+Removing both guards fails **9 of the 12**. The three that stay green
+are exactly the "must not be refused" cases — an empty seat, the same
+pilot re-assigned to the seat they already hold, and a CANCELLED row
+not blocking — which SHOULD pass in both directions, because they
+assert the guard does not fire. A guard that is absent and a guard that
+is correctly quiet look identical to those three, and that is the point
+of having them.
+
+## 2026-09-05: PLAN — backups (the trigger fired weeks ago). NOT BUILT.
+
+**Operator instruction: plan it, do not build. Arif decides Pro versus
+`supabase db dump` to his own storage, and the decision is his.**
+
+### Why this is first
+
+HANDOVER's own rule, written before any of this happened: *"the moment
+real crew/flight data enters production — Pro plan, auth, and backups
+all land in the same move. Not auth without backups."* Auth landed on
+2026-08-16. Backups did not, on the judgement that shadow-trial data
+was re-creatable.
+
+**That judgement has expired.** Measured 2026-09-05, read-only:
+
+```
+audit_log      277 rows, every one attributed (occ1 261, occ3 6, import_script 10)
+crew            10 records, 9 active
+flights        103
+roster          48 rows across 22 duties
+rotation_instances  42 APPROVED, 14 DRAFT
+uncovered_seats     10 open
+```
+
+The audit log is **the permanent regulatory record for a PCAA-regulated
+operator**, and there is no copy of it anywhere. It is also the one
+thing here that cannot be re-created: flights and rosters could be
+rebuilt from the templates, but "who did what, when" cannot be
+reconstructed from anything.
+
+Two free-tier properties matter, and they are different problems:
+
+* **No automated backups.** The exposure above.
+* **The project pauses after 7 days of inactivity.** A paused project
+  means the app is DOWN, not degraded. Less likely now that it is used
+  daily, but it is the failure that looks like a total outage on a
+  Monday morning after a quiet week.
+
+### The decision, stated so it can be made in one sitting
+
+| | **Supabase Pro** | **`supabase db dump` to own storage** |
+| --- | --- | --- |
+| cost | ~$25/mo | $0 plus wherever the files live |
+| backups | daily, automatic, 7-day retention | whatever cadence is actually run |
+| pausing | no longer pauses | still pauses after 7 idle days |
+| restore | Supabase console, project offline for the duration | manual `psql` restore |
+| survives project deletion | **no** — deleting the project destroys its backups | **yes** |
+| ongoing effort | none | somebody has to run it, or automate it |
+
+**They are not alternatives.** Pro fixes pausing and gives daily
+backups nobody has to remember; the independent dump is the only thing
+that survives the project itself being deleted, which is a real
+recovery scenario. HANDOVER already recorded that conclusion in the
+2026-08 research and it still holds. PITR was ruled out there too —
+~$100/mo for 7-day retention, roughly 4x the Pro plan, and it REPLACES
+daily backups rather than supplementing them.
+
+**Recommendation, and it is a recommendation and not a decision:** Pro
+for the pausing and the automatic dailies, plus a periodic
+`supabase db dump` kept off Supabase entirely. If only one, take the
+dump — it is free and it is the one that survives everything.
+
+### What building it would actually involve
+
+Deliberately concrete, so the estimate is not a guess:
+
+1. **`scripts/backup_db.py`** — wraps `supabase db dump` (a single
+   binary; no Postgres install needed, per the 2026-08 research),
+   writes a timestamped `.sql` to a configured directory, prunes beyond
+   N copies. Reads `DATABASE_URL` the way every other script does.
+2. **A restore rehearsal, written down.** A backup nobody has restored
+   is a hypothesis. Restore into a scratch database, run
+   `run_migrations.py --status` and a row count against it, record what
+   the commands actually were.
+3. **Scheduling** — Windows Task Scheduler on the machine that already
+   has the repo, or a GitHub Action with the connection string as a
+   secret. The Action is tidier and puts a production credential in
+   GitHub; the local task keeps the credential where it already is.
+   **Operator call.**
+4. **A HANDOVER entry recording where the backups live and how to
+   restore**, because the person restoring will not be the person who
+   set it up.
+
+Roughly an afternoon for 1 and 2. Step 3 depends on the answer above.
+
+### What NOT to do
+
+Do not write a backup script that connects and `SELECT *`s each table
+into CSV. It loses constraints, triggers (migrations/019 exists
+precisely because of an immutability trigger), sequences, and the
+`schema_migrations` table — and it would restore into something that
+looks like the database and is not it.
+
+---
+
+## 2026-09-05: PLAN — the concurrency race. NOT BUILT, and deliberately.
+
+**Operator instruction: plan, do not build. The fix touches the
+legality write path, which is the highest-risk code here, and it
+deserves a design conversation.**
+
+### The failure shape
+
+Verified by grep, 2026-09-05: **no `FOR UPDATE`, no `SERIALIZABLE`, no
+advisory locks anywhere in `services/` or `db/`.** Every assignment is
+read-then-write across two separate statements with nothing in between.
+
+Concretely: controllers A and B both assign **the same pilot**, at the
+same moment, to two duties that overlap or leave insufficient rest.
+
+```
+A: read the pilot's duty history      B: read the pilot's duty history
+A: validate -> LEGAL                  B: validate -> LEGAL
+A: INSERT                             B: INSERT
+```
+
+Neither read includes the other's write, because neither write had
+happened yet. Both pass. The roster now holds two duties that are
+individually legal and jointly illegal, **with no error, no alert and
+nothing flagged for review.**
+
+Three OCC accounts exist and at least two are active (occ1: 261 audit
+rows, occ3: 6). This is not hypothetical for a three-controller team
+working the same window.
+
+**It is the worst failure shape in this system**: silent wrongness in
+the one component whose entire job is to be right, and invisible
+afterwards — the roster looks normal, and only a hand-check of FDP and
+rest across duties would find it.
+
+### Why it is not a quick fix
+
+The natural instinct — wrap the validate-and-write in a transaction —
+is not sufficient on its own. Postgres's default READ COMMITTED means
+B's re-read inside a transaction still would not see A's uncommitted
+insert. The options genuinely differ:
+
+1. **Advisory lock per crew member.** `pg_advisory_xact_lock(hashtext(crew_id))`
+   taken at the top of the write, released at commit. Serialises
+   assignments for ONE pilot while leaving assignments for different
+   pilots fully concurrent. Small blast radius, no isolation-level
+   change, no retry logic. **My provisional preference.** The
+   complication is that a pair assignment touches two pilots, so it
+   needs both locks taken **in a fixed order** (sorted by crew_id) or
+   two controllers assigning the same two pilots in opposite roles can
+   deadlock.
+2. **SERIALIZABLE for the assignment transaction.** Correct by
+   construction, and it makes the database the authority rather than a
+   convention anyone can forget. Costs: serialisation failures become
+   a normal outcome, so every write path needs retry logic and every
+   page needs to handle "try again" — and the generator's accept loop
+   writes rotation by rotation, so it would need to retry per rotation.
+3. **Re-validate inside the writing transaction.** Cheapest to reason
+   about, and it does not actually close the window without one of the
+   two above.
+
+### What has to be decided before anything is written
+
+* **Which pilot's history is the lock?** A pair assignment is two
+  pilots. Locking both, in a deterministic order, or the deadlock is
+  the new bug.
+* **What does the generator do?** `accept_preview()` writes rotation by
+  rotation and already catches `ValueError` per rotation. A lock wait
+  there is fine; a serialisation failure needs a retry it does not have.
+* **What does a controller see when they lose the race?** "Somebody
+  else just assigned this pilot — re-check" is a real message that has
+  to be written, queued through the notice mechanism (it reruns), and
+  tested. A silent retry that succeeds is worse than the refusal,
+  because the second controller believes they made the assignment they
+  did not make.
+* **How is it tested?** Two connections in one test, deliberately
+  interleaved. The suite has no concurrency test today and no fixture
+  shape for one. This is most of the work.
+
+### The honest ranking
+
+Lower than backups and lower than the expiry horizon, because it needs
+two controllers acting on the same pilot within seconds of each other,
+whereas the expiry gap has **already happened** and the backup gap is
+one accident from being permanent. But it is above every remaining
+nicety, and it should be built deliberately rather than slotted in
+behind other work.
+
+## 2026-09-05: both branches failed verification, and both failures were mine
+
+Reported from real Postgres 16. Two different faults, both introduced by
+me in the same session, and both are worth recording because neither was
+visible on the machine that wrote them.
+
+### 1. An em dash where a SQL comment marker belonged
+
+`seat-occupancy-and-stale-handover`: **770 passed, 52 failed.**
+
+```
+LINE 4:   — operating_position added 2026-08-21, additi...
+```
+
+A blanket `" -- "` → `" — "` pass over `services/assignment_service.py`
+— run to make the comments I had just written match house style —
+rewrote **eleven lines inside a SQL string literal**:
+
+```sql
+SELECT r.roster_id, ..., r.debrief_time,
+       — operating_position added 2026-08-21, additive: no
+       — existing consumer selects columns by position.
+       r.operating_position,
+```
+
+SQL comments are `--`. An em dash is not syntax, so
+`get_roster_for_flight()` failed to parse on every call, and the 52
+failures were five test files plus the four inherited from the base
+branch — `roster_generator_service` (17), `roster_generation_page`
+(11), `seat_occupancy` (9), `assistant_page` (6),
+`assistant_reports` (5).
+
+**THIS IS THE MOJIBAKE CLASS AGAIN**, in a new form: *a typographic
+character standing where a syntactic one was needed, which reads
+correctly and parses as nothing.* The previous instance was em dashes
+inside regex alternations, which compiled fine and then matched nothing
+forever. Both were introduced by a well-meaning pass that made prose
+nicer **without asking what each occurrence WAS**.
+
+The aggravating detail: earlier the same session I checked that this
+file already held 32 `" -- "` on `main`, concluded a blanket replace
+would "pollute the diff", and decided against it — then ran one anyway
+two steps later. **The check was done and the conclusion was not
+applied.**
+
+Restored byte-identical to `main`; `git diff main` over that block is
+empty.
+
+> **RULE.** Never run a cosmetic character replace across a whole
+> source file. A file contains Python, prose, SQL, regex and format
+> strings, and `--`, `-`, `'` and `"` are syntax in some of them.
+> Convert the lines you wrote, by anchor, or leave the file alone.
+
+**`tests/test_sql_string_hygiene.py` is the thing that notices**, since
+reading the diff did not. It parses every file under `services/`,
+`core/`, `db/`, `pages/` and `scripts/` with `ast`, finds the string
+literals that are SQL, strips each line's `-- comment` tail, and fails
+on an em dash, en dash, minus sign, smart quote or non-breaking space
+in what remains.
+
+Three things it took to make that test honest, each a small lesson:
+
+* **`ast`, not a regex.** "Is this line inside a string" is not a
+  question a regex answers reliably.
+* **A statement, not a word.** The first version asked whether
+  `"UPDATE "` appeared anywhere and flagged four docstrings and a Crew
+  Data caption ("Renewing a document? Update its expiry date"). Prose
+  about the database is not SQL, and a hygiene test that cries wolf
+  gets suppressed rather than fixed. It now requires a line that BEGINS
+  a statement AND a clause keyword, and skips docstrings entirely.
+* **Only what the database parses.** `get_roster_for_flight()`'s query
+  has carried `-- role_assigned is NOT — under the pair model` since
+  2026-08-21 and is perfectly valid: Postgres stops reading at the
+  `--`. Flagging it would have demanded that correct code change. The
+  test strips comment tails, so the em dash that broke everything is
+  caught precisely because it was standing WHERE the `--` should have
+  been — and the test pins BOTH directions with that exact pair of
+  strings.
+
+### 2. A "DB-free" test that reached `get_engine()`
+
+`enforce-planned-only-crewing`: **806 passed, 4 failed**, all
+`RuntimeError: DATABASE_URL not set` from
+`services/assignment_service.py:1782` — `engine = get_engine()`, which
+runs at the top of `assign_pair_to_duty()` BEFORE any guard.
+
+They passed here because this machine's `.env` supplies the URL. **They
+were not DB-free; they were .env-dependent** — which is a worse state
+than a DB-gated test, because a DB-gated test skips honestly.
+
+Same class as the round-trip guards of 2026-08-27, and the fix is the
+net that already exists: `isolate_from_database()` from
+`tests/test_generation_round_trips.py`, which replaces `get_engine` and
+`log_audit` on EVERY service module — necessary because
+`from db.db import get_engine` binds a COPY into each module's
+namespace, so patching one module does nothing to another. The engine
+it installs raises on any use, so a guard that lets something through
+now fails loudly instead of opening a connection to production.
+
+Wired into `tests/test_planned_only_crewing.py` and
+`tests/test_seat_occupancy.py`. Both also needed `tests/` on
+`sys.path`, the same two lines
+`tests/test_partial_accept.py` and `tests/test_cross_rotation_legality.py`
+already carry.
+
+> **RULE.** A test that calls a service entry point is not DB-free
+> because it patches the reads. Entry points take `engine =
+> get_engine()` first, so the test is only DB-free once `get_engine`
+> itself is isolated. **Verify it by running with `.env` moved aside**,
+> not by observing that it passes.
+
+That last line is the operational half: this file's tests now run with
+`.env` temporarily renamed before being pushed, because "passes on my
+machine" is exactly the state that produced both of these.
+
+### What did NOT change
+
+The #6 finding stands entirely. A form labelled "Replace crew" that
+added a second Commander instead of replacing one, reachable in one
+move, latent only because production happened to hold no duplicate. The
+guard, its placement, the refuse-don't-overwrite decision and the
+`_read_duty_rows()` routing are all unchanged — the SQL fault was in a
+cosmetic pass over the same file, not in the fix.
