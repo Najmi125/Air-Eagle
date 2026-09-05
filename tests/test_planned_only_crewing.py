@@ -19,11 +19,31 @@ on the room, so these tests call the SERVICE.
 DB-free. Every case here refuses before any connection is opened, which
 is what makes that true — and it matters on this machine specifically,
 where `.env` points at production.
+
+DB-FREE MEANS get_engine() TOO, and that is the correction this file
+needed (2026-09-05). These reached `engine = get_engine()` at the top
+of the entry point before any guard ran. On a machine with a .env they
+passed; on one without, all four failed with "DATABASE_URL not set" —
+so the tests were not DB-free, they were .env-dependent. Same class as
+the round-trip guards of 2026-08-27.
+
+`isolate_from_database()` is the existing net for exactly this: it
+replaces `get_engine` and `log_audit` on EVERY service module, because
+`from db.db import get_engine` binds a COPY into each module's
+namespace and patching one module does nothing to another. The engine
+it installs raises on any use, so a guard that let something through
+fails loudly here rather than opening a connection — which, against
+this machine's .env, would mean opening one to production.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# tests/ as well as the repo root: isolate_from_database() lives in
+# test_generation_round_trips and is imported by bare module name, the
+# same way tests/test_partial_accept.py and
+# tests/test_cross_rotation_legality.py already reach it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pandas as pd
 import pytest
@@ -31,6 +51,7 @@ import pytest
 from services import assignment_service, flight_service
 from services.assignment_service import (CREWABLE_FLIGHT_STATUSES,
                                           _refuse_uncrewable_flights)
+from test_generation_round_trips import isolate_from_database
 
 
 def _flight(flight_id, status):
@@ -46,6 +67,7 @@ def flights(monkeypatch):
     """`by_id` maps flight_id -> status; anything absent does not
     exist."""
     def install(by_id):
+        isolate_from_database(monkeypatch)
         monkeypatch.setattr(
             flight_service, "get_flight",
             lambda fid: (_flight(fid, by_id[fid]) if fid in by_id else None))
