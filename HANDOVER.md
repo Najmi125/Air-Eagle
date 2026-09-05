@@ -10091,3 +10091,248 @@ move, latent only because production happened to hold no duplicate. The
 guard, its placement, the refuse-don't-overwrite decision and the
 `_read_duty_rows()` routing are all unchanged — the SQL fault was in a
 cosmetic pass over the same file, not in the fix.
+
+## 2026-09-05: PLAN — crew non-availability. NOT BUILT.
+
+**New operator requirement, not a deferred one.** Air Eagle needs to
+record when a crew member is unavailable for flight duty — leave,
+simulator, a course, sickness — as dated ranges with a reason, and the
+roster must honour them.
+
+**Plan only, no code, at the operator's instruction.**
+
+### What already exists: nothing, and that was checked
+
+* **No `crew_availability_service`, no `crew_unavailability` table, no
+  stub, no deferred entry.** Grepped across `*.py`, `*.sql` and `*.md`.
+* **`DutyType.AIRPORT_STANDBY` / `OTHER_STANDBY` exist in
+  `core/legality/pcaa_ano012_core.py` and are deliberately unreached** —
+  `duty_type` is hardcoded to FDP, and the full requirements document
+  **CONFIRMED Air Eagle has no standby/reserve arrangement at all**
+  (HANDOVER 2026-07). **Do not build unavailability as a duty type.**
+  Leave is not a duty; modelling it as one would resurrect a concept
+  the operator has explicitly said they do not have, and would push it
+  through FDP/rest math that has nothing to say about it.
+* **The vocabulary is already in OCC's head.** The Assistant's
+  decision-question refusal list contains *"Tahir called in sick, who
+  can replace him Thursday"* — a real phrasing, currently refused with
+  a redirect to the Roster page.
+* **One live hook worth knowing about.** The requirements document
+  defines fairness as *"proportional to actual availability"*.
+  `_seed_duty_counts()` currently counts duties per seat and has no
+  availability input, so **that definition is not implementable
+  today**. This data is the missing input. NOT scope now; recorded
+  because it is the second thing this unlocks.
+
+### 1. Where it lives
+
+`crew_unavailability`: `id`, `crew_id` (FK), `date_from`, `date_to`,
+`reason`, `note`, `created_by`, `created_at`. Three decisions inside
+that shape:
+
+**DATE, not TIMESTAMP — and the check compares against BOTH duty
+dates.** This is the `_check_crew_qualifications()` lesson repeated:
+that function checks the **debrief** date, not the report date,
+because Air Eagle's real EPE 786/787 rotation reports 18:15 and
+debriefs 00:00 the following day. Leave recorded 12–19 Sep against a
+duty reporting 19 Sep and debriefing 20 Sep is a conflict, and a check
+that looked only at report date, or only at debrief date, gets one of
+those cases wrong. **Any overlap between [date_from, date_to] and
+[report date, debrief date] is unavailable.** Both ends inclusive,
+stated in the column comment, because "is date_to the last day off or
+the first day back" is the ambiguity that produces a pilot rostered on
+the last day of their own leave.
+
+**Reason: a CONTROLLED LIST, plus a free-text `note`.** Free text
+cannot drive behaviour, and behaviour is the point — the generator
+needs to say "on leave" rather than "unavailable", and the question
+"should any reason be softer" can only be asked of a closed set.
+Controllers will still need to say more than a code ("course in Dubai,
+back on the 20th"), so `note` is nullable and never parsed.
+
+**Where the list is enforced is a real choice with precedent both
+ways.** `crew.role` is deliberately NOT constrained at schema level
+("tighten at the service layer, not schema"); `flights.status` IS a
+CHECK constraint, because "disrupted-duty counting already checks
+status == 'DISRUPTED' literally". The rule those two imply: **constrain
+at the schema when code branches on the value; constrain at the service
+when it does not.** Under the recommendation in §3 no reason is
+softer, so nothing branches — **service-layer allowlist**, which means
+adding "compassionate leave" later is not a migration. If a soft type
+is ever introduced, that is the trigger to move it to a CHECK
+constraint.
+
+**Overlaps: ALLOWED.** Overlapping records are how reality arrives —
+sickness extending into booked annual leave, a course inside a leave
+block. Refusing overlap forces a controller to edit history in order
+to record the present. The overlap query is `EXISTS ... WHERE ranges
+intersect`, which is indifferent to how many rows match, so permitting
+them costs nothing. **Refuse only `date_to < date_from`**, and an exact
+duplicate of an existing row.
+
+**Migration number is a decision, not a detail.** HANDOVER currently
+reserves **"MIGRATION 021"** by name for dropping the `PROPOSED`
+roster status — a migration that does not exist and cannot be written
+until the 24 legacy PROPOSED rows are resolved. Taking 021 for
+unavailability means amending that reservation in the same change.
+Leaving a numbering gap is worse. **Recommend: unavailability takes
+021, and the PROPOSED drop is renamed to "the next free number" in its
+own entry** — a reserved number that names the wrong thing is exactly
+the confusion the numbering rule exists to prevent, and this file has
+already been stale twice about migrations.
+
+### 2. How it reaches the gate — the SSOT question
+
+**The anchor is `_check_crew_qualifications()`, which is called from
+five places** (`assignment_service.py` lines 1103, 2317, 2361, 2651,
+2895 — the immediate gate, two candidate-search paths, the delay
+recompute, and revalidation tier 1). Those five are today's single
+authority for "may this person fly this duty".
+
+**It cannot host the new check.** Its signature is
+`(crew_row, duty_date)` — a row and a date, no engine, no prefetch.
+That is the same limitation already recorded for `cargo_dg`: it "could
+not consult a flight even in principle". Availability needs a database
+read.
+
+**So: a sibling, and one wrapper both go through.**
+
+```
+_check_crew_availability(engine, crew_id, report_date, debrief_date,
+                         prefetch=None) -> List[RuleAlert]
+
+_check_crew_is_usable(...)  ->  qualifications + availability
+```
+
+Every one of the five sites calls the **wrapper**, never either half.
+That is what makes it one authority rather than three checks that can
+disagree — **a sixth call site added next year gets both or neither**,
+which is the property the picker-versus-gate lesson (2026-09-05) says
+to design for rather than to remember.
+
+Two integration details that will bite if not planned:
+
+* **Round-trip cost, and this is the seat-guard lesson arriving
+  early.** The generator calls the gate **C x S times per rotation**.
+  An uncached read per call reintroduces the quadratic term removed on
+  2026-08-22. The read must go through **`_read_duty_rows()`** — the
+  seam the round-trip budget tests actually count, *a read that
+  bypasses it is a read nothing can measure* — and cache on
+  `Prefetch`, keyed by `crew_id`, exactly as `seat_holders` now does.
+* **`alert_summary` buckets by rule prefix.** It splits qualification
+  alerts out by `QUALIFICATION_RULE_PREFIX = "AE-CREW-QUAL-001"`, and
+  routes any alert with `duty_id is None` that is NOT a qualification
+  alert into `schedule_level_alerts`. A new `AE-CREW-AVAIL-001` alert
+  would land in the wrong bucket and be reported as a whole-schedule
+  pattern. Either it carries a `duty_id`, or the prefix handling
+  becomes a tuple. **Decide before writing the alert, not after seeing
+  it in the wrong place.**
+
+### 3. What it produces: ILLEGAL, and the override is a record, not a click
+
+**ILLEGAL, not a warning.** The distinction that makes it clear-cut:
+an expiring qualification is a fact about a document and an FDP breach
+is a computation, but **leave is a recorded human decision**. There is
+nothing for the system to weigh.
+
+**No reason type should be softer, and the reason is about
+auditability rather than strictness.** A WARNING that can be clicked
+through is exactly the affordance a controller wants when somebody's
+leave is cancelled by agreement — and it leaves no record that the
+agreement happened. **Shortening or deleting the unavailability record
+is the override**, and it is audited, attributable and visible to the
+next person. A soft reason type would give the same flexibility with
+none of the trail.
+
+### 4. Revalidation: reuse the existing door
+
+Recording leave for a pilot who already holds future duties **is** the
+crew-change scenario from 2026-09-05, and it should flag those duties
+the same way.
+
+**It can reuse `revalidate_crew_duties()`, and the change that makes it
+reuse cleanly is the same change §2 already requires.** That function
+takes `changed_fields` and computes `_tier_for()`; unavailability is
+not a crew field, so it needs a sentinel — add `"unavailability"` to
+`LEGALITY_FIELDS_TIER1` and call
+`revalidate_crew_duties(crew_id, {"unavailability"}, app_user)`.
+
+Tier 1 currently asks `_check_crew_qualifications()` directly
+(line 2895). **Point it at the wrapper instead** and reuse falls out
+for free — no second revalidation path, no chance of the two drifting.
+
+Three properties carry over unchanged and should be stated so nobody
+"fixes" them:
+
+* **Future PLANNED duties only.** Sickness is often recorded
+  retroactively; a duty already flown must not be re-flagged.
+* **NEVER CLEARS.** Deleting or shortening an unavailability record
+  must NOT auto-clear the flags it raised — the flag records that
+  nobody has looked, not that the data is currently bad.
+  `clear_duty_review_flag()` stays the only exit.
+* **Every affected duty is flagged, no cap.**
+
+### 5. The generator — and the obvious approach is wrong
+
+**"Exclude them from the candidate pool" cannot be done at the pool.**
+`pools` is built ONCE per run, before the rotation loop
+(`roster_generator_service.py:591`), from all crew filtered by grade.
+**Unavailability is date-shaped**: a pilot on leave 12–19 Sep is a
+perfectly good candidate on the 20th, and a run spanning both would
+exclude them from every rotation or none.
+
+**Exclusion happens PER ROTATION**, against that rotation's
+`reference_date`, in the two places candidates are built: the
+fresh-pair search (~line 740) and the one-seat-remaining branch
+(~line 683).
+
+**And the exclusion must carry its own reason, or it destroys the
+message it was meant to produce.** An excluded candidate is never
+trialled, so it contributes no rejection reason, and
+`summarize_rejected_trials()` would report "no legal pair found" —
+with the single most useful explanation missing. That is the swap-alert
+swallow in a new place. `_record_uncovered()` already takes a free-text
+`reason` and needs no schema change, so:
+
+> `CPT-04 on leave 12–19 Sep; CPT-06 on leave 12–14 Sep — no
+> Commander available`
+
+is reachable, and is worth far more to a controller than a rest
+failure.
+
+### 6. UI
+
+**A new section on Crew Data, not a new page.** It is crew data, and
+OCC will record it while looking at the crew record. But it is
+**date-shaped and list-shaped**, so it does not belong in the edit
+form: select crew → date range → reason → optional note → Add, plus a
+table of current and future records with a Remove control. Crew Data
+is 302 lines today with two forms; this is a third section, not a
+rewrite.
+
+**It must also be visible where it bites.** A controller who picks a
+pilot on leave in the Roster form and only learns at submit has been
+told late. Minimum: the refusal names the dates and the reason. Better:
+mark them in the picker label — `CPT Tahir (on leave to 19 Sep)`.
+
+**And it belongs in the front-door summary** proposed on 2026-09-05
+(the expiry horizon and what-is-uncrewed piece). "Who lapses in 30
+days", "what is not crewed" and "who is away this week" are the same
+question asked three ways, and they belong on the same screen.
+
+### Sequencing, and what it costs
+
+1. Migration + service + the wrapper (§1, §2) — the SSOT, and nothing
+   works without it.
+2. Revalidation wiring (§4) — small, once §2 is done.
+3. Generator exclusion + reason (§5).
+4. UI (§6).
+
+**Reboot required: two limbs** — a new service module, and a new
+import in `pages/2_Crew_Data.py`. Plus a migration. Stated in advance
+from the rule, to be confirmed by running the grep at merge time
+rather than recalled.
+
+**Tests: DB-free through `isolate_from_database()`, verified with
+`.env` moved aside** — the correction of 2026-09-05, applied from the
+start rather than after a failed verification.
