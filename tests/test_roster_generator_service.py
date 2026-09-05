@@ -205,6 +205,55 @@ def test_generate_for_window_fills_international_rotation_as_planned(_patch_engi
     assert summary.uncovered == []
 
 
+def test_a_cancelled_leg_takes_out_its_own_rotation_and_no_other(_patch_engine):
+    """PLANNED-only crewing (operator decision, 2026-09-05) meets a real
+    shape of the data: get_promoted_flight_ids() selects an approved
+    rotation's legs by rotation_instance_id with NO status filter, so a
+    leg cancelled after approval is still handed to the generator.
+
+    That was harmless while assign_pair_to_duty() accepted any status.
+    Now it raises — and the preview's candidate search calls it C x S
+    times with no try/except, so without the per-rotation check this
+    would take down the preview for the WHOLE WINDOW.
+
+    Two rotations, one broken: the broken one comes back UNCOVERED with
+    a reason, and the other is crewed normally. Verified against the
+    live shape too: on 2026-09-05 production held one CANCELLED and
+    three OPERATED flights, four of them legs of APPROVED rotations.
+    """
+    created = _make_domestic_instances(dt.date(2026, 8, 3), dt.date(2026, 8, 4))
+    assert len(created) == 2
+    _add_crew("CPT")
+    _add_crew("FO")
+
+    # Cancel ONE leg of the FIRST rotation, the way Flt Schedule would.
+    broken_id = created[0]
+    doomed = rts.get_promoted_flight_ids(broken_id)[0]
+    flight_service.cancel_flight(doomed, reason="test: leg cancelled after approval")
+
+    preview = rgs.generate_preview(dt.date(2026, 8, 3), dt.date(2026, 8, 4))
+
+    by_instance = {r.rotation_instance_id: r for r in preview.rotations}
+    broken = by_instance[broken_id]
+    assert broken.outcome == rgs.OUTCOME_UNCOVERED
+    assert "CANCELLED" in (broken.outcome_reason or "")
+    assert "only PLANNED flights can be crewed" in (broken.outcome_reason or "")
+
+    # THE POINT: the other rotation is unaffected. A cancelled leg is a
+    # problem with one rotation, not with the run.
+    healthy = by_instance[created[1]]
+    assert healthy.outcome == rgs.OUTCOME_PROPOSED, healthy.outcome_reason
+    assert all(seat.crew_id is not None for seat in healthy.seats.values())
+
+    # And accept() writes the healthy one, records the broken one's
+    # reason, and raises nothing.
+    rgs.accept_preview(preview)
+    assert by_instance[created[1]].outcome == rgs.OUTCOME_WRITTEN
+    open_seats = rgs.get_open_uncovered_seats(dt.date(2026, 8, 3), dt.date(2026, 8, 4))
+    assert any("only PLANNED" in (row["reason"] or "")
+               for _, row in open_seats.iterrows()), open_seats
+
+
 def test_generate_for_window_no_approved_instances_in_range_is_a_no_op(_patch_engine):
     summary = rgs.generate_for_window(dt.date(2026, 8, 3), dt.date(2026, 8, 3))
     assert summary.filled == summary.uncovered == summary.already_covered == []

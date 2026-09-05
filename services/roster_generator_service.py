@@ -628,6 +628,41 @@ def generate_preview(date_from: dt.date, date_to: dt.date,
         )
         preview.rotations.append(rotation)
 
+        # A LEG OF AN APPROVED ROTATION CAN BE CANCELLED LATER, and
+        # get_promoted_flight_ids() selects by rotation_instance_id with
+        # no status filter, so this list can still contain it. That was
+        # harmless while assign_pair_to_duty() accepted any status; from
+        # 2026-09-05 it raises, and the candidate search below calls it
+        # C x S times WITHOUT a try/except — so ONE cancelled leg would
+        # have taken down the preview for the WHOLE WINDOW rather than
+        # for its own rotation.
+        #
+        # Caught HERE, once per rotation, rather than by wrapping the
+        # search loops: the answer does not vary by candidate, and a
+        # rotation whose flights cannot be crewed is not the same thing
+        # as a rotation nobody was legal for.
+        #
+        # The rotation stays IN the preview, marked UNCOVERED with a
+        # reason, because a rotation that silently disappears from the
+        # list is the failure this codebase keeps finding. accept()
+        # already records an UNCOVERED rotation's per-seat reasons into
+        # uncovered_seats, so the explanation outlives the session.
+        uncrewable = [
+            (fid, f["status"]) for fid, f in zip(flight_ids, flights)
+            if f["status"] not in assignment_service.CREWABLE_FLIGHT_STATUSES
+        ]
+        if uncrewable:
+            detail = ", ".join(f"flight {fid} is {status}" for fid, status in uncrewable)
+            rotation.outcome = OUTCOME_UNCOVERED
+            rotation.outcome_reason = f"{detail} — only PLANNED flights can be crewed"
+            rotation.outcome_summary = (
+                "This rotation has a leg that is no longer PLANNED, so it "
+                "cannot be crewed here."
+            )
+            for position in SEATS:
+                rotation.seats[position].reason = rotation.outcome_reason
+            continue
+
         commander_id = _seat_occupant(flight_ids, "COMMANDER")
         second_pilot_id = _seat_occupant(flight_ids, "SECOND_PILOT")
 
